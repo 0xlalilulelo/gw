@@ -1,0 +1,10 @@
+[package]
+name                   = "arsenal_borrow"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW region-based borrow checker (Phase 3+ stub). See docs/architecture.md Part D.5."
+
+[lints.rust]
+missing_docs = "deny"

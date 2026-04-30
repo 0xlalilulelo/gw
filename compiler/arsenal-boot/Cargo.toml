@@ -1,0 +1,67 @@
+# GW bootstrap compiler workspace.
+#
+# See docs/architecture.md Part A.3 (host language: Rust) and Part N.1 (file layout).
+# Phase 0 builds only the four front-end crates (lex, ast, parse, driver); the
+# remaining crates listed in Part N.1 exist as empty stubs so the workspace
+# graph is in place from day one and downstream tooling (CI, rustfmt, clippy)
+# treats every crate uniformly.
+
+[workspace]
+resolver = "2"
+members = [
+    # --- Phase 0 active --------------------------------------------------
+    "crates/arsenal_lex",
+    "crates/arsenal_ast",
+    "crates/arsenal_parse",
+    "crates/arsenal_driver",
+    # --- Phase 1+ stubs --------------------------------------------------
+    "crates/arsenal_resolve",
+    "crates/arsenal_typeck",
+    "crates/arsenal_mir",
+    "crates/arsenal_borrow",
+    "crates/arsenal_lir",
+    "crates/arsenal_codegen_llvm",
+    "crates/arsenal_codegen_fast",
+    "crates/arsenal_comptime",
+    "crates/arsenal_jit",
+    "crates/arsenal_lsp",
+    "crates/arsenal_fmt",
+    "crates/arsenal_doc",
+    "crates/arsenal_cipher",
+]
+
+[workspace.package]
+version      = "0.0.1"
+edition      = "2021"
+rust-version = "1.95"
+license      = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# In-tree (Phase 0 active)
+arsenal_lex   = { path = "crates/arsenal_lex" }
+arsenal_ast   = { path = "crates/arsenal_ast" }
+arsenal_parse = { path = "crates/arsenal_parse" }
+
+# Foundational, in-tree consumers in Phase 0
+phf        = { version = "0.11", features = ["macros"] }
+rustc-hash = "2"
+bumpalo    = { version = "3", features = ["collections"] }
+
+# Pinned for Phase 1+ codegen — declared at the workspace level so the version
+# is reviewed once. NOT consumed by any Phase 0 crate, so cargo will not fetch
+# them until a downstream crate adds the dependency.
+# See docs/architecture.md Part A.3, M.4.
+inkwell  = { version = "0.5", features = ["llvm18-0"] }
+llvm-sys = "180"
+
+# Dev-only
+insta = { version = "1", features = ["glob"] }
+
+[profile.dev]
+debug       = "line-tables-only"
+incremental = true
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+debug         = "line-tables-only"

@@ -1,0 +1,19 @@
+# Rust / Cargo
+target/
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Editors
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# insta pending snapshots
+**/*.snap.new
+
+# Claude Code per-user permissions (the `.local.json` flavour is local-only;
+# `settings.json` without `.local` is shared and OK to commit).
+.claude/settings.local.json

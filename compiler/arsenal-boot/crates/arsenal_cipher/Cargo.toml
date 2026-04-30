@@ -1,0 +1,10 @@
+[package]
+name                   = "arsenal_cipher"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW package manager `cipher` (Phase 9+ stub). See docs/architecture.md Part H.5."
+
+[lints.rust]
+missing_docs = "deny"

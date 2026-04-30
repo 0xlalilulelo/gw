@@ -1,0 +1,1 @@
+fn t() -> u0 { if true { return; } }

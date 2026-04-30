@@ -1,0 +1,10 @@
+[package]
+name                   = "arsenal_lir"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW LIR (target-shaped, register-flavored linear IR) (Phase 1+ stub). See docs/architecture.md Part B.8, Part C.4."
+
+[lints.rust]
+missing_docs = "deny"

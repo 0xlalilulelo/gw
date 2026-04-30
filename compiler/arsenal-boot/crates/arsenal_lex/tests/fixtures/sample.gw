@@ -1,0 +1,246 @@
+// GW lexer fixture — exercises every TokenKind in a single file.
+//
+// Goal: lex with zero diagnostics. Many constructs here are NOT yet
+// grammatical for the Phase 0 parser; this file is for the lexer alone.
+
+/// Sum-type smoke test for the eventual liberty parser.
+liberty Tile {
+    Floor,
+    Wall,
+    Door { locked: bool },
+}
+
+/// POD class with field metadata.
+class Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+class Player {
+    hp: i32 @range(0, 100),
+    mana: i32 @range(0, 200),
+    name: []u8 @display,
+}
+
+cipher Ord {
+    fn cmp(self: &Self, other: &Self) -> i32;
+}
+
+const MAX_HP: i32 = 100;
+const PI: f64 = 3.141_592_653_589_793;
+const HEX: u32 = 0xCAFE_BABE;
+const OCT: u16 = 0o755;
+const BIN: u8  = 0b1010_1010;
+const SCI: f64 = 1.0e9;
+const HEXFLOAT: f64 = 0x1.fp10;
+const NEG_EXP: f64 = 6.022e+23;
+
+pub fn ack(m: u64, n: u64) -> u64 {
+    if m == 0 { return n + 1; }
+    if n == 0 { return ack(m - 1, 1); }
+    return ack(m - 1, ack(m, n - 1));
+}
+
+pub fn fib(n: i64) -> i64 {
+    if n < 2 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn arith_smoke() -> u0 {
+    let a: i32 = 7;
+    let b: i32 = 3;
+    let s = a + b;
+    let d = a - b;
+    let m = a * b;
+    let q = a / b;
+    let r = a % b;
+    let p = a ** b;
+    let neg = -a;
+    let nb  = !true;
+    let bn  = ~a;
+    let or_  = true || false;
+    let and_ = false && true;
+    let bxor = a ^ b;
+    let bor  = a | b;
+    let band = a & b;
+    let shl  = a << 2;
+    let shr  = a >> 2;
+}
+
+fn cmp_smoke(x: i32, y: i32) -> bool {
+    if x == y { return true; }
+    if x != y { return false; }
+    if x <  y { return false; }
+    if x <= y { return true; }
+    if x >  y { return false; }
+    if x >= y { return true; }
+    return false;
+}
+
+fn compound_assign(p: &mut Player) -> u0 {
+    p.hp += 5;
+    p.hp -= 1;
+    p.mana *= 2;
+    p.mana /= 3;
+    p.mana %= 7;
+    p.mana **= 1;
+    p.mana &= 0xFF;
+    p.mana |= 0x10;
+    p.mana ^= 0xAA;
+    p.mana <<= 1;
+    p.mana >>= 1;
+}
+
+fn loops() -> u0 {
+    let mut i: i32 = 0;
+    while i < 10 {
+        i = i + 1;
+        if i == 5 { break; }
+        if i == 3 { continue; }
+    }
+    loop { break; }
+    for x in 0..10 { let _ = x; }
+    for x in 0..=10 { let _ = x; }
+}
+
+fn strings_and_runes() -> u0 {
+    let s: []u8 = "hello";
+    let raw: []u8 = \\multi-line
+also a line
+raw end\\;
+    let cstr: [*:0]u8 = c"as a c string";
+    let r1: rune = 'A';
+    let r2: rune = '\n';
+    let r3: rune = '\u{1F600}';
+    let b: u8 = c'A';
+    let escaped: []u8 = "tab\tnl\nbs\\quote\"hex\x41";
+}
+
+/// Demonstrates option chaining and nil-coalescing.
+fn options(opt: ?Player) -> ?i32 {
+    let hp = opt?.hp;
+    let m  = opt?.mana ?? 0;
+    return hp;
+}
+
+/// Error-union usage with foxdie propagation.
+fn read_int(path: []u8) -> !i32 {
+    let f = foxdie open(path);
+    let n = foxdie f.read_int();
+    return n;
+}
+
+fn channels() -> u0 {
+    let ch = make_channel();
+    ch <- 42;
+    let v = <- ch;
+    let _ = v;
+}
+
+fn match_smoke(t: Tile) -> u0 {
+    match t {
+        Tile.Floor          => "floor",
+        Tile.Wall           => "wall",
+        Tile.Door { locked } => if locked then "locked" else "open",
+        else                => "?",
+    };
+}
+
+#[interrupt]
+fn irq_kbd() -> u0 naked {
+    rex {
+        IN AL, 0x60
+        IRET
+    }
+}
+
+#virtuous {
+    const N: i32 = 4;
+}
+
+#[serialize]
+class Saved {
+    timestamp: u64 @display,
+    hp: i32 @range(0, 100),
+}
+
+extern fn malloc(size: usize) -> *naked u8;
+
+pub fn use_attrs(p: &Player) -> u0 {
+    let info = @codec(Player);
+    let val  = @field(p, "hp");
+    let made = @call(makefn, args);
+}
+
+mod sub;
+use std::mem;
+use std::fs::{Reader, Writer};
+
+fn types_smoke() -> u0 {
+    let arr:    [10]i32;
+    let slice:  []i32;
+    let multi:  [*]i32;
+    let cstr:   [*:0]u8;
+    let dyn_:   [dyn]i32;
+    let opt:    ?i32 = nil;
+    let pair:   (i32, i32) = (1, 2);
+}
+
+fn must_not_fail() -> u0 {
+    let v = some_call()!!;
+    let _ = v;
+}
+
+fn ranges() -> u0 {
+    let r1 = 0..10;
+    let r2 = 0..=10;
+    let triple = ...;
+}
+
+fn block_comment_smoke() -> u0 {
+    /* simple block */
+    /* nested /* deeper /* deepest */ deeper */ simple */
+    let _ = 1; // trailing line comment
+}
+
+defer cleanup();
+errdefer rollback();
+
+inline fn always_inlined(x: i32) -> i32 { x + 1 }
+comptime fn at_compile_time() -> i32 { 0 }
+
+fn try_catch_smoke() -> u0 {
+    try {
+        let _ = read_int("p");
+    } catch e {
+        return;
+    };
+}
+
+lock {
+    let _ = 0;
+}
+
+fox worker();
+await some_future();
+yield 0;
+
+fn await_chain(x: i32) -> i32 {
+    if x as i64 == 0 { return 0; }
+    return x;
+}
+
+fn pub_const_var_where() -> u0 where T: Ord {
+    pub const C: i32 = 1;
+    var v: i32 = 2;
+    let _ = v;
+}
+
+// Reserved theme aliases (spec §5.1, §5.4.3, §5.5.1). The lexer
+// classifies these as keywords; the parser aliases them later.
+enum Color { Red, Green, Blue }
+union Bytes { i: i64, f: f64 }
+fn raw_pointer_smoke() -> u0 {
+    unsafe { let _ = 0; }
+}

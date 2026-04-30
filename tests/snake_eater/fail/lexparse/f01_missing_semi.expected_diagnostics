@@ -1,0 +1,3 @@
+// Expected diagnostics for f01_missing_semi.gw.
+// One `EXXXX:line:col` triple per non-blank, non-`//` line.
+E0101:1:26

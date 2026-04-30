@@ -1,0 +1,10 @@
+[package]
+name                   = "arsenal_codegen_fast"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW TPDE-style fast backend (Phase 7+ stub). See docs/architecture.md Part F.1."
+
+[lints.rust]
+missing_docs = "deny"

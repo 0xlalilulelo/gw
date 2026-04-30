@@ -1,0 +1,194 @@
+(* ============================================================================
+ * GW grammar — Phase 0 subset accepted by `arsenal_parse`.
+ *
+ * This file describes the *exact* subset of GW the bootstrap parser
+ * currently accepts; it is updated as the parser evolves. The full GW
+ * surface is described in `docs/spec.md`; the architecture rationale
+ * for keeping a hand-written parser is in `docs/architecture.md` Part B.3.
+ *
+ * Notation
+ * --------
+ *   Nonterminals are PascalCase.
+ *   Terminals are either:
+ *     - uppercase token names (matching `arsenal_lex::TokenKind` variants
+ *       whose lexeme varies — `IDENT`, `INT_LIT`, `STRING_LIT`, ...), or
+ *     - quoted lexemes for tokens whose text is fixed (`'fn'`, `'->'`).
+ *
+ *   `?`   optional
+ *   `*`   zero or more
+ *   `+`   one or more
+ *   `|`   alternation
+ *   `(.)` grouping
+ *
+ * Trivia (whitespace, line/block/doc comments) may appear between any
+ * two terminals. The rules below describe significant tokens only.
+ * ============================================================================ *)
+
+
+(* ===== File =============================================================== *)
+
+Module        ::= Item*
+
+
+(* ===== Items ============================================================== *)
+
+Item          ::= FnDecl
+              |   ClassDecl
+
+FnDecl        ::= 'pub'? 'extern'?
+                  'fn' IDENT ParamList RetType? ( Block | ';' )
+
+ParamList     ::= '(' ( Param ( ',' Param )* )? ')'
+Param         ::= IDENT ':' Type
+
+RetType       ::= '->' Type
+
+ClassDecl     ::= 'pub'? 'class' IDENT FieldDeclList
+FieldDeclList ::= '{' ( FieldDecl ( ',' FieldDecl )* )? '}'
+
+(* Field metadata `@range(0,100)` etc. is lexed and consumed by the
+ * parser but not modelled as a CST node yet — see SyntaxKind::Attr in
+ * arsenal_ast for the Phase 2+ hook. *)
+FieldDecl     ::= IDENT ':' Type Attr*
+Attr          ::= '@' IDENT ( '(' AttrArgs? ')' )?
+AttrArgs      ::= ANY_TOKEN+        (* bracket-balanced, opaque to Phase 0 *)
+
+
+(* ===== Types ============================================================== *)
+
+Type          ::= PathType
+              |   RefType
+              |   OptType
+              |   SliceType
+              |   ArrayType
+
+PathType      ::= IDENT ( '::' IDENT )*
+RefType       ::= '&' Type
+OptType       ::= '?' Type
+SliceType     ::= '[' ']' Type
+ArrayType     ::= '[' Expr ']' Type
+
+
+(* ===== Patterns =========================================================== *)
+
+Pattern       ::= IdentPat
+              |   WildcardPat
+
+IdentPat      ::= IDENT                 (* IDENT whose lexeme != "_" *)
+WildcardPat   ::= '_'                   (* lexed as IDENT, classified by text *)
+
+
+(* ===== Statements ========================================================= *)
+
+Stmt          ::= LetStmt
+              |   ExprStmt
+              |   BlockLikeExprStmt
+
+LetStmt       ::= 'let' Pattern ( ':' Type )? ( '=' Expr )? ';'
+ExprStmt      ::= Expr ';'
+
+(* Block-like expressions in statement position do not require a
+ * trailing `;`; the trailing `;` is consumed if present. *)
+BlockLikeExprStmt
+              ::= ( IfExpr | WhileExpr | Block ) ';'?
+
+
+(* ===== Expressions (Pratt precedence) ===================================== *)
+
+(* The parser implements Pratt-style precedence climbing in
+ * `arsenal_parse::grammar::parse_expr_bp`. The grammar below describes
+ * the resulting parse trees by precedence level, lowest to highest.
+ * The `(left_bp, right_bp)` annotations match the binding-power table
+ * in `infix_bp`. Operators within a level are equal-precedence and
+ * left-associative unless noted. *)
+
+Expr          ::= LogOrExpr
+
+(* (3, 4)  left-assoc *)
+LogOrExpr     ::= LogAndExpr     ( '||'  LogAndExpr     )*
+(* (5, 6)  left-assoc *)
+LogAndExpr    ::= CmpExpr        ( '&&'  CmpExpr        )*
+(* (7, 8)  left-assoc — non-associative chaining is a Phase 2+ enhancement *)
+CmpExpr       ::= BitOrExpr      ( CmpOp BitOrExpr      )*
+CmpOp         ::= '==' | '!=' | '<' | '<=' | '>' | '>='
+(* (9, 10) left-assoc *)
+BitOrExpr     ::= BitXorExpr     ( '|'   BitXorExpr     )*
+(* (11, 12) left-assoc *)
+BitXorExpr    ::= BitAndExpr     ( '^'   BitAndExpr     )*
+(* (13, 14) left-assoc *)
+BitAndExpr    ::= ShiftExpr      ( '&'   ShiftExpr      )*
+(* (15, 16) left-assoc *)
+ShiftExpr     ::= AddExpr        ( ShiftOp AddExpr      )*
+ShiftOp       ::= '<<' | '>>'
+(* (17, 18) left-assoc *)
+AddExpr       ::= MulExpr        ( AddOp MulExpr        )*
+AddOp         ::= '+' | '-'
+(* (19, 20) left-assoc *)
+MulExpr       ::= PowExpr        ( MulOp PowExpr        )*
+MulOp         ::= '*' | '/' | '%'
+(* (22, 21) right-assoc *)
+PowExpr       ::= UnaryExpr      ( '**' PowExpr         )?
+(* (right-bp 23) — prefix unary *)
+UnaryExpr     ::= UnaryOp UnaryExpr
+              |   PostfixExpr
+UnaryOp       ::= '-' | '!' | '~'
+
+(* Postfix: only function call in Phase 0. Field access (`.foo`),
+ * indexing (`[i]`), method calls, optional chaining (`?.`), nil-
+ * coalescing (`??`), must-not-fail (`!!`), and casts (`as T`) are
+ * Phase 2+. *)
+PostfixExpr   ::= Atom ( ArgList )*
+ArgList       ::= '(' ( Expr ( ',' Expr )* )? ')'
+
+(* ----- Atoms --------------------------------------------------------------- *)
+
+Atom          ::= LiteralExpr
+              |   PathExpr
+              |   ParenExpr
+              |   Block
+              |   IfExpr
+              |   WhileExpr
+              |   ReturnExpr
+
+LiteralExpr   ::= INT_LIT
+              |   FLOAT_LIT
+              |   STRING_LIT
+              |   RAW_STRING_LIT
+              |   C_STRING_LIT
+              |   RUNE_LIT
+              |   BYTE_CHAR_LIT
+              |   'true'
+              |   'false'
+              |   'nil'
+
+PathExpr      ::= IDENT ( '::' IDENT )*
+ParenExpr     ::= '(' Expr ')'
+Block         ::= '{' Stmt* '}'
+
+IfExpr        ::= 'if'    Expr Block ( 'else' ( IfExpr | Block ) )?
+WhileExpr     ::= 'while' Expr Block
+ReturnExpr    ::= 'return' Expr?
+
+
+(* ===== Lexical (informative) ============================================= *)
+
+(* Token kinds referenced above are produced by `arsenal_lex`. The full
+ * GW lexical grammar is in `docs/spec.md` §5.3. Phase 0 highlights:
+ *
+ *   IDENT          ::= [A-Za-z_] [A-Za-z0-9_]*    (* ASCII-only *)
+ *   INT_LIT        ::= ('0x' HEX+) | ('0o' OCT+) | ('0b' BIN+) | DEC+
+ *                      (* Underscores allowed between digits *)
+ *   FLOAT_LIT      ::= DEC+ ('.' DEC+)? (('e'|'E') ('+'|'-')? DEC+)?
+ *                      | '0x' HEX+ ('.' HEX+)? ('p'|'P') ('+'|'-')? DEC+
+ *   STRING_LIT     ::= '"' ( STRING_CHAR | ESCAPE )* '"'
+ *   RAW_STRING_LIT ::= '\\' ANY* '\\'
+ *   C_STRING_LIT   ::= 'c' STRING_LIT
+ *   RUNE_LIT       ::= "'" ( RUNE_CHAR | ESCAPE ) "'"
+ *   BYTE_CHAR_LIT  ::= 'c' RUNE_LIT
+ *
+ * Trivia (skipped by the parser cursor; preserved in the CST):
+ *   Whitespace     ::= ( ' ' | '\t' | '\r' | '\n' )+
+ *   LineComment    ::= '//'   [^\n]*
+ *   BlockComment   ::= '/*'   ANY*  '*/'           (* nestable *)
+ *   DocComment     ::= '///'  [^\n]*               (* doc trivia *)
+ *)

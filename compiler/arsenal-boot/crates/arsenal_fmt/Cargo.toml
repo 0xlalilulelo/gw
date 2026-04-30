@@ -1,0 +1,10 @@
+[package]
+name                   = "arsenal_fmt"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW canonical formatter (Phase 9+ stub). See docs/architecture.md Part H.2."
+
+[lints.rust]
+missing_docs = "deny"

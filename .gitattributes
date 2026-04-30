@@ -1,0 +1,12 @@
+# Treat everything as text with LF normalization on commit.
+# This keeps `cargo fmt --check` deterministic across Windows runners
+# where git would otherwise convert files to CRLF on checkout.
+* text=auto eol=lf
+
+# Snapshots are line-sensitive; pin LF.
+*.snap text eol=lf
+*.snap.new text eol=lf
+
+# Test fixtures encode their own line semantics.
+*.gw text eol=lf
+*.expected_diagnostics text eol=lf

@@ -1,0 +1,1 @@
+fn t(x: i32, y: i32) -> u0 { if x { } else if y { } else { } }

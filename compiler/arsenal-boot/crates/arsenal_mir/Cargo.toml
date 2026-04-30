@@ -1,0 +1,10 @@
+[package]
+name                   = "arsenal_mir"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW MIR (CFG of SSA basic blocks with region annotations) (Phase 1+ stub). See docs/architecture.md Part B.7, Part C.3."
+
+[lints.rust]
+missing_docs = "deny"

@@ -1,0 +1,24 @@
+---
+source: crates/arsenal_parse/tests/snake_eater.rs
+expression: dump_text
+---
+Module @1:1..2:1
+  FnDecl @1:1..2:1
+    KwFn `fn` @1:1..1:3
+    Ident `t` @1:4..1:5
+    ParamList @1:5..1:8
+      LParen `(` @1:5..1:6
+      RParen `)` @1:6..1:7
+    RetType @1:8..1:15
+      Arrow `->` @1:8..1:10
+      PathType @1:11..1:15
+        Ident `i32` @1:11..1:14
+    Block @1:15..2:1
+      LBrace `{` @1:15..1:16
+      ExprStmt @1:17..1:28
+        ReturnExpr @1:17..1:26
+          KwReturn `return` @1:17..1:23
+          LiteralExpr @1:24..1:26
+            IntLit `42` @1:24..1:26
+        Semi `;` @1:26..1:27
+      RBrace `}` @1:28..1:29

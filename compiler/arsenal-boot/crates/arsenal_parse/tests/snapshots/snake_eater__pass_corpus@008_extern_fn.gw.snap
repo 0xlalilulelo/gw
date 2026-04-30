@@ -1,0 +1,22 @@
+---
+source: crates/arsenal_parse/tests/snake_eater.rs
+expression: dump_text
+---
+Module @1:1..2:1
+  FnDecl @1:1..2:1
+    KwExtern `extern` @1:1..1:7
+    KwFn `fn` @1:8..1:10
+    Ident `malloc` @1:11..1:17
+    ParamList @1:17..1:29
+      LParen `(` @1:17..1:18
+      Param @1:18..1:27
+        Ident `size` @1:18..1:22
+        Colon `:` @1:22..1:23
+        PathType @1:24..1:27
+          Ident `i64` @1:24..1:27
+      RParen `)` @1:27..1:28
+    RetType @1:29..1:34
+      Arrow `->` @1:29..1:31
+      PathType @1:32..1:34
+        Ident `u8` @1:32..1:34
+    Semi `;` @1:34..1:35

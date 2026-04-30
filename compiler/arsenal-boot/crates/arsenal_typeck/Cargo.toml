@@ -1,0 +1,10 @@
+[package]
+name                   = "arsenal_typeck"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW bidirectional type checker and cipher (trait) resolver (Phase 1+ stub). See docs/architecture.md Part B.6, Part D."
+
+[lints.rust]
+missing_docs = "deny"

@@ -1,0 +1,19 @@
+---
+source: crates/arsenal_parse/tests/snake_eater.rs
+expression: dump_text
+---
+Module @1:1..2:1
+  FnDecl @1:1..2:1
+    KwPub `pub` @1:1..1:4
+    KwFn `fn` @1:5..1:7
+    Ident `exposed` @1:8..1:15
+    ParamList @1:15..1:18
+      LParen `(` @1:15..1:16
+      RParen `)` @1:16..1:17
+    RetType @1:18..1:24
+      Arrow `->` @1:18..1:20
+      PathType @1:21..1:24
+        Ident `u0` @1:21..1:23
+    Block @1:24..2:1
+      LBrace `{` @1:24..1:25
+      RBrace `}` @1:25..1:26

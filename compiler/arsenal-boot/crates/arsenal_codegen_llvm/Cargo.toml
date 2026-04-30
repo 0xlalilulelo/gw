@@ -1,0 +1,10 @@
+[package]
+name                   = "arsenal_codegen_llvm"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW LLVM backend via inkwell (Phase 1+ stub). See docs/architecture.md Part F.2."
+
+[lints.rust]
+missing_docs = "deny"

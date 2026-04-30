@@ -1,0 +1,16 @@
+---
+source: crates/arsenal_parse/tests/snake_eater.rs
+expression: dump_text
+---
+Module @1:1..2:1
+  ClassDecl @1:1..2:1
+    KwClass `class` @1:1..1:6
+    Ident `Wrap` @1:7..1:11
+    FieldDeclList @1:12..2:1
+      LBrace `{` @1:12..1:13
+      FieldDecl @1:14..1:21
+        Ident `v` @1:14..1:15
+        Colon `:` @1:15..1:16
+        PathType @1:17..1:21
+          Ident `i32` @1:17..1:20
+      RBrace `}` @1:21..1:22

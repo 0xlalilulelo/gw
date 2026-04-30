@@ -1,0 +1,10 @@
+[package]
+name                   = "arsenal_resolve"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW name resolver and frequency graph (Phase 1+ stub). See docs/architecture.md Part B.5."
+
+[lints.rust]
+missing_docs = "deny"
