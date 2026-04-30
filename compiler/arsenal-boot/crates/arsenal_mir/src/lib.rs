@@ -470,8 +470,14 @@ fn lower_literal<'a>(l: LiteralExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) -> O
         .get(&NodePtr(l.syntax()))
         .copied()
         .unwrap_or(Ty::Error);
-    let raw = lcx.sm.slice(l.syntax().span).unwrap_or("");
-    match l.token_kind() {
+    // Slice the underlying TOKEN's span, not the LiteralExpr node's
+    // span — node spans extend to the next significant token, which
+    // would pick up trailing trivia and break numeric parsing.
+    let (kind, raw) = match l.token() {
+        Some((k, span)) => (Some(k), lcx.sm.slice(span).unwrap_or("")),
+        None => (None, ""),
+    };
+    match kind {
         Some(SyntaxKind::IntLit) => {
             let int_ty = match ty {
                 Ty::Int(i) => i,
@@ -536,6 +542,13 @@ fn lower_binary<'a>(
     bin: BinaryExpr<'a>,
     lcx: &mut LowerCx<'a, '_, '_, '_>,
 ) -> Operand {
+    // Capture each operand's type *before* lowering: the codegen needs
+    // the operand width, which differs from the result width for
+    // comparison operators (operands i32, result bool).
+    let operand_ty = bin
+        .lhs()
+        .and_then(|e| lcx.typed.expr_types.get(&NodePtr(e.syntax())).copied())
+        .unwrap_or(Ty::Error);
     let lhs = bin
         .lhs()
         .map(|e| lower_expr(b, e, lcx))
@@ -553,13 +566,15 @@ fn lower_binary<'a>(
     let Some(op) = bin.op_kind().and_then(syntax_kind_to_binop) else {
         return Operand::Const(Const::Error);
     };
-    // Operand type is the comparison's input type, which equals the
-    // result type for arithmetic and equals lhs's type otherwise.
+    // `Rvalue::BinOp::ty` carries the OPERAND type (which equals the
+    // result type for arithmetic but differs for comparison). Codegen
+    // uses it to decide operand width, signed-vs-unsigned ops, and
+    // float-vs-int dispatch.
     let value = Rvalue::BinOp {
         op,
         lhs,
         rhs,
-        ty: result_ty,
+        ty: operand_ty,
     };
     let local = b.alloc_local(LocalDecl {
         ty: result_ty,
@@ -873,5 +888,37 @@ mod tests {
             )
         });
         assert!(has_add, "expected BinOp::Add in entry block");
+    }
+
+    /// Regression: a literal nested inside a binary expression must
+    /// lower to its actual numeric value, not 0. Earlier versions of
+    /// `lower_literal` sliced the LiteralExpr *node* span (which
+    /// extends past trailing trivia) and parsed `"1 ".parse::<i128>()`
+    /// — which fails — defaulting both operands to 0.
+    #[test]
+    fn binary_literal_operands_carry_correct_values() {
+        let prog = lower_src("fn main() -> i32 { return 1 + 2; }");
+        let entry = &prog.functions[0].blocks[0];
+        let stmt = entry
+            .statements
+            .iter()
+            .find_map(|s| match s {
+                MirStmt::Assign {
+                    value: Rvalue::BinOp { lhs, rhs, .. },
+                    ..
+                } => Some((lhs, rhs)),
+                _ => None,
+            })
+            .expect("a BinOp Assign");
+        match stmt {
+            (
+                Operand::Const(Const::Int { value: l, .. }),
+                Operand::Const(Const::Int { value: r, .. }),
+            ) => {
+                assert_eq!(*l, 1);
+                assert_eq!(*r, 2);
+            }
+            other => panic!("operands should both be Int constants, got {other:?}"),
+        }
     }
 }

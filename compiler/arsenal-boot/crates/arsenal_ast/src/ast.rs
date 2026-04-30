@@ -496,10 +496,14 @@ impl<'a> AstNode<'a> for LiteralExpr<'a> {
 }
 
 impl<'a> LiteralExpr<'a> {
-    /// Kind of the wrapped literal token, if any.
-    pub fn token_kind(self) -> Option<SyntaxKind> {
+    /// Kind and source span of the wrapped literal token.
+    ///
+    /// This is the **token** span (not the enclosing node's span), so
+    /// callers that want to parse the literal text can slice the
+    /// source map without picking up trailing trivia.
+    pub fn token(self) -> Option<(SyntaxKind, Span)> {
         self.0.children.iter().find_map(|c| match c {
-            SyntaxElement::Token { kind, .. }
+            SyntaxElement::Token { kind, span }
                 if matches!(
                     kind,
                     SyntaxKind::IntLit
@@ -514,10 +518,15 @@ impl<'a> LiteralExpr<'a> {
                         | SyntaxKind::KwNil
                 ) =>
             {
-                Some(*kind)
+                Some((*kind, *span))
             }
             _ => None,
         })
+    }
+
+    /// Kind of the wrapped literal token, if any.
+    pub fn token_kind(self) -> Option<SyntaxKind> {
+        self.token().map(|(k, _)| k)
     }
 }
 
