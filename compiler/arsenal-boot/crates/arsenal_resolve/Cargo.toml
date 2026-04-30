@@ -4,7 +4,16 @@ version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
-description            = "GW name resolver and frequency graph (Phase 1+ stub). See docs/architecture.md Part B.5."
+description            = "GW name resolver and frequency graph. See docs/architecture.md Part B.5."
+
+[dependencies]
+arsenal_lex = { workspace = true }
+arsenal_ast = { workspace = true }
+rustc-hash  = { workspace = true }
+
+[dev-dependencies]
+arsenal_parse = { workspace = true }
+bumpalo       = { workspace = true }
 
 [lints.rust]
 missing_docs = "deny"

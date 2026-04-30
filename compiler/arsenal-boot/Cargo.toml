@@ -37,20 +37,32 @@ rust-version = "1.95"
 license      = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-# In-tree (Phase 0 active)
-arsenal_lex   = { path = "crates/arsenal_lex" }
-arsenal_ast   = { path = "crates/arsenal_ast" }
-arsenal_parse = { path = "crates/arsenal_parse" }
+# In-tree (Phase 0+ active)
+arsenal_lex          = { path = "crates/arsenal_lex" }
+arsenal_ast          = { path = "crates/arsenal_ast" }
+arsenal_parse        = { path = "crates/arsenal_parse" }
+arsenal_resolve      = { path = "crates/arsenal_resolve" }
+arsenal_typeck       = { path = "crates/arsenal_typeck" }
+arsenal_mir          = { path = "crates/arsenal_mir" }
+arsenal_codegen_fast = { path = "crates/arsenal_codegen_fast" }
 
-# Foundational, in-tree consumers in Phase 0
+# Foundational
 phf        = { version = "0.11", features = ["macros"] }
 rustc-hash = "2"
 bumpalo    = { version = "3", features = ["collections"] }
 
-# Pinned for Phase 1+ codegen — declared at the workspace level so the version
-# is reviewed once. NOT consumed by any Phase 0 crate, so cargo will not fetch
-# them until a downstream crate adds the dependency.
-# See docs/architecture.md Part A.3, M.4.
+# Phase 1 codegen — Cranelift acts as the placeholder backend until the
+# TPDE-style fast backend lands in Phase 7 (see arsenal_codegen_fast/lib.rs).
+# Cranelift is pure-Rust with zero system dependencies, in contrast to LLVM,
+# which is deferred to its own session.
+cranelift-codegen   = "0.115"
+cranelift-frontend  = "0.115"
+cranelift-module    = "0.115"
+cranelift-object    = "0.115"
+target-lexicon      = "0.12"
+
+# Pinned for the eventual LLVM port (architecture Part F.2, M.4) — declared at
+# the workspace level so the version is reviewed once. NOT consumed yet.
 inkwell  = { version = "0.5", features = ["llvm18-0"] }
 llvm-sys = "180"
 

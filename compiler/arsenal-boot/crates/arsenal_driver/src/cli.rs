@@ -30,8 +30,13 @@ pub const SUBCMDS: &[SubCmd] = &[
     },
     SubCmd {
         name: "build",
-        summary: "lex, parse, and dump the AST for the given project",
+        summary: "compile a single .gw file to an executable (Phase 1 increment 1)",
         run: crate::cmd_build::run,
+    },
+    SubCmd {
+        name: "dump",
+        summary: "lex, parse, and pretty-print the AST for the given path",
+        run: crate::cmd_dump::run,
     },
 ];
 

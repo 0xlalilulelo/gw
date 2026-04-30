@@ -4,7 +4,18 @@ version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
-description            = "GW TPDE-style fast backend (Phase 7+ stub). See docs/architecture.md Part F.1."
+description            = "GW codegen — Phase 1 uses Cranelift; Phase 7 swaps in TPDE per architecture Part F.1."
+
+[dependencies]
+arsenal_lex     = { workspace = true }
+arsenal_typeck  = { workspace = true }
+arsenal_mir     = { workspace = true }
+cranelift-codegen   = { workspace = true }
+cranelift-frontend  = { workspace = true }
+cranelift-module    = { workspace = true }
+cranelift-object    = { workspace = true }
+target-lexicon      = { workspace = true }
+rustc-hash          = { workspace = true }
 
 [lints.rust]
 missing_docs = "deny"

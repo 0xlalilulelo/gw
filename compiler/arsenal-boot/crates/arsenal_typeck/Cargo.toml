@@ -4,7 +4,17 @@ version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
-description            = "GW bidirectional type checker and cipher (trait) resolver (Phase 1+ stub). See docs/architecture.md Part B.6, Part D."
+description            = "GW bidirectional type checker. See docs/architecture.md Part B.6, Part D."
+
+[dependencies]
+arsenal_lex     = { workspace = true }
+arsenal_ast     = { workspace = true }
+arsenal_resolve = { workspace = true }
+rustc-hash      = { workspace = true }
+
+[dev-dependencies]
+arsenal_parse = { workspace = true }
+bumpalo       = { workspace = true }
 
 [lints.rust]
 missing_docs = "deny"

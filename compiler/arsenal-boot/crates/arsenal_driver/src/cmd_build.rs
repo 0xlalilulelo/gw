@@ -1,114 +1,136 @@
-//! `arsenal build [path]` — lex, parse, and pretty-print the AST for
-//! every `.gw` file in the given project directory (or `.` if none is
-//! given).
+//! `arsenal build <file.gw>` — lex, parse, resolve, type-check, lower
+//! to MIR, codegen via Cranelift, and link with the system C compiler
+//! to produce an executable next to the source file.
 //!
-//! Phase 0 satisfies the exit criterion of *Part L Phase 0* by emitting
-//! the typed AST dump on stdout; type checking, MIR, and codegen are
-//! Phase 1+.
+//! Phase 1 increment 1: single-file builds only. Cross-file projects
+//! land once we have a frequency-graph builder.
 
-use arsenal_ast::{dump, FileArena};
+use arsenal_ast::FileArena;
+use arsenal_codegen_fast::compile_program;
 use arsenal_lex::{render_simple, SourceMap};
+use arsenal_mir::lower;
 use arsenal_parse::parse;
+use arsenal_resolve::resolve_module;
+use arsenal_typeck::type_check;
 use bumpalo::Bump;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
-/// Run `arsenal build [path]`.
+/// Run `arsenal build <file.gw>`.
 pub fn run(args: &[OsString]) -> ExitCode {
-    let path = args
-        .first()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let path = match args.first() {
+        Some(p) => PathBuf::from(p),
+        None => {
+            eprintln!("arsenal build: missing source path");
+            eprintln!("usage: arsenal build <file.gw>");
+            return ExitCode::from(2);
+        }
+    };
     if args.len() > 1 {
         eprintln!("arsenal build: unexpected extra arguments");
         return ExitCode::from(2);
     }
 
-    let files = match collect_gw_files(&path) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("arsenal build: cannot read `{}`: {e}", path.display());
-            return ExitCode::from(1);
-        }
-    };
-
-    if files.is_empty() {
+    if !path.is_file() {
         eprintln!(
-            "arsenal build: no `.gw` files found in `{}`",
+            "arsenal build: `{}` is not a file (Phase 1 only supports single-file builds)",
+            path.display()
+        );
+        return ExitCode::from(1);
+    }
+    if path.extension().and_then(|s| s.to_str()) != Some("gw") {
+        eprintln!(
+            "arsenal build: expected `.gw` extension, got `{}`",
             path.display()
         );
         return ExitCode::from(1);
     }
 
-    let mut sm = SourceMap::new();
-    let mut total_errors: u32 = 0;
-
-    for src_path in &files {
-        let contents = match fs::read_to_string(src_path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "arsenal build: failed to read `{}`: {e}",
-                    src_path.display()
-                );
-                total_errors = total_errors.saturating_add(1);
-                continue;
-            }
-        };
-        let display_name = src_path.display().to_string();
-        let file = sm.add_file(display_name.clone(), contents);
-        let bytes = sm.get(file).expect("just inserted").contents.as_bytes();
-
-        let bump = Bump::new();
-        let arena = FileArena::new(&bump, file);
-        let (root, diags) = parse(file, bytes, &arena);
-
-        println!("=== {} ===", display_name);
-        let s = dump(root, &sm);
-        print!("{s}");
-        if !diags.is_empty() {
-            println!();
-            println!("--- diagnostics ({}) ---", diags.len());
-            for d in diags.iter() {
-                println!("  {}", render_simple(d, &sm));
-            }
+    match build_one(&path) {
+        Ok(out) => {
+            println!("built `{}`", out.display());
+            ExitCode::SUCCESS
         }
-        println!();
-        total_errors = total_errors.saturating_add(diags.error_count());
-    }
-
-    if total_errors > 0 {
-        eprintln!(
-            "arsenal build: {total_errors} error(s) across {n} file(s)",
-            n = files.len()
-        );
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
+        Err(e) => {
+            eprintln!("arsenal build: {e}");
+            ExitCode::from(1)
+        }
     }
 }
 
-/// Collect every `*.gw` file from `path`.
-///
-/// If `path` is a file, returns just that file. If `path` is a
-/// directory, walks its **immediate children only** (a single level —
-/// recursive walk is a Phase 1 concern that wants the proper module-
-/// graph builder rather than a directory recursion).
-fn collect_gw_files(path: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let meta = fs::metadata(path)?;
-    if meta.is_file() {
-        return Ok(vec![path.to_path_buf()]);
-    }
-    let mut out = Vec::new();
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let p = entry.path();
-        if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("gw") {
-            out.push(p);
+fn build_one(src_path: &Path) -> Result<PathBuf, String> {
+    let contents = fs::read_to_string(src_path)
+        .map_err(|e| format!("failed to read `{}`: {e}", src_path.display()))?;
+    let mut sm = SourceMap::new();
+    let display_name = src_path.display().to_string();
+    let file = sm.add_file(display_name.clone(), contents);
+    let bytes = sm.get(file).expect("just inserted").contents.as_bytes();
+
+    let bump = Bump::new();
+    let arena = FileArena::new(&bump, file);
+    let (root, mut diags) = parse(file, bytes, &arena);
+    let resolved = resolve_module(root, &sm, &mut diags);
+    let typed = type_check(&resolved, &sm, &mut diags);
+
+    if diags.has_errors() {
+        for d in diags.iter() {
+            eprintln!("  {}", render_simple(d, &sm));
         }
+        return Err(format!(
+            "{n} error(s) in `{}`",
+            display_name,
+            n = diags.error_count()
+        ));
     }
-    out.sort();
-    Ok(out)
+
+    let mir = lower(&typed, &resolved, &sm);
+
+    let stem = src_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("cannot derive output name from `{}`", src_path.display()))?;
+    let out_dir = src_path.parent().unwrap_or_else(|| Path::new("."));
+    let object_path = out_dir.join(format!("{stem}.o"));
+    let exe_path = out_dir.join(executable_name(stem));
+
+    let triple = target_lexicon::Triple::host();
+    let object_bytes =
+        compile_program(&mir, triple, stem).map_err(|e| format!("codegen failed: {e}"))?;
+    fs::write(&object_path, &object_bytes)
+        .map_err(|e| format!("failed to write `{}`: {e}", object_path.display()))?;
+
+    link_executable(&object_path, &exe_path)?;
+    // Clean up the intermediate object — the user only asked for the
+    // executable. Best-effort; ignore failure.
+    let _ = fs::remove_file(&object_path);
+
+    Ok(exe_path)
+}
+
+fn executable_name(stem: &str) -> String {
+    if cfg!(windows) {
+        format!("{stem}.exe")
+    } else {
+        stem.to_string()
+    }
+}
+
+fn link_executable(object_path: &Path, exe_path: &Path) -> Result<(), String> {
+    // Phase 1 strategy: shell out to the system C compiler (`cc`),
+    // which exists on every supported host (clang on macOS, gcc on
+    // Linux, optional on Windows). The architecture's eventual
+    // bundled-lld pipeline (Part J.3) lands later.
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let status = Command::new(&cc)
+        .arg(object_path)
+        .arg("-o")
+        .arg(exe_path)
+        .status()
+        .map_err(|e| format!("failed to invoke `{cc}`: {e}"))?;
+    if !status.success() {
+        return Err(format!("`{cc}` exited with status {status}"));
+    }
+    Ok(())
 }

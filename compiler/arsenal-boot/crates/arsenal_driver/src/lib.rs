@@ -8,6 +8,7 @@
 
 pub mod cli;
 pub mod cmd_build;
+pub mod cmd_dump;
 pub mod cmd_new;
 
 use std::ffi::OsString;
