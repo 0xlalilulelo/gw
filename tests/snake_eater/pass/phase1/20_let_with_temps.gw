@@ -1,0 +1,6 @@
+fn add(x: i32, y: i32) -> i32 {
+    let z: i32 = x + y;
+    let w: i32 = z + 1;
+    return w;
+}
+fn main() -> i32 { return add(2, 3); }

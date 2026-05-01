@@ -246,17 +246,29 @@ fn lower_fn<'a>(
     let mut b = Builder::new();
 
     // Allocate parameter locals first so their indices are 0..params.
+    // Look up each parameter's BindingId from the typed module's
+    // `pat_bindings` map keyed on the AST `Param` node — typeck and
+    // MIR allocate "binding-like things" at different paces (MIR
+    // introduces fresh `Local`s for expression intermediates that
+    // typeck never sees), so we must not infer the BindingId from
+    // MIR's `local.0`.
     let mut binding_to_local: FxHashMap<BindingId, Local> = FxHashMap::default();
-    for p in &sig.params {
+    let ast_params: Vec<_> = fn_decl
+        .params()
+        .map(|pl| pl.params().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for (sig_p, ast_p) in sig.params.iter().zip(ast_params.iter()) {
         let local = b.alloc_local(LocalDecl {
-            ty: p.ty,
-            span: p.name_span,
+            ty: sig_p.ty,
+            span: sig_p.name_span,
         });
         b.params.push(local);
-        // Resolver/typeck assign BindingIds in source order, matching
-        // our Local allocation order, but we still record explicitly so
-        // intra-body PathExpr lookups work.
-        binding_to_local.insert(BindingId(local.0), local);
+        let binding_id = typed
+            .pat_bindings
+            .get(&NodePtr(ast_p.syntax()))
+            .copied()
+            .unwrap_or(BindingId(local.0));
+        binding_to_local.insert(binding_id, local);
     }
 
     // Open the entry block.
@@ -401,9 +413,6 @@ fn lower_stmt<'a>(b: &mut Builder, stmt: Stmt<'a>, lcx: &mut LowerCx<'a, '_, '_,
 }
 
 fn lower_let<'a>(b: &mut Builder, let_stmt: LetStmt<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) {
-    // Determine the local's type from typeck. We re-resolve via the
-    // pattern's binding id which the typeck context allocated in source
-    // order — i.e. it equals the Local index we'll allocate now.
     let init_ty = let_stmt
         .init()
         .and_then(|e| lcx.typed.expr_types.get(&NodePtr(e.syntax())).copied())
@@ -416,12 +425,21 @@ fn lower_let<'a>(b: &mut Builder, let_stmt: LetStmt<'a>, lcx: &mut LowerCx<'a, '
     match let_stmt.pattern() {
         Some(Pattern::Ident(p)) => {
             let span = p.name().unwrap_or_else(Span::synthetic);
+            // Allocate the binding's Local *before* lowering the init,
+            // so init expressions allocate fresh higher-numbered Locals
+            // for any temps and don't displace this binding's slot.
             let local = b.alloc_local(LocalDecl { ty, span });
-            // BindingId mirrors the typeck allocator: param count + #lets
-            // so far. We use the local's own index as the BindingId by
-            // construction (typeck assigns them in lock-step source
-            // order, matching our allocation order).
-            lcx.binding_to_local.insert(BindingId(local.0), local);
+            // Look up the BindingId typeck assigned to this pattern.
+            // Falling back to `BindingId(local.0)` only matters for
+            // bodies where typeck didn't run (which doesn't happen in
+            // production lowering — fail soft rather than panic).
+            let binding_id = lcx
+                .typed
+                .pat_bindings
+                .get(&NodePtr(p.syntax()))
+                .copied()
+                .unwrap_or(BindingId(local.0));
+            lcx.binding_to_local.insert(binding_id, local);
             if let Some(init) = let_stmt.init() {
                 let val = lower_expr(b, init, lcx);
                 b.push_stmt(MirStmt::Assign {
@@ -888,6 +906,55 @@ mod tests {
             )
         });
         assert!(has_add, "expected BinOp::Add in entry block");
+    }
+
+    /// Regression: when a `let` binding's initializer contains a
+    /// binary expression, MIR allocates a fresh `Local` for the
+    /// binop's intermediate, which advances the local counter past
+    /// what typeck's BindingId allocator did. Earlier versions of
+    /// `lower_let` registered `binding_to_local[BindingId(local.0)]`,
+    /// inferring the BindingId from the just-allocated Local; this
+    /// silently mismatched typeck's assignment and `return w;`
+    /// resolved to a stale temp (often `Const::Error` → 0).
+    ///
+    /// Fix: typeck records `pat_bindings[NodePtr(IdentPat)] =
+    /// BindingId`, MIR consults that map.
+    #[test]
+    fn let_binding_with_temped_init_resolves_to_correct_local() {
+        let prog = lower_src(
+            "fn add(x: i32, y: i32) -> i32 {
+                let z: i32 = x + y;
+                let w: i32 = z + 1;
+                return w;
+            }
+            fn main() -> i32 { return add(2, 3); }",
+        );
+        let add_fn = prog
+            .functions
+            .iter()
+            .find(|f| f.name == "add")
+            .expect("add fn lowered");
+        // The final block's terminator must be `Return(Local(_))`
+        // pointing at a Local whose declaration matches `w` — i.e.,
+        // the second-to-last let binding (since the last is `w` itself
+        // after a temp). We don't inspect that exactly here; instead
+        // assert the simpler invariant that the return is *not*
+        // Return(Const::Error), which was the failure mode.
+        let mut saw_real_return = false;
+        for blk in &add_fn.blocks {
+            if let Terminator::Return(Operand::Local(_)) = &blk.terminator {
+                saw_real_return = true;
+            }
+            if let Terminator::Return(Operand::Const(Const::Error)) = &blk.terminator {
+                panic!(
+                    "regression: `return w` lowered to Const::Error, indicating BindingId mismatch"
+                );
+            }
+        }
+        assert!(
+            saw_real_return,
+            "expected at least one Return(Local) terminator in add()"
+        );
     }
 
     /// Regression: a literal nested inside a binary expression must

@@ -10,6 +10,18 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Mutex, MutexGuard};
+
+/// Process CWD is global state. Several tests below `set_current_dir`
+/// to a tempdir and back; without this mutex, parallel runs of those
+/// tests race and the second one observes the first's tempdir as its
+/// own cwd — leading to false-failed assertions or accidental file
+/// deletions outside the tempdir. Hold this guard for the entire
+/// duration of any test that mutates `std::env::current_dir`.
+fn cwd_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 fn argv(parts: &[&str]) -> Vec<OsString> {
     std::iter::once("arsenal".into())
@@ -56,6 +68,7 @@ fn unknown_subcommand_returns_nonzero() {
 
 #[test]
 fn new_then_build_round_trip() {
+    let _guard = cwd_lock();
     let tmp = unique_tmp("new_then_build");
     let cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(&tmp).expect("chdir tmp");
@@ -82,6 +95,7 @@ fn new_rejects_invalid_name() {
 
 #[test]
 fn new_rejects_existing_dir() {
+    let _guard = cwd_lock();
     let tmp = unique_tmp("new_rejects_existing");
     let cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(&tmp).expect("chdir tmp");

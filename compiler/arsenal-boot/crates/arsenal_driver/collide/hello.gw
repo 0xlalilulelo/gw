@@ -1,0 +1,2 @@
+// docs/spec.md §5.15.1: bare string literals are sugar for Print.
+"Behold the Outer Heaven.\n";

@@ -1,0 +1,6 @@
+fn compute(a: i32) -> i32 {
+    let doubled: i32 = a + a;
+    let plus_one: i32 = doubled + 1;
+    return plus_one;
+}
+fn main() -> i32 { return compute(7); }

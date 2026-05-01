@@ -207,6 +207,13 @@ pub struct TypedModule<'a> {
     /// Per-CST-node binding from [`SyntaxKind::PathExpr`] to a parameter
     /// or `let`-bound local.
     pub path_bindings: FxHashMap<NodePtr<'a>, BindingId>,
+    /// Per-CST-node binding from a *binding* node — `Param` or
+    /// `IdentPat` — to the [`BindingId`] allocated for it. MIR
+    /// lowering uses this to keep its `Local` allocation order in
+    /// sync with typeck's `BindingId` allocation order, which differ
+    /// because MIR introduces fresh `Local`s for expression
+    /// intermediates that typeck does not.
+    pub pat_bindings: FxHashMap<NodePtr<'a>, BindingId>,
 }
 
 /// Pointer-identity key into the bump-allocated CST.
@@ -267,6 +274,7 @@ pub fn type_check<'a>(
         expr_types: FxHashMap::default(),
         call_targets: FxHashMap::default(),
         path_bindings: FxHashMap::default(),
+        pat_bindings: FxHashMap::default(),
     };
     for def in &resolved.defs {
         let fn_decl = FnDecl::cast(def.syntax).unwrap();
@@ -440,10 +448,18 @@ fn check_fn_body<'a>(
         locals: Vec::new(),
         next_binding: 0,
     };
-    // Register parameters as bindings.
-    for p in &sig.params {
+    // Register parameters as bindings. We zip the FnSig::Param structs
+    // (with resolved types) with the AST Param nodes so we can record
+    // each binding under its CST node identity for MIR's BindingId →
+    // Local plumbing.
+    let ast_params: Vec<_> = fn_decl
+        .params()
+        .map(|pl| pl.params().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for (sig_p, ast_p) in sig.params.iter().zip(ast_params.iter()) {
         let id = cx.alloc_binding();
-        cx.locals.push((p.name.clone(), id, p.ty));
+        cx.locals.push((sig_p.name.clone(), id, sig_p.ty));
+        cx.tm.pat_bindings.insert(NodePtr(ast_p.syntax()), id);
     }
     let Some(body) = fn_decl.body() else {
         // `extern fn foo(...) -> T;` — no body to check.
@@ -483,12 +499,16 @@ fn check_let<'a>(let_stmt: LetStmt<'a>, cx: &mut Cx<'a, '_, '_, '_>) {
             if let Some(name) = cx.sm.slice(name_span) {
                 let id = cx.alloc_binding();
                 cx.locals.push((name.to_string(), id, final_ty));
+                cx.tm.pat_bindings.insert(NodePtr(p.syntax()), id);
             }
         }
     }
-    // Wildcard pattern (`_`): allocate a binding id but don't add to locals.
-    if let Some(Pattern::Wildcard(_)) = let_stmt.pattern() {
-        let _ = cx.alloc_binding();
+    // Wildcard pattern (`_`): allocate a binding id but don't add to
+    // locals (no name to look up). Still record the mapping so MIR
+    // can find a Local slot if it ever needs one.
+    if let Some(Pattern::Wildcard(p)) = let_stmt.pattern() {
+        let id = cx.alloc_binding();
+        cx.tm.pat_bindings.insert(NodePtr(p.syntax()), id);
     }
 }
 
