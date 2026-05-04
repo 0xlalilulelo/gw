@@ -715,21 +715,29 @@ impl<'a> IfExpr<'a> {
         first_child(self.0)
     }
     /// Else branch, either a `Block` (`else { ... }`) or an `IfExpr`
-    /// (`else if ...`). Returns the second `Expr::Block` or `Expr::If`
-    /// child node if the parser emitted one.
+    /// (`else if ...`).
+    ///
+    /// The parser places the else-arm node *after* the `KwElse` token
+    /// in the IfExpr's child list. To distinguish it from the
+    /// then-arm, we walk children in source order and return the
+    /// first node we see after a `KwElse` token leaf.
     pub fn else_branch(self) -> Option<Expr<'a>> {
-        let mut blocks = self.0.child_nodes().filter(|n| n.kind == SyntaxKind::Block);
-        let _then = blocks.next();
-        if let Some(b) = blocks.next() {
-            return Expr::cast(b);
+        let mut seen_else = false;
+        for c in self.0.children {
+            match c {
+                SyntaxElement::Token {
+                    kind: SyntaxKind::KwElse,
+                    ..
+                } => {
+                    seen_else = true;
+                }
+                SyntaxElement::Node(n) if seen_else => {
+                    return Expr::cast(n);
+                }
+                _ => {}
+            }
         }
-        // Else-if form: an IfExpr node sibling.
-        let mut ifs = self
-            .0
-            .child_nodes()
-            .filter(|n| n.kind == SyntaxKind::IfExpr);
-        let _self_already_handled = ifs.next();
-        ifs.next().and_then(Expr::cast)
+        None
     }
 }
 

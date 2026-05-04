@@ -663,13 +663,20 @@ fn lower_if<'a>(b: &mut Builder, i: IfExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_
         },
     );
 
-    // The result of the if-expression lives in a fresh local that both
-    // arms write to before jumping to the join. For Ty::U0 we still
-    // allocate a Unit slot for uniformity.
-    let result_local = b.alloc_local(LocalDecl {
-        ty: result_ty,
-        span: i.syntax().span,
-    });
+    // Allocate a result local only for if-expressions whose value is
+    // observed at runtime. A `Ty::U0` if (e.g. one whose arms both
+    // diverge via `return`, or has no `else`) has no runtime
+    // representation, and creating a Cranelift Variable for it would
+    // force codegen to def_var an i32-shaped Unit constant into an
+    // i8-typed Variable — a verifier failure.
+    let result_local = if !matches!(result_ty, Ty::U0 | Ty::Error) {
+        Some(b.alloc_local(LocalDecl {
+            ty: result_ty,
+            span: i.syntax().span,
+        }))
+    } else {
+        None
+    };
 
     // Then arm.
     b.cur = then_bb;
@@ -677,10 +684,12 @@ fn lower_if<'a>(b: &mut Builder, i: IfExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_
         .then_block()
         .map(|blk| lower_block(b, blk, lcx))
         .unwrap_or(Operand::Const(Const::Unit));
-    b.push_stmt(MirStmt::Assign {
-        dst: result_local,
-        value: Rvalue::Use(then_val),
-    });
+    if let Some(local) = result_local {
+        b.push_stmt(MirStmt::Assign {
+            dst: local,
+            value: Rvalue::Use(then_val),
+        });
+    }
     b.set_terminator(b.cur, Terminator::Goto(join_bb));
 
     // Else arm.
@@ -689,15 +698,20 @@ fn lower_if<'a>(b: &mut Builder, i: IfExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_
         Some(branch) => lower_expr(b, branch, lcx),
         None => Operand::Const(Const::Unit),
     };
-    b.push_stmt(MirStmt::Assign {
-        dst: result_local,
-        value: Rvalue::Use(else_val),
-    });
+    if let Some(local) = result_local {
+        b.push_stmt(MirStmt::Assign {
+            dst: local,
+            value: Rvalue::Use(else_val),
+        });
+    }
     b.set_terminator(b.cur, Terminator::Goto(join_bb));
 
     // Continue lowering at the join block.
     b.cur = join_bb;
-    Operand::Local(result_local)
+    match result_local {
+        Some(l) => Operand::Local(l),
+        None => Operand::Const(Const::Unit),
+    }
 }
 
 fn lower_while<'a>(
@@ -987,5 +1001,47 @@ mod tests {
             }
             other => panic!("operands should both be Int constants, got {other:?}"),
         }
+    }
+
+    /// Regression: an `if`/`else if`/`else` chain must lower the
+    /// nested `else if` as the outer if's `else_branch`, not silently
+    /// drop it. The previous `IfExpr::else_branch` filtered for child
+    /// IfExpr nodes and incorrectly skipped the first one (thinking
+    /// it was `self`); since `child_nodes()` doesn't include `self`,
+    /// it would skip the *actual* else-if and return None. Codegen
+    /// then produced an unreachable code path that ran garbage and
+    /// crashed via SIGILL at runtime.
+    #[test]
+    fn else_if_chain_branches_into_nested_if() {
+        let prog = lower_src(
+            "fn classify(x: i32) -> i32 {
+                if x < 0 { return 1; }
+                else if x < 10 { return 2; }
+                else { return 3; }
+            }
+            fn main() -> i32 { return classify(5); }",
+        );
+        let classify = prog
+            .functions
+            .iter()
+            .find(|f| f.name == "classify")
+            .expect("classify lowered");
+        // The entry block must terminate in a Branch; the else arm
+        // (else_bb) must itself terminate in another Branch (the
+        // nested else-if), not a plain Goto-into-default-return.
+        let entry = &classify.blocks[0];
+        let (then_bb, else_bb) = match &entry.terminator {
+            Terminator::Branch {
+                then_bb, else_bb, ..
+            } => (*then_bb, *else_bb),
+            other => panic!("entry should branch, got {other:?}"),
+        };
+        let _ = then_bb;
+        let else_block = &classify.blocks[else_bb.0 as usize];
+        assert!(
+            matches!(else_block.terminator, Terminator::Branch { .. }),
+            "else arm should itself branch on the nested if; got {:?}",
+            else_block.terminator,
+        );
     }
 }

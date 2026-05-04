@@ -1,0 +1,4 @@
+fn main() -> i32 {
+    while false { return 1; }
+    return 99;
+}
