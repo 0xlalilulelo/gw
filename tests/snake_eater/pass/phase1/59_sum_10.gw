@@ -1,0 +1,5 @@
+fn main() -> i32 {
+    let s: i32 = 0;
+    for i in 1..=10 { s = s + i; }
+    return s;
+}

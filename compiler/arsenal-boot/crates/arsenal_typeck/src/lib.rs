@@ -26,9 +26,9 @@
 //! lowering can still produce best-effort output.
 
 use arsenal_ast::{
-    AstNode, BinaryExpr, Block, CallExpr, Expr, ExprStmt, FnDecl, IfExpr, LetStmt, LiteralExpr,
-    ParenExpr, PathExpr, PathType, Pattern, ReturnExpr, Stmt, SyntaxKind, SyntaxNode, Type,
-    UnaryExpr, WhileExpr,
+    AstNode, BinaryExpr, Block, BreakExpr, CallExpr, ContinueExpr, Expr, ExprStmt, FnDecl, ForExpr,
+    IfExpr, LetStmt, LiteralExpr, ParenExpr, PathExpr, PathType, Pattern, ReturnExpr, Stmt,
+    SyntaxKind, SyntaxNode, Type, UnaryExpr, WhileExpr,
 };
 use arsenal_lex::{DiagBag, Diagnostic, Label, SourceMap, Span};
 use arsenal_resolve::{primitive_type_name, DefId, ResolvedModule};
@@ -57,6 +57,8 @@ pub mod ec {
     pub const MISSING_RETURN_TYPE: ErrorCode = ErrorCode(307);
     /// Function parameter is missing its type annotation.
     pub const MISSING_PARAM_TYPE: ErrorCode = ErrorCode(308);
+    /// `break` or `continue` used outside of a loop body.
+    pub const BREAK_OUTSIDE_LOOP: ErrorCode = ErrorCode(309);
 }
 
 /// Concrete type. Phase-1 supports primitives only; classes and
@@ -411,6 +413,10 @@ struct Cx<'a, 'tm, 'sm, 'd> {
     locals: Vec<(String, BindingId, Ty)>,
     /// Counter for the next [`BindingId`] within the current function.
     next_binding: u32,
+    /// Depth of the enclosing-loop stack. Incremented on entering a
+    /// `while` or `for` body; decremented on exit. Used by
+    /// `synth_break` / `synth_continue` to reject usage outside a loop.
+    loop_depth: u32,
 }
 
 impl<'a, 'tm, 'sm, 'd> Cx<'a, 'tm, 'sm, 'd> {
@@ -447,6 +453,7 @@ fn check_fn_body<'a>(
         expected_ret: sig.ret,
         locals: Vec::new(),
         next_binding: 0,
+        loop_depth: 0,
     };
     // Register parameters as bindings. We zip the FnSig::Param structs
     // (with resolved types) with the AST Param nodes so we can record
@@ -548,6 +555,9 @@ fn synth_expr<'a>(expr: Expr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
         Expr::While(w) => synth_while(w, cx),
         Expr::Return(r) => synth_return(r, cx),
         Expr::Call(c) => synth_call(c, cx),
+        Expr::Break(br) => synth_break(br, cx),
+        Expr::Continue(co) => synth_continue(co, cx),
+        Expr::For(fe) => synth_for(fe, cx),
         Expr::Stub(n) | Expr::Error(n) => {
             cx.diags.push(Diagnostic::error(
                 ec::UNSUPPORTED_CONSTRUCT,
@@ -626,6 +636,14 @@ fn synth_paren<'a>(p: ParenExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
 }
 
 fn synth_binary<'a>(b: BinaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
+    // Assignment is structurally a BinaryExpr (the parser wraps every
+    // infix uniformly) but semantically a place-update statement. Peel
+    // it off before synthesising operands to avoid asking for the
+    // value-type of the LHS path expression in a context where it will
+    // be written, not read.
+    if matches!(b.op_kind(), Some(SyntaxKind::Eq)) {
+        return synth_assign(b, cx);
+    }
     let lhs = b.lhs().map(|e| synth_expr(e, cx)).unwrap_or(Ty::Error);
     let rhs = b.rhs().map(|e| synth_expr(e, cx)).unwrap_or(Ty::Error);
     let Some(op) = b.op_kind() else {
@@ -654,6 +672,28 @@ fn synth_binary<'a>(b: BinaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
         }
         _ => Ty::Error,
     }
+}
+
+/// `x = expr` where `x` is a path to a local. The Phase-1 model
+/// treats every let-bound local as mutable; `let` vs `var` is a
+/// borrow-checker concern and lands in Phase 3.
+fn synth_assign<'a>(b: BinaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
+    let lhs_ty = match b.lhs() {
+        Some(Expr::Path(p)) => synth_path(p, cx),
+        Some(other) => {
+            cx.diags.push(Diagnostic::error(
+                ec::BAD_OPERAND,
+                Label::new(expr_span(other), ""),
+                "left side of `=` must be an assignable place (a local variable name)",
+            ));
+            Ty::Error
+        }
+        None => Ty::Error,
+    };
+    if let Some(rhs) = b.rhs() {
+        check_expr(rhs, lhs_ty, cx);
+    }
+    Ty::U0
 }
 
 fn synth_unary<'a>(u: UnaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
@@ -732,8 +772,85 @@ fn synth_while<'a>(w: WhileExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
         check_expr(cond, Ty::Bool, cx);
     }
     if let Some(body) = w.body() {
+        cx.loop_depth += 1;
         synth_block(body, cx);
+        cx.loop_depth -= 1;
     }
+    Ty::U0
+}
+
+fn synth_break<'a>(br: BreakExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
+    if cx.loop_depth == 0 {
+        cx.diags.push(Diagnostic::error(
+            ec::BREAK_OUTSIDE_LOOP,
+            Label::new(br.syntax().span, ""),
+            "`break` outside of a loop",
+        ));
+    }
+    if let Some(v) = br.value() {
+        // Phase 1 doesn't thread break values; we still type-check the
+        // expression so user typos get diagnosed.
+        let _ = synth_expr(v, cx);
+    }
+    Ty::U0
+}
+
+fn synth_continue<'a>(co: ContinueExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
+    if cx.loop_depth == 0 {
+        cx.diags.push(Diagnostic::error(
+            ec::BREAK_OUTSIDE_LOOP,
+            Label::new(co.syntax().span, ""),
+            "`continue` outside of a loop",
+        ));
+    }
+    Ty::U0
+}
+
+fn synth_for<'a>(fe: ForExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
+    // Range bounds. Phase 1 supports only integer ranges; we infer the
+    // loop variable's type from the *start* bound and check the end
+    // against it.
+    let start_ty = match fe.range_start() {
+        Some(e) => synth_expr(e, cx),
+        None => Ty::Error,
+    };
+    if let Some(e) = fe.range_end() {
+        check_expr(e, start_ty, cx);
+    }
+    let var_ty = if start_ty.is_integer() {
+        start_ty
+    } else if start_ty == Ty::Error {
+        Ty::Error
+    } else {
+        cx.diags.push(Diagnostic::error(
+            ec::BAD_OPERAND,
+            Label::new(fe.syntax().span, ""),
+            format!("`for` loop range must be integer, found `{start_ty}`"),
+        ));
+        Ty::Error
+    };
+    // Bind the loop variable for the body's scope. We snapshot the
+    // previous local-vec length so we can pop the binding afterwards.
+    let saved_len = cx.locals.len();
+    if let Some(Pattern::Ident(p)) = fe.pattern() {
+        if let Some(name_span) = p.name() {
+            if let Some(name) = cx.sm.slice(name_span) {
+                let id = cx.alloc_binding();
+                cx.locals.push((name.to_string(), id, var_ty));
+                cx.tm.pat_bindings.insert(NodePtr(p.syntax()), id);
+            }
+        }
+    }
+    if let Some(Pattern::Wildcard(p)) = fe.pattern() {
+        let id = cx.alloc_binding();
+        cx.tm.pat_bindings.insert(NodePtr(p.syntax()), id);
+    }
+    if let Some(body) = fe.body() {
+        cx.loop_depth += 1;
+        synth_block(body, cx);
+        cx.loop_depth -= 1;
+    }
+    cx.locals.truncate(saved_len);
     Ty::U0
 }
 
@@ -961,6 +1078,9 @@ fn expr_span(e: Expr<'_>) -> Span {
         Expr::While(x) => x.syntax().span,
         Expr::Return(x) => x.syntax().span,
         Expr::Call(x) => x.syntax().span,
+        Expr::Break(x) => x.syntax().span,
+        Expr::Continue(x) => x.syntax().span,
+        Expr::For(x) => x.syntax().span,
         Expr::Stub(n) | Expr::Error(n) => n.span,
     }
 }

@@ -1,0 +1,5 @@
+fn double(x: i32) -> i32 {
+    x = x + x;
+    return x;
+}
+fn main() -> i32 { return double(7); }

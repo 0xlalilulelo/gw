@@ -1,0 +1,8 @@
+fn main() -> i32 {
+    let acc: i32 = 0;
+    for i in 0..6 {
+        if i == 3 { continue; }
+        acc = acc + i;
+    }
+    return acc;
+}

@@ -431,6 +431,12 @@ pub enum Expr<'a> {
     Return(ReturnExpr<'a>),
     /// `callee(args)`.
     Call(CallExpr<'a>),
+    /// `break` or `break expr`.
+    Break(BreakExpr<'a>),
+    /// `continue`.
+    Continue(ContinueExpr<'a>),
+    /// `for pat in lo..hi { body }` (Phase 1 supports range form only).
+    For(ForExpr<'a>),
     /// Recognised expression kind without a typed view yet.
     Stub(&'a SyntaxNode<'a>),
     /// Parser-recovery node.
@@ -452,13 +458,15 @@ impl<'a> Expr<'a> {
             WhileExpr => Self::While(self::WhileExpr(n)),
             ReturnExpr => Self::Return(self::ReturnExpr(n)),
             CallExpr => Self::Call(self::CallExpr(n)),
+            BreakExpr => Self::Break(self::BreakExpr(n)),
+            ContinueExpr => Self::Continue(self::ContinueExpr(n)),
+            ForExpr => Self::For(self::ForExpr(n)),
             // Hooks
-            MatchExpr | ForExpr | LoopExpr | BreakExpr | ContinueExpr | FieldExpr | IndexExpr
-            | CastExpr | RefExpr | DerefExpr | RangeExpr | OptionalChainExpr | NilCoalesceExpr
-            | MustExpr | FoxdieExpr | CatchExpr | TryExpr | AwaitExpr | YieldExpr
-            | ChannelSendExpr | ChannelRecvExpr | LockExpr | NakedExpr | RexBlock
-            | ComptimeExpr | IntrinsicCallExpr | AnonAggregateExpr | StructLitExpr
-            | ArrayLitExpr => Self::Stub(n),
+            MatchExpr | LoopExpr | FieldExpr | IndexExpr | CastExpr | RefExpr | DerefExpr
+            | RangeExpr | OptionalChainExpr | NilCoalesceExpr | MustExpr | FoxdieExpr
+            | CatchExpr | TryExpr | AwaitExpr | YieldExpr | ChannelSendExpr | ChannelRecvExpr
+            | LockExpr | NakedExpr | RexBlock | ComptimeExpr | IntrinsicCallExpr
+            | AnonAggregateExpr | StructLitExpr | ArrayLitExpr => Self::Stub(n),
             ErrorNode => Self::Error(n),
             _ => return None,
         })
@@ -477,6 +485,9 @@ impl<'a> Expr<'a> {
             Self::While(e) => e.syntax(),
             Self::Return(e) => e.syntax(),
             Self::Call(e) => e.syntax(),
+            Self::Break(e) => e.syntax(),
+            Self::Continue(e) => e.syntax(),
+            Self::For(e) => e.syntax(),
             Self::Stub(n) | Self::Error(n) => n,
         }
     }
@@ -826,6 +837,93 @@ impl<'a> ArgList<'a> {
     /// Iterator over argument expressions.
     pub fn args(self) -> impl Iterator<Item = Expr<'a>> + 'a {
         self.0.child_nodes().filter_map(Expr::cast)
+    }
+}
+
+/// `break` or `break expr`.
+#[derive(Copy, Clone)]
+pub struct BreakExpr<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for BreakExpr<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::BreakExpr).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> BreakExpr<'a> {
+    /// Optional break value (Phase 1 doesn't thread it through).
+    pub fn value(self) -> Option<Expr<'a>> {
+        self.0.child_nodes().find_map(Expr::cast)
+    }
+}
+
+/// `continue`.
+#[derive(Copy, Clone)]
+pub struct ContinueExpr<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for ContinueExpr<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::ContinueExpr).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+/// `for pat in lo..hi { body }`.
+///
+/// Phase 1 supports range iterators only; the parser stores the range
+/// bounds as two consecutive `Expr` children of the `ForExpr` node (the
+/// `..` / `..=` token between them is a leaf token).
+#[derive(Copy, Clone)]
+pub struct ForExpr<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for ForExpr<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::ForExpr).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> ForExpr<'a> {
+    /// Loop variable pattern.
+    pub fn pattern(self) -> Option<Pattern<'a>> {
+        self.0.child_nodes().find_map(Pattern::cast)
+    }
+
+    /// Lower bound of the range (the expression before `..`/`..=`).
+    pub fn range_start(self) -> Option<Expr<'a>> {
+        self.0.child_nodes().find_map(Expr::cast)
+    }
+
+    /// Upper bound of the range (the expression after `..`/`..=`).
+    pub fn range_end(self) -> Option<Expr<'a>> {
+        let mut iter = self.0.child_nodes().filter_map(Expr::cast);
+        let _start = iter.next();
+        iter.next()
+    }
+
+    /// Whether the range is inclusive (`..=`); false for exclusive (`..`).
+    pub fn inclusive(self) -> bool {
+        self.0.children.iter().any(|c| {
+            matches!(
+                c,
+                SyntaxElement::Token {
+                    kind: SyntaxKind::DotDotEq,
+                    ..
+                }
+            )
+        })
+    }
+
+    /// Loop body block.
+    pub fn body(self) -> Option<Block<'a>> {
+        first_child(self.0)
     }
 }
 

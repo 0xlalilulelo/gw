@@ -1,0 +1,5 @@
+fn main() -> i32 {
+    let acc: i32 = 1;
+    for i in 1..=5 { acc = acc * i; }
+    return acc;
+}

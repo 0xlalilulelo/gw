@@ -13,8 +13,8 @@
 //! the IR is filled in to support increments 2–6 without churn.
 
 use arsenal_ast::{
-    AstNode, BinaryExpr, Block, CallExpr, Expr, ExprStmt, FnDecl, IfExpr, LetStmt, LiteralExpr,
-    ParenExpr, PathExpr, Pattern, ReturnExpr, Stmt, SyntaxKind, UnaryExpr, WhileExpr,
+    AstNode, BinaryExpr, Block, CallExpr, Expr, ExprStmt, FnDecl, ForExpr, IfExpr, LetStmt,
+    LiteralExpr, ParenExpr, PathExpr, Pattern, ReturnExpr, Stmt, SyntaxKind, UnaryExpr, WhileExpr,
 };
 use arsenal_lex::{SourceMap, Span};
 use arsenal_resolve::{DefId, ResolvedModule};
@@ -316,6 +316,19 @@ struct Builder {
     blocks: Vec<DraftBlock>,
     /// Currently-open block. New statements go into this block.
     cur: BlockId,
+    /// Stack of (continue_bb, break_bb) pairs for the lexically
+    /// enclosing loops. Pushed on entering a `while`/`for` body and
+    /// popped on exit; consumed by `lower_break` / `lower_continue`.
+    loop_targets: Vec<LoopTarget>,
+}
+
+/// Where `break` and `continue` jump within the current loop.
+#[derive(Copy, Clone, Debug)]
+struct LoopTarget {
+    /// Block to jump to when `continue` is encountered (loop header).
+    continue_bb: BlockId,
+    /// Block to jump to when `break` is encountered (loop exit).
+    break_bb: BlockId,
 }
 
 struct DraftBlock {
@@ -347,6 +360,7 @@ impl Builder {
             locals: Vec::new(),
             blocks: Vec::new(),
             cur: BlockId(0),
+            loop_targets: Vec::new(),
         }
     }
 
@@ -470,13 +484,22 @@ fn lower_expr<'a>(b: &mut Builder, expr: Expr<'a>, lcx: &mut LowerCx<'a, '_, '_,
         Expr::Literal(l) => lower_literal(l, lcx),
         Expr::Path(p) => lower_path(p, lcx),
         Expr::Paren(p) => lower_paren(b, p, lcx),
-        Expr::Binary(bin) => lower_binary(b, bin, lcx),
+        Expr::Binary(bin) => {
+            if matches!(bin.op_kind(), Some(SyntaxKind::Eq)) {
+                lower_assign(b, bin, lcx)
+            } else {
+                lower_binary(b, bin, lcx)
+            }
+        }
         Expr::Unary(u) => lower_unary(b, u, lcx),
         Expr::Block(blk) => lower_block(b, blk, lcx),
         Expr::If(i) => lower_if(b, i, lcx),
         Expr::While(w) => lower_while(b, w, lcx),
         Expr::Return(r) => lower_return(b, r, lcx),
         Expr::Call(c) => lower_call(b, c, lcx),
+        Expr::Break(_) => lower_break(b),
+        Expr::Continue(_) => lower_continue(b),
+        Expr::For(fe) => lower_for(b, fe, lcx),
         Expr::Stub(_) | Expr::Error(_) => Operand::Const(Const::Error),
     }
 }
@@ -553,6 +576,37 @@ fn lower_paren<'a>(
     p.inner()
         .map(|e| lower_expr(b, e, lcx))
         .unwrap_or(Operand::Const(Const::Error))
+}
+
+/// Lower `lhs = rhs`. The LHS must be a path to a local (typeck has
+/// already enforced this and pushed a `BAD_OPERAND` diagnostic
+/// otherwise). Yields `Operand::Const(Const::Unit)` since assignment
+/// is a `u0`-typed expression.
+fn lower_assign<'a>(
+    b: &mut Builder,
+    bin: BinaryExpr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_>,
+) -> Operand {
+    let rhs_val = bin
+        .rhs()
+        .map(|e| lower_expr(b, e, lcx))
+        .unwrap_or(Operand::Const(Const::Error));
+    let dst = match bin.lhs() {
+        Some(Expr::Path(p)) => lcx
+            .typed
+            .path_bindings
+            .get(&NodePtr(p.syntax()))
+            .and_then(|bid| lcx.binding_to_local.get(bid))
+            .copied(),
+        _ => None,
+    };
+    if let Some(local) = dst {
+        b.push_stmt(MirStmt::Assign {
+            dst: local,
+            value: Rvalue::Use(rhs_val),
+        });
+    }
+    Operand::Const(Const::Unit)
 }
 
 fn lower_binary<'a>(
@@ -740,11 +794,182 @@ fn lower_while<'a>(
         },
     );
 
-    // Body.
+    // Body. Push the loop targets so any `break` or `continue` inside
+    // resolves to the right blocks; `continue` re-enters the header to
+    // re-evaluate the condition.
     b.cur = body_bb;
+    b.loop_targets.push(LoopTarget {
+        continue_bb: header_bb,
+        break_bb: exit_bb,
+    });
     if let Some(body) = w.body() {
         let _ = lower_block(b, body, lcx);
     }
+    b.loop_targets.pop();
+    b.set_terminator(b.cur, Terminator::Goto(header_bb));
+
+    // Continue at exit.
+    b.cur = exit_bb;
+    Operand::Const(Const::Unit)
+}
+
+/// Lower `break`. Jumps to the enclosing loop's exit block, then opens
+/// a fresh dead block to absorb any further statements in the same
+/// source block (those won't be reached at runtime). Outside any loop,
+/// emits no terminator — typeck has already pushed a diagnostic.
+fn lower_break(b: &mut Builder) -> Operand {
+    if let Some(target) = b.loop_targets.last().copied() {
+        b.set_terminator(b.cur, Terminator::Goto(target.break_bb));
+        let dead = b.alloc_block();
+        b.cur = dead;
+    }
+    Operand::Const(Const::Unit)
+}
+
+/// Lower `continue`. Jumps to the enclosing loop's continue target
+/// (the header for `while`, the increment block for `for`).
+fn lower_continue(b: &mut Builder) -> Operand {
+    if let Some(target) = b.loop_targets.last().copied() {
+        b.set_terminator(b.cur, Terminator::Goto(target.continue_bb));
+        let dead = b.alloc_block();
+        b.cur = dead;
+    }
+    Operand::Const(Const::Unit)
+}
+
+/// Lower `for x in lo..hi { body }` by desugaring into:
+///
+/// ```text
+///     let __counter = lo;
+///     let __end     = hi;
+/// header:
+///     if __counter >= __end goto exit    (or > for `..=`)
+///     x = __counter
+///     body
+/// step:
+///     __counter = __counter + 1
+///     goto header
+/// exit:
+/// ```
+///
+/// Continues jump to `step`, breaks jump to `exit`.
+fn lower_for<'a>(b: &mut Builder, fe: ForExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) -> Operand {
+    // Determine the iteration type from the start bound's typeck record.
+    let iter_ty = fe
+        .range_start()
+        .and_then(|e| lcx.typed.expr_types.get(&NodePtr(e.syntax())).copied())
+        .unwrap_or(Ty::Error);
+    let inclusive = fe.inclusive();
+
+    // Lower the bounds *before* opening the loop blocks so any nested
+    // expressions emit into the predecessor.
+    let start_val = fe
+        .range_start()
+        .map(|e| lower_expr(b, e, lcx))
+        .unwrap_or(Operand::Const(Const::Error));
+    let end_val = fe
+        .range_end()
+        .map(|e| lower_expr(b, e, lcx))
+        .unwrap_or(Operand::Const(Const::Error));
+
+    let span = fe.syntax().span;
+    let counter = b.alloc_local(LocalDecl { ty: iter_ty, span });
+    let end_local = b.alloc_local(LocalDecl { ty: iter_ty, span });
+
+    // Initialise counter and end.
+    b.push_stmt(MirStmt::Assign {
+        dst: counter,
+        value: Rvalue::Use(start_val),
+    });
+    b.push_stmt(MirStmt::Assign {
+        dst: end_local,
+        value: Rvalue::Use(end_val),
+    });
+
+    // Allocate the loop blocks.
+    let header_bb = b.alloc_block();
+    let body_bb = b.alloc_block();
+    let step_bb = b.alloc_block();
+    let exit_bb = b.alloc_block();
+
+    b.set_terminator(b.cur, Terminator::Goto(header_bb));
+
+    // Header: cmp counter against end and branch.
+    b.cur = header_bb;
+    let cmp_op = if inclusive { BinOp::Le } else { BinOp::Lt };
+    let cond_local = b.alloc_local(LocalDecl { ty: Ty::Bool, span });
+    b.push_stmt(MirStmt::Assign {
+        dst: cond_local,
+        value: Rvalue::BinOp {
+            op: cmp_op,
+            lhs: Operand::Local(counter),
+            rhs: Operand::Local(end_local),
+            ty: iter_ty,
+        },
+    });
+    b.set_terminator(
+        b.cur,
+        Terminator::Branch {
+            cond: Operand::Local(cond_local),
+            then_bb: body_bb,
+            else_bb: exit_bb,
+        },
+    );
+
+    // Body. Bind the user's loop variable to the counter's current value.
+    b.cur = body_bb;
+    if let Some(Pattern::Ident(p)) = fe.pattern() {
+        let var_local = b.alloc_local(LocalDecl { ty: iter_ty, span });
+        let bid = lcx
+            .typed
+            .pat_bindings
+            .get(&NodePtr(p.syntax()))
+            .copied()
+            .unwrap_or(BindingId(var_local.0));
+        lcx.binding_to_local.insert(bid, var_local);
+        b.push_stmt(MirStmt::Assign {
+            dst: var_local,
+            value: Rvalue::Use(Operand::Local(counter)),
+        });
+    }
+    // Wildcard pattern: nothing to bind.
+
+    b.loop_targets.push(LoopTarget {
+        continue_bb: step_bb,
+        break_bb: exit_bb,
+    });
+    if let Some(body) = fe.body() {
+        let _ = lower_block(b, body, lcx);
+    }
+    b.loop_targets.pop();
+    b.set_terminator(b.cur, Terminator::Goto(step_bb));
+
+    // Step: counter += 1.
+    b.cur = step_bb;
+    let one = match iter_ty {
+        Ty::Int(int_ty) => Operand::Const(Const::Int {
+            value: 1,
+            ty: int_ty,
+        }),
+        _ => Operand::Const(Const::Int {
+            value: 1,
+            ty: IntTy::I32,
+        }),
+    };
+    let next_local = b.alloc_local(LocalDecl { ty: iter_ty, span });
+    b.push_stmt(MirStmt::Assign {
+        dst: next_local,
+        value: Rvalue::BinOp {
+            op: BinOp::Add,
+            lhs: Operand::Local(counter),
+            rhs: one,
+            ty: iter_ty,
+        },
+    });
+    b.push_stmt(MirStmt::Assign {
+        dst: counter,
+        value: Rvalue::Use(Operand::Local(next_local)),
+    });
     b.set_terminator(b.cur, Terminator::Goto(header_bb));
 
     // Continue at exit.

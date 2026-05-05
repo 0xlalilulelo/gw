@@ -15,10 +15,10 @@ pub mod syntax_kind;
 
 pub use arena::FileArena;
 pub use ast::{
-    ArgList, ArrayType, AstNode, BinaryExpr, Block, CallExpr, ClassDecl, Expr, ExprStmt, FieldDecl,
-    FieldDeclList, FnDecl, IdentPat, IfExpr, Item, LetStmt, LiteralExpr, Module, OptType, Param,
-    ParamList, ParenExpr, PathExpr, PathType, Pattern, RefType, RetType, ReturnExpr, SliceType,
-    Stmt, Type, UnaryExpr, WhileExpr, WildcardPat,
+    ArgList, ArrayType, AstNode, BinaryExpr, Block, BreakExpr, CallExpr, ClassDecl, ContinueExpr,
+    Expr, ExprStmt, FieldDecl, FieldDeclList, FnDecl, ForExpr, IdentPat, IfExpr, Item, LetStmt,
+    LiteralExpr, Module, OptType, Param, ParamList, ParenExpr, PathExpr, PathType, Pattern,
+    RefType, RetType, ReturnExpr, SliceType, Stmt, Type, UnaryExpr, WhileExpr, WildcardPat,
 };
 pub use cst::{Checkpoint, CstBuilder, SyntaxElement, SyntaxNode};
 pub use print::{dump, dump_with, DumpOpts};

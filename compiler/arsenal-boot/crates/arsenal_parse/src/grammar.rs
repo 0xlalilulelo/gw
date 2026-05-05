@@ -439,7 +439,7 @@ fn parse_stmt(p: &mut Parser<'_, '_, '_>) {
     match p.current() {
         TokenKind::KwLet => parse_let_stmt(p),
         TokenKind::KwReturn => parse_expr_stmt(p, /* leading_kw */ true),
-        TokenKind::KwIf | TokenKind::KwWhile | TokenKind::LBrace => {
+        TokenKind::KwIf | TokenKind::KwWhile | TokenKind::KwFor | TokenKind::LBrace => {
             // Block-like expressions used as statements; they may stand
             // without a trailing `;`.
             let start = p.cur_byte_start();
@@ -527,6 +527,10 @@ fn parse_pattern(p: &mut Parser<'_, '_, '_>) {
 /// Right-associative operators reverse it.
 fn infix_bp(op: TokenKind) -> Option<(u8, u8)> {
     Some(match op {
+        // Assignment is right-associative and binds the loosest of any
+        // infix, so `x = y + 1` parses as `x = (y + 1)` and
+        // `a = b = c` parses as `a = (b = c)`.
+        TokenKind::Eq => (2, 1),
         TokenKind::PipePipe => (3, 4),
         TokenKind::AmpAmp => (5, 6),
         TokenKind::EqEq | TokenKind::BangEq => (7, 8),
@@ -645,6 +649,9 @@ fn parse_atom(p: &mut Parser<'_, '_, '_>) {
         TokenKind::KwIf => parse_if_expr(p),
         TokenKind::KwWhile => parse_while_expr(p),
         TokenKind::KwReturn => parse_return_expr(p),
+        TokenKind::KwBreak => parse_break_expr(p),
+        TokenKind::KwContinue => parse_continue_expr(p),
+        TokenKind::KwFor => parse_for_expr(p),
         _ => {
             let span = p.current_span();
             p.error(
@@ -722,6 +729,51 @@ fn parse_return_expr(p: &mut Parser<'_, '_, '_>) {
     // not a stmt-boundary.
     if !p.at_any(&[TokenKind::Semi, TokenKind::RBrace, TokenKind::Eof]) {
         parse_expr(p);
+    }
+    let end = p.cur_byte_start();
+    p.builder.finish_node(end);
+}
+
+fn parse_break_expr(p: &mut Parser<'_, '_, '_>) {
+    let start = p.cur_byte_start();
+    p.builder.start_node(SyntaxKind::BreakExpr, start);
+    p.expect(TokenKind::KwBreak);
+    // Optional break value (Phase 1 doesn't actually thread it through,
+    // but we accept the syntax).
+    if !p.at_any(&[TokenKind::Semi, TokenKind::RBrace, TokenKind::Eof]) {
+        parse_expr(p);
+    }
+    let end = p.cur_byte_start();
+    p.builder.finish_node(end);
+}
+
+fn parse_continue_expr(p: &mut Parser<'_, '_, '_>) {
+    let start = p.cur_byte_start();
+    p.builder.start_node(SyntaxKind::ContinueExpr, start);
+    p.expect(TokenKind::KwContinue);
+    let end = p.cur_byte_start();
+    p.builder.finish_node(end);
+}
+
+fn parse_for_expr(p: &mut Parser<'_, '_, '_>) {
+    let start = p.cur_byte_start();
+    p.builder.start_node(SyntaxKind::ForExpr, start);
+    p.expect(TokenKind::KwFor);
+    parse_pattern(p);
+    p.expect(TokenKind::KwIn);
+    // Phase 1 only supports range iterators: `for x in EXPR..EXPR { ... }`
+    // and `for x in EXPR..=EXPR { ... }`. Range expressions outside `for`
+    // are a Phase 2+ feature; we parse them inline here so the `..`
+    // tokens don't have to be added to `infix_bp`.
+    parse_expr(p);
+    if !p.eat(TokenKind::DotDot) && !p.eat(TokenKind::DotDotEq) {
+        p.unexpected("`..` or `..=` to begin a range");
+    }
+    parse_expr(p);
+    if p.at(TokenKind::LBrace) {
+        parse_block(p);
+    } else {
+        p.unexpected("`{` to begin the loop body");
     }
     let end = p.cur_byte_start();
     p.builder.finish_node(end);
