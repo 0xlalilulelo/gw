@@ -27,8 +27,9 @@
 
 use arsenal_ast::{
     AstNode, BinaryExpr, Block, BreakExpr, CallExpr, ClassDecl, ContinueExpr, Expr, ExprStmt,
-    FieldExpr, FnDecl, ForExpr, IfExpr, LetStmt, LiteralExpr, ParenExpr, PathExpr, PathType,
-    Pattern, ReturnExpr, Stmt, StructLitExpr, SyntaxKind, SyntaxNode, Type, UnaryExpr, WhileExpr,
+    FieldExpr, FnDecl, ForExpr, IfExpr, LetStmt, LiteralExpr, Module, ParenExpr, PathExpr,
+    PathType, Pattern, ReturnExpr, Stmt, StructLitExpr, SyntaxKind, SyntaxNode, Type, UnaryExpr,
+    WhileExpr,
 };
 use arsenal_lex::{DiagBag, Diagnostic, Label, SourceMap, Span};
 use arsenal_resolve::{primitive_type_name, DefId, DefKind, ResolvedModule};
@@ -319,12 +320,25 @@ pub fn type_check<'a>(
     // Pass 1b: collect fn signatures so calls can reference forward.
     let mut sigs: FxHashMap<DefId, FnSig> = FxHashMap::default();
     for def in &resolved.defs {
-        if def.kind != DefKind::Fn {
-            continue;
+        match def.kind {
+            DefKind::Fn => {
+                let fn_decl = FnDecl::cast(def.syntax).expect("DefKind::Fn syntax must be FnDecl");
+                let sig = check_fn_signature(fn_decl, resolved, sm, diags);
+                sigs.insert(def.id, sig);
+            }
+            DefKind::SyntheticMain => {
+                // Synthetic `main` from top-level statements: no params,
+                // returns i32 (POSIX exit code). Phase 1 increment 11a.
+                sigs.insert(
+                    def.id,
+                    FnSig {
+                        params: Vec::new(),
+                        ret: Ty::Int(IntTy::I32),
+                    },
+                );
+            }
+            DefKind::Class => {}
         }
-        let fn_decl = FnDecl::cast(def.syntax).expect("DefKind::Fn syntax must be FnDecl");
-        let sig = check_fn_signature(fn_decl, resolved, sm, diags);
-        sigs.insert(def.id, sig);
     }
 
     // Pass 2: check function bodies.
@@ -338,11 +352,18 @@ pub fn type_check<'a>(
         pat_bindings: FxHashMap::default(),
     };
     for def in &resolved.defs {
-        if def.kind != DefKind::Fn {
-            continue;
+        match def.kind {
+            DefKind::Fn => {
+                let fn_decl = FnDecl::cast(def.syntax).unwrap();
+                check_fn_body(def.id, fn_decl, sm, &mut tm, diags);
+            }
+            DefKind::SyntheticMain => {
+                let module =
+                    Module::cast(def.syntax).expect("DefKind::SyntheticMain syntax must be Module");
+                check_synthetic_main_body(module, sm, &mut tm, diags);
+            }
+            DefKind::Class => {}
         }
-        let fn_decl = FnDecl::cast(def.syntax).unwrap();
-        check_fn_body(def.id, fn_decl, sm, &mut tm, diags);
     }
     tm
 }
@@ -627,6 +648,30 @@ fn check_fn_body<'a>(
         return;
     };
     check_block(body, sig.ret, &mut cx);
+}
+
+/// Type-check a synthetic `main` body composed of the module's top-level
+/// statements (Phase 1 increment 11a). The synthesised signature is
+/// `fn () -> i32`; the implicit return-zero on fall-through is materialised
+/// in MIR rather than typeck.
+fn check_synthetic_main_body<'a>(
+    module: Module<'a>,
+    sm: &SourceMap,
+    tm: &mut TypedModule<'a>,
+    diags: &mut DiagBag,
+) {
+    let mut cx = Cx {
+        sm,
+        diags,
+        tm,
+        expected_ret: Ty::Int(IntTy::I32),
+        locals: Vec::new(),
+        next_binding: 0,
+        loop_depth: 0,
+    };
+    for stmt in module.stmts() {
+        check_stmt(stmt, &mut cx);
+    }
 }
 
 fn check_block<'a>(block: Block<'a>, _expected: Ty, cx: &mut Cx<'a, '_, '_, '_>) {

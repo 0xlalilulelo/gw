@@ -14,11 +14,11 @@
 
 use arsenal_ast::{
     AstNode, BinaryExpr, Block, CallExpr, Expr, ExprStmt, FieldExpr, FnDecl, ForExpr, IfExpr,
-    LetStmt, LiteralExpr, ParenExpr, PathExpr, Pattern, ReturnExpr, Stmt, StructLitExpr,
+    LetStmt, LiteralExpr, Module, ParenExpr, PathExpr, Pattern, ReturnExpr, Stmt, StructLitExpr,
     SyntaxKind, UnaryExpr, WhileExpr,
 };
 use arsenal_lex::{SourceMap, Span};
-use arsenal_resolve::{DefId, ResolvedModule};
+use arsenal_resolve::{DefId, DefKind, ResolvedModule};
 use arsenal_typeck::{BindingId, ClassLayout, FloatTy, FnSig, IntTy, NodePtr, Ty, TypedModule};
 use rustc_hash::FxHashMap;
 
@@ -251,20 +251,75 @@ pub fn lower<'a>(
 
     let mut functions = Vec::new();
     for def in &resolved.defs {
-        // Skip class defs — they have no MIR function.
-        let Some(fn_decl) = FnDecl::cast(def.syntax) else {
-            continue;
-        };
-        let sig = typed.sigs.get(&def.id).cloned().unwrap_or(FnSig {
-            params: Vec::new(),
-            ret: Ty::Error,
-        });
-        let mir_fn = lower_fn(def.name.clone(), fn_decl, &sig, typed, sm, &def_to_fn);
-        functions.push(mir_fn);
+        match def.kind {
+            DefKind::Fn => {
+                let fn_decl = FnDecl::cast(def.syntax).expect("DefKind::Fn syntax must be FnDecl");
+                let sig = typed.sigs.get(&def.id).cloned().unwrap_or(FnSig {
+                    params: Vec::new(),
+                    ret: Ty::Error,
+                });
+                let mir_fn = lower_fn(def.name.clone(), fn_decl, &sig, typed, sm, &def_to_fn);
+                functions.push(mir_fn);
+            }
+            DefKind::SyntheticMain => {
+                let module =
+                    Module::cast(def.syntax).expect("DefKind::SyntheticMain syntax must be Module");
+                let mir_fn = lower_synthetic_main(module, typed, sm, &def_to_fn);
+                functions.push(mir_fn);
+            }
+            DefKind::Class => {
+                // Classes have no MIR function.
+            }
+        }
     }
     MirProgram {
         functions,
         class_layouts: typed.classes.clone(),
+    }
+}
+
+/// Lower the synthetic `main` produced by Phase 1 increment 11a from
+/// top-level statements. The signature is `() -> i32`; if control falls
+/// off the end of the body without an explicit `return`, an implicit
+/// `Return(Const::Int { value: 0, ty: I32 })` is appended so the program
+/// exits 0 by default.
+fn lower_synthetic_main<'a>(
+    module: Module<'a>,
+    typed: &TypedModule<'a>,
+    sm: &SourceMap,
+    def_to_fn: &FxHashMap<DefId, FnIdx>,
+) -> MirFn {
+    let mut b = Builder::new();
+    let entry = b.alloc_block();
+    b.cur = entry;
+
+    let mut lcx = LowerCx {
+        typed,
+        sm,
+        def_to_fn,
+        binding_to_local: FxHashMap::default(),
+    };
+    for stmt in module.stmts() {
+        lower_stmt(&mut b, stmt, &mut lcx);
+    }
+
+    if !b.blocks[b.cur.0 as usize].terminator_set {
+        b.set_terminator(
+            b.cur,
+            Terminator::Return(Operand::Const(Const::Int {
+                value: 0,
+                ty: IntTy::I32,
+            })),
+        );
+    }
+
+    MirFn {
+        name: "main".to_string(),
+        params: Vec::new(),
+        return_ty: Ty::Int(IntTy::I32),
+        locals: b.locals,
+        blocks: b.blocks.into_iter().map(|x| x.into_block()).collect(),
+        is_extern: false,
     }
 }
 

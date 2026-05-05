@@ -86,6 +86,12 @@ impl<'a> Module<'a> {
         self.0.child_nodes().filter_map(Item::cast)
     }
 
+    /// Top-level statements declared outside any `fn`. Phase 1 increment
+    /// 11a collects these into a synthetic `main` body.
+    pub fn stmts(self) -> impl Iterator<Item = Stmt<'a>> + 'a {
+        self.0.child_nodes().filter_map(Stmt::cast)
+    }
+
     /// Doc comments attached to the module (leading `///` lines at file
     /// start, before the first item).
     pub fn doc_comments(self) -> impl Iterator<Item = Span> + 'a {

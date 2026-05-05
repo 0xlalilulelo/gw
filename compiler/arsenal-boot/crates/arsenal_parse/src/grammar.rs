@@ -23,9 +23,15 @@ use arsenal_lex::TokenKind;
 // ─── public entry point ────────────────────────────────────────────────
 
 /// Parse a [`SyntaxKind::Module`] frame. Opens the frame, parses items
-/// until EOF, drains any trailing trivia, but does **not** call
-/// `finish_root` — the caller is responsible for that so it can recover
-/// the root reference.
+/// and top-level statements until EOF, drains any trailing trivia, but
+/// does **not** call `finish_root` — the caller is responsible for that
+/// so it can recover the root reference.
+///
+/// A top-level form is classified by the leading keyword (after any
+/// `pub`/`extern` modifiers): `fn`, `class`, and other recognised item
+/// keywords are parsed as items; anything else is parsed as a
+/// statement, which downstream passes collect into a synthetic `main`
+/// (Phase 1 increment 11a — see `docs/HANDOFF.md`).
 ///
 /// Recovery is best-effort; the result is always a syntactically-shaped
 /// Module node, possibly containing `ErrorNode` children where recovery
@@ -35,7 +41,11 @@ pub fn parse_module(p: &mut Parser<'_, '_, '_>) {
     p.builder.start_node(SyntaxKind::Module, start);
     while !p.at(TokenKind::Eof) {
         let before = p.pos;
-        parse_item_or_recover(p);
+        if is_top_level_item_kind(peek_item_keyword(p)) {
+            parse_item_or_recover(p);
+        } else {
+            parse_stmt(p);
+        }
         if p.pos == before {
             // Defensive: don't infinite-loop on a sync-set member.
             // Bump one significant token under an Error node.
@@ -44,6 +54,30 @@ pub fn parse_module(p: &mut Parser<'_, '_, '_>) {
     }
     // Trailing trivia goes into Module so the dump stays lossless.
     p.skip_trivia_into_node();
+}
+
+/// Whether a leading keyword (post `pub`/`extern` modifiers) starts a
+/// module item. Anything else at the top level is a top-level statement.
+/// `Eof` routes through the item path so a stray `pub`/`extern` with
+/// nothing after it produces the existing "expected an item" diagnostic.
+fn is_top_level_item_kind(kw: TokenKind) -> bool {
+    matches!(
+        kw,
+        TokenKind::KwFn
+            | TokenKind::KwClass
+            | TokenKind::KwLiberty
+            | TokenKind::KwCipher
+            | TokenKind::KwConst
+            | TokenKind::KwMod
+            | TokenKind::KwUse
+            | TokenKind::KwEnum
+            | TokenKind::KwUnion
+            | TokenKind::KwInline
+            | TokenKind::KwComptime
+            | TokenKind::Hash
+            | TokenKind::At
+            | TokenKind::Eof
+    )
 }
 
 fn recover_one_token(p: &mut Parser<'_, '_, '_>) {

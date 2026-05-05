@@ -21,6 +21,9 @@ pub mod ec {
     pub const DUPLICATE_DEFINITION: ErrorCode = ErrorCode(200);
     /// A function declaration has no name token.
     pub const MISSING_NAME: ErrorCode = ErrorCode(201);
+    /// Top-level statements appear alongside an explicit `fn main`.
+    /// Both would lower to the same `main` symbol.
+    pub const TOP_LEVEL_STMTS_WITH_EXPLICIT_MAIN: ErrorCode = ErrorCode(202);
 }
 
 /// Stable identifier for a top-level definition within a module.
@@ -37,6 +40,10 @@ pub enum DefKind {
     Fn,
     /// `class Name { fields }` — POD aggregate type declaration.
     Class,
+    /// Implicit `main` synthesised from top-level statements outside any
+    /// `fn`. The `Def::syntax` field points at the [`Module`] node so
+    /// downstream passes can iterate `Module::stmts()`.
+    SyntheticMain,
 }
 
 /// One entry in the module symbol table.
@@ -96,6 +103,37 @@ pub fn resolve_module<'a>(
                 // Phase 0 parser already produced diagnostics for items
                 // it couldn't classify; the resolver doesn't add more.
             }
+        }
+    }
+
+    // Phase 1 increment 11a: top-level statements outside any `fn`
+    // synthesise an implicit `main`. If the user also wrote an explicit
+    // `fn main`, the two would collide on the linker symbol — diagnose
+    // and skip the synthetic registration.
+    if module.stmts().next().is_some() {
+        if let Some(&prev_id) = by_name.get("main") {
+            let prev = &defs[prev_id.0 as usize];
+            diags.push(
+                Diagnostic::error(
+                    ec::TOP_LEVEL_STMTS_WITH_EXPLICIT_MAIN,
+                    Label::new(prev.name_span, ""),
+                    "top-level statements cannot coexist with an explicit `fn main`",
+                )
+                .with_secondary(Label::new(
+                    prev.name_span,
+                    "explicit `fn main` defined here",
+                )),
+            );
+        } else {
+            let id = DefId(defs.len() as u32);
+            by_name.insert("main".to_string(), id);
+            defs.push(Def {
+                id,
+                kind: DefKind::SyntheticMain,
+                name: "main".to_string(),
+                name_span: Span::synthetic(),
+                syntax: module_node,
+            });
         }
     }
 
@@ -278,5 +316,59 @@ mod tests {
         assert_eq!(primitive_type_name("bool"), Some(PrimitiveTy::Bool));
         assert_eq!(primitive_type_name("u0"), Some(PrimitiveTy::U0));
         assert_eq!(primitive_type_name("Vec3"), None);
+    }
+
+    fn run_resolver_full(src: &str) -> (Vec<(String, DefKind)>, u32) {
+        let mut sm = SourceMap::new();
+        let file = sm.add_file("t.gw", src);
+        let bytes = sm.get(file).unwrap().contents.as_bytes();
+        let bump = Bump::new();
+        let arena = FileArena::new(&bump, file);
+        let (root, mut diags) = parse(file, bytes, &arena);
+        let resolved = resolve_module(root, &sm, &mut diags);
+        let entries: Vec<_> = resolved
+            .defs
+            .iter()
+            .map(|d| (d.name.clone(), d.kind))
+            .collect();
+        (entries, diags.error_count())
+    }
+
+    #[test]
+    fn top_level_stmts_synthesise_main() {
+        let (entries, errs) = run_resolver_full("let x: i32 = 1; return x;");
+        assert_eq!(errs, 0);
+        assert_eq!(entries, vec![("main".to_string(), DefKind::SyntheticMain)]);
+    }
+
+    #[test]
+    fn items_only_no_synthetic_main() {
+        let (entries, errs) = run_resolver_full("fn main() -> i32 { return 0; }");
+        assert_eq!(errs, 0);
+        assert_eq!(entries, vec![("main".to_string(), DefKind::Fn)]);
+    }
+
+    #[test]
+    fn top_level_stmts_with_explicit_main_errors() {
+        let (entries, errs) = run_resolver_full("fn main() -> i32 { return 0; } let x: i32 = 1;");
+        assert_eq!(errs, 1);
+        // The explicit `fn main` is registered; the synthetic is skipped.
+        assert_eq!(entries, vec![("main".to_string(), DefKind::Fn)]);
+    }
+
+    #[test]
+    fn top_level_stmts_alongside_other_items() {
+        let (entries, errs) = run_resolver_full(
+            "extern fn putchar(c: i32) -> i32; class Foo { x: i32 } let x: i32 = 1; return x;",
+        );
+        assert_eq!(errs, 0);
+        assert_eq!(
+            entries,
+            vec![
+                ("putchar".to_string(), DefKind::Fn),
+                ("Foo".to_string(), DefKind::Class),
+                ("main".to_string(), DefKind::SyntheticMain),
+            ]
+        );
     }
 }
