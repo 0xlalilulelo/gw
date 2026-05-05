@@ -1,0 +1,12 @@
+// abs(x) returns the magnitude. We then exit with that magnitude
+// to verify extern declarations don't interfere with regular fns.
+extern fn putchar(c: i32) -> i32;
+fn abs(x: i32) -> i32 {
+    if x < 0 { return -x; }
+    return x;
+}
+fn main() -> i32 {
+    putchar(33);
+    putchar(10);
+    return abs(-7);
+}

@@ -1,0 +1,10 @@
+extern fn putchar(c: i32) -> i32;
+fn main() -> i32 {
+    let c: i32 = 65;
+    while c < 70 {
+        putchar(c);
+        c = c + 1;
+    }
+    putchar(10);
+    return 0;
+}

@@ -1,0 +1,6 @@
+extern fn putchar(c: i32) -> i32;
+fn main() -> i32 {
+    for i in 0..5 { putchar(48 + i); }
+    putchar(10);
+    return 0;
+}

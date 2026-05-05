@@ -41,8 +41,14 @@ pub struct MirFn {
     /// are parameters; the rest are `let`-bindings or compiler-
     /// synthesised temporaries.
     pub locals: Vec<LocalDecl>,
-    /// Basic blocks; `blocks[0]` is the entry block.
+    /// Basic blocks; `blocks[0]` is the entry block. **Empty for
+    /// extern declarations** — the body lives in another translation
+    /// unit (typically libc); codegen declares such functions with
+    /// import-style linkage and skips body emission.
     pub blocks: Vec<MirBlock>,
+    /// Whether this function has a body in this translation unit.
+    /// `false` for `extern fn name(...) -> T;` declarations.
+    pub is_extern: bool,
 }
 
 /// A local slot.
@@ -271,32 +277,40 @@ fn lower_fn<'a>(
         binding_to_local.insert(binding_id, local);
     }
 
-    // Open the entry block.
-    let entry = b.alloc_block();
-    b.cur = entry;
+    // Extern declarations have no body in this translation unit; we
+    // emit them as block-less MirFns and let codegen declare them with
+    // import-style linkage so the system linker resolves them against
+    // libc / another object.
+    let is_extern = fn_decl.body().is_none();
 
-    if let Some(body) = fn_decl.body() {
-        let mut lcx = LowerCx {
-            typed,
-            sm,
-            def_to_fn,
-            binding_to_local,
-        };
-        let _ = lower_block(&mut b, body, &mut lcx);
-    }
+    if !is_extern {
+        // Open the entry block.
+        let entry = b.alloc_block();
+        b.cur = entry;
 
-    // If the entry block (or wherever we ended up) has no terminator
-    // yet, fabricate one. This happens when the function body falls
-    // through without an explicit `return`. For a function returning
-    // `u0` this is fine; for any other return type it would have been
-    // a type-checker error already, and the unreachable terminator is
-    // a safety net.
-    if b.blocks[b.cur.0 as usize].terminator_set {
-        // already set
-    } else if sig.ret == Ty::U0 || sig.ret == Ty::Error {
-        b.set_terminator(b.cur, Terminator::Return(Operand::Const(Const::Unit)));
-    } else {
-        b.set_terminator(b.cur, Terminator::Unreachable);
+        if let Some(body) = fn_decl.body() {
+            let mut lcx = LowerCx {
+                typed,
+                sm,
+                def_to_fn,
+                binding_to_local,
+            };
+            let _ = lower_block(&mut b, body, &mut lcx);
+        }
+
+        // If the trailing block has no terminator yet, fabricate one.
+        // This happens when the function body falls through without an
+        // explicit `return`. For a function returning `u0` this is
+        // fine; for any other return type it would have been a type-
+        // checker error already, and the unreachable terminator is a
+        // safety net.
+        if b.blocks[b.cur.0 as usize].terminator_set {
+            // already set
+        } else if sig.ret == Ty::U0 || sig.ret == Ty::Error {
+            b.set_terminator(b.cur, Terminator::Return(Operand::Const(Const::Unit)));
+        } else {
+            b.set_terminator(b.cur, Terminator::Unreachable);
+        }
     }
 
     MirFn {
@@ -305,6 +319,7 @@ fn lower_fn<'a>(
         return_ty: sig.ret,
         locals: b.locals,
         blocks: b.blocks.into_iter().map(|x| x.into_block()).collect(),
+        is_extern,
     }
 }
 

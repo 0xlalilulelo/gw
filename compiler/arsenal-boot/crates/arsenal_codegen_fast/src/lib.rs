@@ -84,21 +84,31 @@ pub fn compile_program(
     let mut module = ObjectModule::new(object_builder);
 
     // Pass 1: declare every function so calls can resolve forward.
+    // `extern fn` declarations get `Linkage::Import` so the system
+    // linker resolves them against another translation unit (libc,
+    // typically). Locally-defined functions get `Linkage::Export` so
+    // the entry point (`main`) is reachable.
     let mut fn_ids: Vec<cranelift_module::FuncId> = Vec::with_capacity(prog.functions.len());
     for f in &prog.functions {
         let sig = make_signature(&module, f);
-        // Phase 1 exports every function; the linker decides which one
-        // is the entry point. `main` is conventionally the entry.
+        let linkage = if f.is_extern {
+            Linkage::Import
+        } else {
+            Linkage::Export
+        };
         let id = module
-            .declare_function(&f.name, Linkage::Export, &sig)
+            .declare_function(&f.name, linkage, &sig)
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         fn_ids.push(id);
     }
 
-    // Pass 2: define each function.
+    // Pass 2: define each non-extern function.
     let mut ctx = module.make_context();
     let mut fbctx = FunctionBuilderContext::new();
     for (i, f) in prog.functions.iter().enumerate() {
+        if f.is_extern {
+            continue;
+        }
         ctx.func.signature = make_signature(&module, f);
         define_fn(&mut ctx, &mut fbctx, &mut module, &fn_ids, f)?;
         module

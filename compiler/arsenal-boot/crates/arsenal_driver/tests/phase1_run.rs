@@ -1,7 +1,12 @@
 //! Phase-1 run-tests: each `tests/snake_eater/pass/phase1/<name>.gw`
 //! is built via `arsenal build`, the resulting executable is run, and
-//! its exit code must match the contents of
-//! `tests/snake_eater/pass/phase1/<name>.expected_exit`.
+//! its observable behaviour is matched against any sibling expectation
+//! files:
+//!
+//! - `<name>.expected_exit` — required; integer exit code on a single
+//!   line (modulo POSIX's 8-bit truncation).
+//! - `<name>.expected_stdout` — optional; raw bytes the program is
+//!   expected to write to stdout.
 //!
 //! Skipped on Windows for now — the driver invokes `cc`, which is not
 //! present by default on Windows runners. Cross-platform linker
@@ -12,7 +17,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn corpus_dir() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -82,15 +87,34 @@ fn corpus_runs_and_exits_correctly() {
 
         let exe = tmp.join(&stem);
         let run = Command::new(&exe)
-            .status()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .output()
             .unwrap_or_else(|e| panic!("invoke {}: {e}", exe.display()));
         let actual_exit = run
+            .status
             .code()
             .expect("process exited via signal, not exit code");
         assert_eq!(
             actual_exit, expected_exit,
             "{stem}: expected exit {expected_exit}, got {actual_exit}"
         );
+
+        // If `<name>.expected_stdout` exists, the program's stdout must
+        // match it byte-for-byte. Programs without the file are
+        // stdout-don't-care.
+        let expected_stdout_path = path.with_extension("expected_stdout");
+        if expected_stdout_path.is_file() {
+            let expected = fs::read(&expected_stdout_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", expected_stdout_path.display()));
+            assert_eq!(
+                run.stdout,
+                expected,
+                "{stem}: stdout mismatch\n  expected: {:?}\n  actual:   {:?}",
+                String::from_utf8_lossy(&expected),
+                String::from_utf8_lossy(&run.stdout),
+            );
+        }
 
         tested += 1;
         let _ = fs::remove_dir_all(&tmp);
