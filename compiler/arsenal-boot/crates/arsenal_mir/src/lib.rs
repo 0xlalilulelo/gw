@@ -13,19 +13,25 @@
 //! the IR is filled in to support increments 2–6 without churn.
 
 use arsenal_ast::{
-    AstNode, BinaryExpr, Block, CallExpr, Expr, ExprStmt, FnDecl, ForExpr, IfExpr, LetStmt,
-    LiteralExpr, ParenExpr, PathExpr, Pattern, ReturnExpr, Stmt, SyntaxKind, UnaryExpr, WhileExpr,
+    AstNode, BinaryExpr, Block, CallExpr, Expr, ExprStmt, FieldExpr, FnDecl, ForExpr, IfExpr,
+    LetStmt, LiteralExpr, ParenExpr, PathExpr, Pattern, ReturnExpr, Stmt, StructLitExpr,
+    SyntaxKind, UnaryExpr, WhileExpr,
 };
 use arsenal_lex::{SourceMap, Span};
 use arsenal_resolve::{DefId, ResolvedModule};
-use arsenal_typeck::{BindingId, FloatTy, FnSig, IntTy, NodePtr, Ty, TypedModule};
+use arsenal_typeck::{BindingId, ClassLayout, FloatTy, FnSig, IntTy, NodePtr, Ty, TypedModule};
 use rustc_hash::FxHashMap;
 
-/// The whole Phase-1 program: a flat list of functions.
+/// The whole Phase-1 program: a flat list of functions plus the
+/// class layout table copied from typeck so codegen doesn't need a
+/// back-pointer to the type checker.
 #[derive(Debug)]
 pub struct MirProgram {
     /// Functions in the order their [`DefId`]s were assigned.
     pub functions: Vec<MirFn>,
+    /// Class layouts indexed by [`DefId`]. Used by codegen to compute
+    /// stack-slot sizes and field byte offsets.
+    pub class_layouts: FxHashMap<DefId, ClassLayout>,
 }
 
 /// One lowered function.
@@ -84,6 +90,14 @@ pub struct MirBlock {
 pub enum MirStmt {
     /// `dst = rvalue`.
     Assign { dst: Local, value: Rvalue },
+    /// `local.field = rvalue` — store into a field of a class-typed
+    /// local. Distinct from `Assign` because the dst is a *projection*
+    /// rather than the full local.
+    AssignField {
+        dst: Local,
+        field_idx: u32,
+        value: Rvalue,
+    },
 }
 
 /// Right-hand side of a [`MirStmt::Assign`].
@@ -103,6 +117,13 @@ pub enum Rvalue {
     },
     /// Unary operation `op operand`. `ty` is the operand type.
     UnOp { op: UnOp, operand: Operand, ty: Ty },
+    /// Read of a field from a class-typed local: `local.field`.
+    /// `field_ty` is the field's type (used by codegen for load width).
+    Field {
+        base: Local,
+        field_idx: u32,
+        field_ty: Ty,
+    },
 }
 
 /// Reference to a value: either a constant or a local.
@@ -228,9 +249,12 @@ pub fn lower<'a>(
         def_to_fn.insert(def.id, FnIdx(i as u32));
     }
 
-    let mut functions = Vec::with_capacity(resolved.defs.len());
+    let mut functions = Vec::new();
     for def in &resolved.defs {
-        let fn_decl = FnDecl::cast(def.syntax).expect("resolver only registers FnDecl");
+        // Skip class defs — they have no MIR function.
+        let Some(fn_decl) = FnDecl::cast(def.syntax) else {
+            continue;
+        };
         let sig = typed.sigs.get(&def.id).cloned().unwrap_or(FnSig {
             params: Vec::new(),
             ret: Ty::Error,
@@ -238,7 +262,10 @@ pub fn lower<'a>(
         let mir_fn = lower_fn(def.name.clone(), fn_decl, &sig, typed, sm, &def_to_fn);
         functions.push(mir_fn);
     }
-    MirProgram { functions }
+    MirProgram {
+        functions,
+        class_layouts: typed.classes.clone(),
+    }
 }
 
 fn lower_fn<'a>(
@@ -515,6 +542,8 @@ fn lower_expr<'a>(b: &mut Builder, expr: Expr<'a>, lcx: &mut LowerCx<'a, '_, '_,
         Expr::Break(_) => lower_break(b),
         Expr::Continue(_) => lower_continue(b),
         Expr::For(fe) => lower_for(b, fe, lcx),
+        Expr::StructLit(s) => lower_struct_lit(b, s, lcx),
+        Expr::Field(fe) => lower_field(b, fe, lcx),
         Expr::Stub(_) | Expr::Error(_) => Operand::Const(Const::Error),
     }
 }
@@ -606,22 +635,62 @@ fn lower_assign<'a>(
         .rhs()
         .map(|e| lower_expr(b, e, lcx))
         .unwrap_or(Operand::Const(Const::Error));
-    let dst = match bin.lhs() {
-        Some(Expr::Path(p)) => lcx
-            .typed
-            .path_bindings
-            .get(&NodePtr(p.syntax()))
-            .and_then(|bid| lcx.binding_to_local.get(bid))
-            .copied(),
-        _ => None,
-    };
-    if let Some(local) = dst {
-        b.push_stmt(MirStmt::Assign {
-            dst: local,
-            value: Rvalue::Use(rhs_val),
-        });
+    match bin.lhs() {
+        Some(Expr::Path(p)) => {
+            let dst = lcx
+                .typed
+                .path_bindings
+                .get(&NodePtr(p.syntax()))
+                .and_then(|bid| lcx.binding_to_local.get(bid))
+                .copied();
+            if let Some(local) = dst {
+                b.push_stmt(MirStmt::Assign {
+                    dst: local,
+                    value: Rvalue::Use(rhs_val),
+                });
+            }
+        }
+        Some(Expr::Field(fe)) => {
+            // `local.field = rhs`. Resolve the local from the base
+            // path and the field index from typeck's class layout.
+            if let Some((base_local, field_idx)) = resolve_field_lvalue(fe, lcx) {
+                b.push_stmt(MirStmt::AssignField {
+                    dst: base_local,
+                    field_idx,
+                    value: Rvalue::Use(rhs_val),
+                });
+            }
+        }
+        _ => {}
     }
     Operand::Const(Const::Unit)
+}
+
+/// Resolve a `base.field` field-access expression in lvalue position.
+/// Returns `(base_local, field_idx)` if the base is a path to a
+/// class-typed local and the field is declared by that class.
+fn resolve_field_lvalue<'a>(
+    fe: FieldExpr<'a>,
+    lcx: &LowerCx<'a, '_, '_, '_>,
+) -> Option<(Local, u32)> {
+    let base = fe.base()?;
+    let base_local = match base {
+        Expr::Path(p) => {
+            let bid = lcx.typed.path_bindings.get(&NodePtr(p.syntax()))?;
+            *lcx.binding_to_local.get(bid)?
+        }
+        _ => return None,
+    };
+    // Look up class via the base's expr type (typeck recorded it).
+    let class_id = match lcx.typed.expr_types.get(&NodePtr(base.syntax())).copied()? {
+        Ty::Class(id) => id,
+        _ => return None,
+    };
+    let layout = lcx.typed.classes.get(&class_id)?;
+    let name_span = fe.field_name()?;
+    let name = lcx.sm.slice(name_span)?;
+    let idx = layout.fields.iter().position(|f| f.name == name)?;
+    Some((base_local, idx as u32))
 }
 
 fn lower_binary<'a>(
@@ -1047,6 +1116,94 @@ fn lower_call<'a>(b: &mut Builder, c: CallExpr<'a>, lcx: &mut LowerCx<'a, '_, '_
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────
+
+/// Lower `Foo { .x = 1, .y = 2 }`. Allocates a fresh class-typed
+/// local, emits one `AssignField` per provided field initialiser, and
+/// returns `Operand::Local(...)` referring to the new local.
+fn lower_struct_lit<'a>(
+    b: &mut Builder,
+    s: StructLitExpr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_>,
+) -> Operand {
+    let class_ty = lcx
+        .typed
+        .expr_types
+        .get(&NodePtr(s.syntax()))
+        .copied()
+        .unwrap_or(Ty::Error);
+    let class_id = match class_ty {
+        Ty::Class(id) => id,
+        _ => return Operand::Const(Const::Error),
+    };
+    let layout = match lcx.typed.classes.get(&class_id) {
+        Some(l) => l.clone(),
+        None => return Operand::Const(Const::Error),
+    };
+    let dst = b.alloc_local(LocalDecl {
+        ty: class_ty,
+        span: s.syntax().span,
+    });
+    if let Some(list) = s.fields() {
+        for fld in list.fields() {
+            let value = match fld.value() {
+                Some(e) => lower_expr(b, e, lcx),
+                None => Operand::Const(Const::Error),
+            };
+            let name_span = match fld.name() {
+                Some(sp) => sp,
+                None => continue,
+            };
+            let name = match lcx.sm.slice(name_span) {
+                Some(n) => n,
+                None => continue,
+            };
+            if let Some(idx) = layout.fields.iter().position(|f| f.name == name) {
+                b.push_stmt(MirStmt::AssignField {
+                    dst,
+                    field_idx: idx as u32,
+                    value: Rvalue::Use(value),
+                });
+            }
+        }
+    }
+    Operand::Local(dst)
+}
+
+/// Lower `base.field`. Phase 1 only supports direct `local.field`;
+/// nested projections (`a.b.c`) require the user to bind intermediates
+/// to locals first.
+fn lower_field<'a>(
+    b: &mut Builder,
+    fe: FieldExpr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_>,
+) -> Operand {
+    let Some((base_local, field_idx)) = resolve_field_lvalue(fe, lcx) else {
+        // Best-effort: still lower the base so any side effects fire.
+        if let Some(base) = fe.base() {
+            let _ = lower_expr(b, base, lcx);
+        }
+        return Operand::Const(Const::Error);
+    };
+    let field_ty = lcx
+        .typed
+        .expr_types
+        .get(&NodePtr(fe.syntax()))
+        .copied()
+        .unwrap_or(Ty::Error);
+    let dst = b.alloc_local(LocalDecl {
+        ty: field_ty,
+        span: fe.syntax().span,
+    });
+    b.push_stmt(MirStmt::Assign {
+        dst,
+        value: Rvalue::Field {
+            base: base_local,
+            field_idx,
+            field_ty,
+        },
+    });
+    Operand::Local(dst)
+}
 
 fn syntax_kind_to_binop(k: SyntaxKind) -> Option<BinOp> {
     use SyntaxKind::*;

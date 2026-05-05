@@ -1,0 +1,10 @@
+class Counter { value: i32 }
+fn main() -> i32 {
+    let c = Counter { .value = 0 };
+    let i: i32 = 0;
+    while i < 10 {
+        c.value = c.value + i;
+        i = i + 1;
+    }
+    return c.value;
+}

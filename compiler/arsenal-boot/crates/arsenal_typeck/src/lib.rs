@@ -26,12 +26,12 @@
 //! lowering can still produce best-effort output.
 
 use arsenal_ast::{
-    AstNode, BinaryExpr, Block, BreakExpr, CallExpr, ContinueExpr, Expr, ExprStmt, FnDecl, ForExpr,
-    IfExpr, LetStmt, LiteralExpr, ParenExpr, PathExpr, PathType, Pattern, ReturnExpr, Stmt,
-    SyntaxKind, SyntaxNode, Type, UnaryExpr, WhileExpr,
+    AstNode, BinaryExpr, Block, BreakExpr, CallExpr, ClassDecl, ContinueExpr, Expr, ExprStmt,
+    FieldExpr, FnDecl, ForExpr, IfExpr, LetStmt, LiteralExpr, ParenExpr, PathExpr, PathType,
+    Pattern, ReturnExpr, Stmt, StructLitExpr, SyntaxKind, SyntaxNode, Type, UnaryExpr, WhileExpr,
 };
 use arsenal_lex::{DiagBag, Diagnostic, Label, SourceMap, Span};
-use arsenal_resolve::{primitive_type_name, DefId, ResolvedModule};
+use arsenal_resolve::{primitive_type_name, DefId, DefKind, ResolvedModule};
 use rustc_hash::FxHashMap;
 
 /// Type-checker error codes. Reserved range: `E0300..E0399`.
@@ -59,9 +59,19 @@ pub mod ec {
     pub const MISSING_PARAM_TYPE: ErrorCode = ErrorCode(308);
     /// `break` or `continue` used outside of a loop body.
     pub const BREAK_OUTSIDE_LOOP: ErrorCode = ErrorCode(309);
+    /// Struct literal has the wrong field set, or `obj.x` references a
+    /// field the class doesn't declare.
+    pub const UNKNOWN_FIELD: ErrorCode = ErrorCode(310);
+    /// Struct literal initialises the same field more than once or
+    /// omits a required field.
+    pub const FIELD_INIT_MISMATCH: ErrorCode = ErrorCode(311);
+    /// Field access on a non-class value.
+    pub const FIELD_ON_NON_CLASS: ErrorCode = ErrorCode(312);
+    /// Struct-literal path didn't resolve to a class.
+    pub const NOT_A_CLASS: ErrorCode = ErrorCode(313);
 }
 
-/// Concrete type. Phase-1 supports primitives only; classes and
+/// Concrete type. Phase-1 supports primitives and POD classes;
 /// generics extend this in later phases.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
@@ -76,6 +86,10 @@ pub enum Ty {
     Float(FloatTy),
     /// `rune` — UTF-8 scalar.
     Rune,
+    /// User-defined POD class identified by its [`DefId`]. Phase 1
+    /// disallows classes in function signatures (a "Phase 2" deferred
+    /// limitation, since cross-fn passing requires by-pointer ABI work).
+    Class(DefId),
     /// Synthetic placeholder when type checking failed for an
     /// expression. Treated as compatible with any expected type so a
     /// single failure does not cascade.
@@ -169,6 +183,7 @@ impl std::fmt::Display for Ty {
                 FloatTy::F64 => "f64",
             }),
             Self::Rune => f.write_str("rune"),
+            Self::Class(def_id) => write!(f, "<class#{}>", def_id.0),
             Self::Error => f.write_str("<error>"),
         }
     }
@@ -195,13 +210,38 @@ pub struct Param {
     pub ty: Ty,
 }
 
+/// Resolved layout of one user-declared class.
+#[derive(Clone, Debug)]
+pub struct ClassLayout {
+    /// Source name (mostly for diagnostics).
+    pub name: String,
+    /// Fields in declaration order. Their types are already resolved;
+    /// codegen consumes this to compute byte offsets.
+    pub fields: Vec<ClassField>,
+}
+
+/// One field within a [`ClassLayout`].
+#[derive(Clone, Debug)]
+pub struct ClassField {
+    /// Source name of the field.
+    pub name: String,
+    /// Source span of the field's name (for diagnostics).
+    pub name_span: Span,
+    /// Resolved field type.
+    pub ty: Ty,
+}
+
 /// Result of type-checking a [`ResolvedModule`].
 pub struct TypedModule<'a> {
     /// Borrowed resolved module (so MIR lowering can still walk the
     /// CST).
     pub resolved: &'a ResolvedModule<'a>,
-    /// Per-definition signature, indexed by [`DefId`].
+    /// Per-definition signature, indexed by [`DefId`]. Only populated
+    /// for `DefKind::Fn` definitions.
     pub sigs: FxHashMap<DefId, FnSig>,
+    /// Per-definition class layout, indexed by [`DefId`]. Only
+    /// populated for `DefKind::Class` definitions.
+    pub classes: FxHashMap<DefId, ClassLayout>,
     /// Per-CST-node expression type (keyed by node pointer identity).
     pub expr_types: FxHashMap<NodePtr<'a>, Ty>,
     /// Resolved callee for each [`SyntaxKind::CallExpr`] node.
@@ -261,11 +301,29 @@ pub fn type_check<'a>(
     sm: &SourceMap,
     diags: &mut DiagBag,
 ) -> TypedModule<'a> {
-    // Pass 1: collect signatures so calls can reference forward.
+    // Pass 1a: collect class layouts. Classes go before fn signatures
+    // so that fn signatures referring to a class type resolve cleanly.
+    // (Phase 1 currently rejects classes in fn signatures; the ordering
+    // still matters for diagnostics.)
+    let mut classes: FxHashMap<DefId, ClassLayout> = FxHashMap::default();
+    for def in &resolved.defs {
+        if def.kind != DefKind::Class {
+            continue;
+        }
+        let class_decl = ClassDecl::cast(def.syntax)
+            .expect("resolver registered DefKind::Class with non-ClassDecl syntax");
+        let layout = check_class_layout(def.name.clone(), class_decl, resolved, sm, diags);
+        classes.insert(def.id, layout);
+    }
+
+    // Pass 1b: collect fn signatures so calls can reference forward.
     let mut sigs: FxHashMap<DefId, FnSig> = FxHashMap::default();
     for def in &resolved.defs {
-        let fn_decl = FnDecl::cast(def.syntax).expect("resolver only registers FnDecl");
-        let sig = check_fn_signature(fn_decl, sm, diags);
+        if def.kind != DefKind::Fn {
+            continue;
+        }
+        let fn_decl = FnDecl::cast(def.syntax).expect("DefKind::Fn syntax must be FnDecl");
+        let sig = check_fn_signature(fn_decl, resolved, sm, diags);
         sigs.insert(def.id, sig);
     }
 
@@ -273,19 +331,76 @@ pub fn type_check<'a>(
     let mut tm = TypedModule {
         resolved,
         sigs,
+        classes,
         expr_types: FxHashMap::default(),
         call_targets: FxHashMap::default(),
         path_bindings: FxHashMap::default(),
         pat_bindings: FxHashMap::default(),
     };
     for def in &resolved.defs {
+        if def.kind != DefKind::Fn {
+            continue;
+        }
         let fn_decl = FnDecl::cast(def.syntax).unwrap();
         check_fn_body(def.id, fn_decl, sm, &mut tm, diags);
     }
     tm
 }
 
-fn check_fn_signature(fn_decl: FnDecl<'_>, sm: &SourceMap, diags: &mut DiagBag) -> FnSig {
+fn check_class_layout(
+    name: String,
+    class_decl: ClassDecl<'_>,
+    resolved: &ResolvedModule<'_>,
+    sm: &SourceMap,
+    diags: &mut DiagBag,
+) -> ClassLayout {
+    let mut fields = Vec::new();
+    if let Some(list) = class_decl.fields() {
+        for fd in list.fields() {
+            let name_span = fd.name();
+            let f_name = name_span
+                .and_then(|s| sm.slice(s).map(str::to_string))
+                .unwrap_or_default();
+            let ty = match fd.ty() {
+                Some(t) => resolve_type(t, resolved, sm, diags),
+                None => {
+                    diags.push(Diagnostic::error(
+                        ec::MISSING_PARAM_TYPE,
+                        Label::new(fd.span(), ""),
+                        format!(
+                            "field `{}` is missing its type annotation",
+                            if f_name.is_empty() { "_" } else { &f_name },
+                        ),
+                    ));
+                    Ty::Error
+                }
+            };
+            // Phase 1 disallows nested class fields to keep codegen simple.
+            // (Nested classes would require recursive size/offset
+            // computation that we punt to Phase 2.)
+            if matches!(ty, Ty::Class(_)) {
+                diags.push(Diagnostic::error(
+                    ec::UNSUPPORTED_CONSTRUCT,
+                    Label::new(fd.span(), ""),
+                    "nested class fields are not yet supported in Phase 1",
+                ));
+            }
+            fields.push(ClassField {
+                name: f_name,
+                name_span: name_span.unwrap_or_else(Span::synthetic),
+                ty,
+            });
+        }
+    }
+    ClassLayout { name, fields }
+}
+
+fn check_fn_signature(
+    fn_decl: FnDecl<'_>,
+    resolved: &ResolvedModule<'_>,
+    sm: &SourceMap,
+    diags: &mut DiagBag,
+) -> FnSig {
     let mut params = Vec::new();
     if let Some(plist) = fn_decl.params() {
         for p in plist.params() {
@@ -294,7 +409,7 @@ fn check_fn_signature(fn_decl: FnDecl<'_>, sm: &SourceMap, diags: &mut DiagBag) 
                 .and_then(|s| sm.slice(s).map(str::to_string))
                 .unwrap_or_default();
             let ty = match p.ty() {
-                Some(t) => resolve_type(t, sm, diags),
+                Some(t) => resolve_type(t, resolved, sm, diags),
                 None => {
                     diags.push(Diagnostic::error(
                         ec::MISSING_PARAM_TYPE,
@@ -307,6 +422,15 @@ fn check_fn_signature(fn_decl: FnDecl<'_>, sm: &SourceMap, diags: &mut DiagBag) 
                     Ty::Error
                 }
             };
+            // Phase 1 disallows class-typed params: cross-fn passing
+            // requires a by-pointer ABI we haven't built yet.
+            if matches!(ty, Ty::Class(_)) {
+                diags.push(Diagnostic::error(
+                    ec::UNSUPPORTED_CONSTRUCT,
+                    Label::new(p.span(), ""),
+                    "class-typed parameters are not yet supported in Phase 1; pass primitive fields instead",
+                ));
+            }
             params.push(Param {
                 name,
                 name_span: name_span.unwrap_or_else(Span::synthetic),
@@ -315,7 +439,7 @@ fn check_fn_signature(fn_decl: FnDecl<'_>, sm: &SourceMap, diags: &mut DiagBag) 
         }
     }
     let ret = match fn_decl.ret_type().and_then(|rt| rt.ty()) {
-        Some(t) => resolve_type(t, sm, diags),
+        Some(t) => resolve_type(t, resolved, sm, diags),
         None => {
             diags.push(Diagnostic::error(
                 ec::MISSING_RETURN_TYPE,
@@ -325,35 +449,65 @@ fn check_fn_signature(fn_decl: FnDecl<'_>, sm: &SourceMap, diags: &mut DiagBag) 
             Ty::Error
         }
     };
+    if matches!(ret, Ty::Class(_)) {
+        diags.push(Diagnostic::error(
+            ec::UNSUPPORTED_CONSTRUCT,
+            Label::new(fn_decl.span(), ""),
+            "class-typed return values are not yet supported in Phase 1",
+        ));
+    }
     FnSig { params, ret }
 }
 
-fn resolve_type(ty: Type<'_>, sm: &SourceMap, diags: &mut DiagBag) -> Ty {
+fn resolve_type(
+    ty: Type<'_>,
+    resolved: &ResolvedModule<'_>,
+    sm: &SourceMap,
+    diags: &mut DiagBag,
+) -> Ty {
     let path = match ty {
         Type::Path(p) => p,
         _ => {
             diags.push(Diagnostic::error(
                 ec::UNSUPPORTED_CONSTRUCT,
                 Label::new(ty_span(&ty), ""),
-                "Phase 1 supports only path-typed primitives (i32, bool, …)",
+                "Phase 1 supports only path-typed primitives and classes",
             ));
             return Ty::Error;
         }
     };
-    primitive_from_path(path, sm).unwrap_or_else(|| {
-        let span = path.syntax().span;
-        let name = path
-            .segments()
-            .filter_map(|s| sm.slice(s))
-            .collect::<Vec<_>>()
-            .join("::");
-        diags.push(Diagnostic::error(
-            ec::UNKNOWN_TYPE,
-            Label::new(span, ""),
-            format!("unknown type `{name}`"),
-        ));
-        Ty::Error
-    })
+    if let Some(prim) = primitive_from_path(path, sm) {
+        return prim;
+    }
+    // Try class lookup.
+    if let Some(name) = single_segment_name(path, sm) {
+        if let Some(def) = resolved.lookup(name) {
+            if def.kind == arsenal_resolve::DefKind::Class {
+                return Ty::Class(def.id);
+            }
+        }
+    }
+    let span = path.syntax().span;
+    let name = path
+        .segments()
+        .filter_map(|s| sm.slice(s))
+        .collect::<Vec<_>>()
+        .join("::");
+    diags.push(Diagnostic::error(
+        ec::UNKNOWN_TYPE,
+        Label::new(span, ""),
+        format!("unknown type `{name}`"),
+    ));
+    Ty::Error
+}
+
+fn single_segment_name<'a>(path: PathType<'a>, sm: &'a SourceMap) -> Option<&'a str> {
+    let mut iter = path.segments();
+    let first = iter.next()?;
+    if iter.next().is_some() {
+        return None;
+    }
+    sm.slice(first)
 }
 
 fn ty_span(t: &Type<'_>) -> Span {
@@ -490,7 +644,9 @@ fn check_stmt<'a>(stmt: Stmt<'a>, cx: &mut Cx<'a, '_, '_, '_>) {
 }
 
 fn check_let<'a>(let_stmt: LetStmt<'a>, cx: &mut Cx<'a, '_, '_, '_>) {
-    let annotated = let_stmt.ty().map(|t| resolve_type(t, cx.sm, cx.diags));
+    let annotated = let_stmt
+        .ty()
+        .map(|t| resolve_type(t, cx.tm.resolved, cx.sm, cx.diags));
     let init_ty = let_stmt.init().map(|e| {
         let expected = annotated.unwrap_or(Ty::Error);
         check_expr(e, expected, cx)
@@ -558,6 +714,8 @@ fn synth_expr<'a>(expr: Expr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
         Expr::Break(br) => synth_break(br, cx),
         Expr::Continue(co) => synth_continue(co, cx),
         Expr::For(fe) => synth_for(fe, cx),
+        Expr::StructLit(s) => synth_struct_lit(s, cx),
+        Expr::Field(f) => synth_field(f, cx),
         Expr::Stub(n) | Expr::Error(n) => {
             cx.diags.push(Diagnostic::error(
                 ec::UNSUPPORTED_CONSTRUCT,
@@ -680,11 +838,12 @@ fn synth_binary<'a>(b: BinaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
 fn synth_assign<'a>(b: BinaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     let lhs_ty = match b.lhs() {
         Some(Expr::Path(p)) => synth_path(p, cx),
+        Some(Expr::Field(fe)) => synth_field(fe, cx),
         Some(other) => {
             cx.diags.push(Diagnostic::error(
                 ec::BAD_OPERAND,
                 Label::new(expr_span(other), ""),
-                "left side of `=` must be an assignable place (a local variable name)",
+                "left side of `=` must be an assignable place (a local variable name or field access)",
             ));
             Ty::Error
         }
@@ -852,6 +1011,145 @@ fn synth_for<'a>(fe: ForExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     }
     cx.locals.truncate(saved_len);
     Ty::U0
+}
+
+fn synth_struct_lit<'a>(s: StructLitExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
+    // Resolve the class name.
+    let path = match s.path() {
+        Some(p) => p,
+        None => return Ty::Error,
+    };
+    let mut segs = path.segments();
+    let Some(first) = segs.next() else {
+        return Ty::Error;
+    };
+    if segs.next().is_some() {
+        cx.diags.push(Diagnostic::error(
+            ec::UNSUPPORTED_CONSTRUCT,
+            Label::new(path.syntax().span, ""),
+            "multi-segment paths in struct literals are not yet supported",
+        ));
+        return Ty::Error;
+    }
+    let Some(name) = cx.sm.slice(first) else {
+        return Ty::Error;
+    };
+    let def = match cx.tm.resolved.lookup(name) {
+        Some(d) if d.kind == DefKind::Class => d.id,
+        Some(_) => {
+            cx.diags.push(Diagnostic::error(
+                ec::NOT_A_CLASS,
+                Label::new(path.syntax().span, ""),
+                format!("`{name}` is not a class"),
+            ));
+            return Ty::Error;
+        }
+        None => {
+            cx.diags.push(Diagnostic::error(
+                ec::UNKNOWN_NAME,
+                Label::new(path.syntax().span, ""),
+                format!("unknown class `{name}`"),
+            ));
+            return Ty::Error;
+        }
+    };
+    let layout = cx.tm.classes.get(&def).cloned().unwrap_or(ClassLayout {
+        name: name.to_string(),
+        fields: Vec::new(),
+    });
+
+    // Walk the literal's `.field = expr` items. Track which declared
+    // fields have been initialised; warn on duplicates and missing.
+    let mut seen = vec![false; layout.fields.len()];
+    if let Some(list) = s.fields() {
+        for fld in list.fields() {
+            let lit_name_span = fld.name();
+            let lit_name = lit_name_span
+                .and_then(|sp| cx.sm.slice(sp).map(str::to_string))
+                .unwrap_or_default();
+            let idx_match = layout.fields.iter().position(|f| f.name == lit_name);
+            let expected_ty = match idx_match {
+                Some(i) => {
+                    if seen[i] {
+                        cx.diags.push(Diagnostic::error(
+                            ec::FIELD_INIT_MISMATCH,
+                            Label::new(fld.syntax().span, ""),
+                            format!("field `{lit_name}` initialised more than once"),
+                        ));
+                    }
+                    seen[i] = true;
+                    layout.fields[i].ty
+                }
+                None => {
+                    cx.diags.push(Diagnostic::error(
+                        ec::UNKNOWN_FIELD,
+                        Label::new(lit_name_span.unwrap_or_else(|| fld.syntax().span), ""),
+                        format!("class `{}` has no field `{lit_name}`", layout.name),
+                    ));
+                    Ty::Error
+                }
+            };
+            if let Some(value) = fld.value() {
+                check_expr(value, expected_ty, cx);
+            }
+        }
+    }
+    // Diagnose missing fields.
+    let missing: Vec<_> = layout
+        .fields
+        .iter()
+        .zip(seen.iter())
+        .filter_map(|(f, &init)| (!init).then_some(f.name.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        cx.diags.push(Diagnostic::error(
+            ec::FIELD_INIT_MISMATCH,
+            Label::new(s.syntax().span, ""),
+            format!("struct literal is missing field(s): {}", missing.join(", "),),
+        ));
+    }
+
+    Ty::Class(def)
+}
+
+fn synth_field<'a>(fe: FieldExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
+    let base_ty = match fe.base() {
+        Some(b) => synth_expr(b, cx),
+        None => return Ty::Error,
+    };
+    let class_id = match base_ty {
+        Ty::Class(id) => id,
+        Ty::Error => return Ty::Error,
+        other => {
+            cx.diags.push(Diagnostic::error(
+                ec::FIELD_ON_NON_CLASS,
+                Label::new(fe.syntax().span, ""),
+                format!("field access on non-class type `{other}`"),
+            ));
+            return Ty::Error;
+        }
+    };
+    let Some(name_span) = fe.field_name() else {
+        return Ty::Error;
+    };
+    let Some(name) = cx.sm.slice(name_span) else {
+        return Ty::Error;
+    };
+    let layout = match cx.tm.classes.get(&class_id) {
+        Some(l) => l.clone(),
+        None => return Ty::Error,
+    };
+    match layout.fields.iter().find(|f| f.name == name) {
+        Some(f) => f.ty,
+        None => {
+            cx.diags.push(Diagnostic::error(
+                ec::UNKNOWN_FIELD,
+                Label::new(name_span, ""),
+                format!("class `{}` has no field `{name}`", layout.name),
+            ));
+            Ty::Error
+        }
+    }
 }
 
 fn synth_return<'a>(r: ReturnExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
@@ -1081,6 +1379,8 @@ fn expr_span(e: Expr<'_>) -> Span {
         Expr::Break(x) => x.syntax().span,
         Expr::Continue(x) => x.syntax().span,
         Expr::For(x) => x.syntax().span,
+        Expr::StructLit(x) => x.syntax().span,
+        Expr::Field(x) => x.syntax().span,
         Expr::Stub(n) | Expr::Error(n) => n.span,
     }
 }

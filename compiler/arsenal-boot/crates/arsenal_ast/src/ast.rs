@@ -437,6 +437,10 @@ pub enum Expr<'a> {
     Continue(ContinueExpr<'a>),
     /// `for pat in lo..hi { body }` (Phase 1 supports range form only).
     For(ForExpr<'a>),
+    /// `Foo { .x = 1, .y = 2 }` — class struct-literal construction.
+    StructLit(StructLitExpr<'a>),
+    /// `recv.field` — field access (read).
+    Field(FieldExpr<'a>),
     /// Recognised expression kind without a typed view yet.
     Stub(&'a SyntaxNode<'a>),
     /// Parser-recovery node.
@@ -461,12 +465,15 @@ impl<'a> Expr<'a> {
             BreakExpr => Self::Break(self::BreakExpr(n)),
             ContinueExpr => Self::Continue(self::ContinueExpr(n)),
             ForExpr => Self::For(self::ForExpr(n)),
+            StructLitExpr => Self::StructLit(self::StructLitExpr(n)),
+            FieldExpr => Self::Field(self::FieldExpr(n)),
             // Hooks
-            MatchExpr | LoopExpr | FieldExpr | IndexExpr | CastExpr | RefExpr | DerefExpr
-            | RangeExpr | OptionalChainExpr | NilCoalesceExpr | MustExpr | FoxdieExpr
-            | CatchExpr | TryExpr | AwaitExpr | YieldExpr | ChannelSendExpr | ChannelRecvExpr
-            | LockExpr | NakedExpr | RexBlock | ComptimeExpr | IntrinsicCallExpr
-            | AnonAggregateExpr | StructLitExpr | ArrayLitExpr => Self::Stub(n),
+            MatchExpr | LoopExpr | IndexExpr | CastExpr | RefExpr | DerefExpr | RangeExpr
+            | OptionalChainExpr | NilCoalesceExpr | MustExpr | FoxdieExpr | CatchExpr | TryExpr
+            | AwaitExpr | YieldExpr | ChannelSendExpr | ChannelRecvExpr | LockExpr | NakedExpr
+            | RexBlock | ComptimeExpr | IntrinsicCallExpr | AnonAggregateExpr | ArrayLitExpr => {
+                Self::Stub(n)
+            }
             ErrorNode => Self::Error(n),
             _ => return None,
         })
@@ -488,6 +495,8 @@ impl<'a> Expr<'a> {
             Self::Break(e) => e.syntax(),
             Self::Continue(e) => e.syntax(),
             Self::For(e) => e.syntax(),
+            Self::StructLit(e) => e.syntax(),
+            Self::Field(e) => e.syntax(),
             Self::Stub(n) | Self::Error(n) => n,
         }
     }
@@ -924,6 +933,131 @@ impl<'a> ForExpr<'a> {
     /// Loop body block.
     pub fn body(self) -> Option<Block<'a>> {
         first_child(self.0)
+    }
+}
+
+/// `Foo { .x = 1, .y = 2 }`.
+///
+/// The class name is the first `PathExpr` child; the field-list block
+/// is the `StructLitFieldList` child that follows.
+#[derive(Copy, Clone)]
+pub struct StructLitExpr<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for StructLitExpr<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::StructLitExpr).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> StructLitExpr<'a> {
+    /// Path identifying the class being constructed.
+    pub fn path(self) -> Option<PathExpr<'a>> {
+        first_child(self.0)
+    }
+    /// Field list (may be empty).
+    pub fn fields(self) -> Option<StructLitFieldList<'a>> {
+        first_child(self.0)
+    }
+}
+
+/// `{ .x = 1, .y = 2 }` — the field-list portion of a struct literal.
+#[derive(Copy, Clone)]
+pub struct StructLitFieldList<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for StructLitFieldList<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::StructLitFieldList).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> StructLitFieldList<'a> {
+    /// Iterator over `.name = expr` items in source order.
+    pub fn fields(self) -> impl Iterator<Item = StructLitField<'a>> + 'a {
+        children(self.0)
+    }
+}
+
+/// `.name = expr` inside a struct literal.
+#[derive(Copy, Clone)]
+pub struct StructLitField<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for StructLitField<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::StructLitField).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> StructLitField<'a> {
+    /// Span of the `name` ident (the first `Ident` child after the `.`).
+    pub fn name(self) -> Option<Span> {
+        // The struct field's children are `Dot`, `Ident`, `Eq`, value.
+        // Skip the dot when finding the name.
+        let mut iter = self.0.children.iter();
+        for c in &mut iter {
+            if let SyntaxElement::Token {
+                kind: SyntaxKind::Ident,
+                span,
+            } = c
+            {
+                return Some(*span);
+            }
+        }
+        None
+    }
+    /// Value expression on the RHS of `=`.
+    pub fn value(self) -> Option<Expr<'a>> {
+        self.0.child_nodes().find_map(Expr::cast)
+    }
+}
+
+/// `recv.field` — field-access expression.
+///
+/// The base (the `recv` half) is the first node child. The field name
+/// is the last `Ident` token leaf in the children list (the parser
+/// places it after the `Dot`).
+#[derive(Copy, Clone)]
+pub struct FieldExpr<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for FieldExpr<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::FieldExpr).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> FieldExpr<'a> {
+    /// Receiver expression.
+    pub fn base(self) -> Option<Expr<'a>> {
+        self.0.child_nodes().find_map(Expr::cast)
+    }
+    /// Span of the field name (the `Ident` token after the `Dot`).
+    pub fn field_name(self) -> Option<Span> {
+        let mut seen_dot = false;
+        for c in self.0.children {
+            match c {
+                SyntaxElement::Token {
+                    kind: SyntaxKind::Dot,
+                    ..
+                } => seen_dot = true,
+                SyntaxElement::Token {
+                    kind: SyntaxKind::Ident,
+                    span,
+                } if seen_dot => return Some(*span),
+                _ => {}
+            }
+        }
+        None
     }
 }
 

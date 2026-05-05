@@ -1,0 +1,12 @@
+extern fn putchar(c: i32) -> i32;
+class Range { lo: i32, hi: i32 }
+fn main() -> i32 {
+    let r = Range { .lo = 65, .hi = 70 };
+    let i: i32 = r.lo;
+    while i < r.hi {
+        putchar(i);
+        i = i + 1;
+    }
+    putchar(10);
+    return 0;
+}

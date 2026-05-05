@@ -13,8 +13,9 @@ use arsenal_mir::{
     BinOp, BlockId, Const, Local, MirBlock, MirFn, MirProgram, MirStmt, Operand, Rvalue,
     Terminator, UnOp,
 };
-use arsenal_typeck::{FloatTy, IntTy, Ty};
-use cranelift_codegen::ir::{self, AbiParam, InstBuilder, MemFlags};
+use arsenal_resolve::DefId;
+use arsenal_typeck::{ClassLayout, FloatTy, IntTy, Ty};
+use cranelift_codegen::ir::{self, AbiParam, InstBuilder, MemFlags, StackSlot};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::{isa, Context};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -110,7 +111,7 @@ pub fn compile_program(
             continue;
         }
         ctx.func.signature = make_signature(&module, f);
-        define_fn(&mut ctx, &mut fbctx, &mut module, &fn_ids, f)?;
+        define_fn(&mut ctx, &mut fbctx, &mut module, &fn_ids, prog, f)?;
         module
             .define_function(fn_ids[i], &mut ctx)
             .map_err(|e| CodegenError::Module(e.to_string()))?;
@@ -122,6 +123,68 @@ pub fn compile_program(
     object
         .emit()
         .map_err(|e| CodegenError::Codegen(e.to_string()))
+}
+
+/// Computed layout for a class type: total byte size, alignment, and
+/// the byte offset of each field. Field `i` lives at
+/// `offsets[i]..offsets[i] + size_of(fields[i].ty)`.
+struct ResolvedClassLayout {
+    size: u32,
+    align: u32,
+    offsets: Vec<u32>,
+}
+
+/// Compute storage layout for a class. Phase 1 supports only primitive
+/// fields (typeck rejects nested classes, so this won't recurse).
+fn resolve_class_layout(layout: &ClassLayout, ptr_bytes: u32) -> ResolvedClassLayout {
+    let mut offsets = Vec::with_capacity(layout.fields.len());
+    let mut offset: u32 = 0;
+    let mut max_align: u32 = 1;
+    for f in &layout.fields {
+        let (sz, al) = primitive_size_align(f.ty, ptr_bytes);
+        offset = align_up(offset, al);
+        offsets.push(offset);
+        offset = offset.saturating_add(sz);
+        if al > max_align {
+            max_align = al;
+        }
+    }
+    let size = if max_align == 0 {
+        offset
+    } else {
+        align_up(offset, max_align)
+    };
+    ResolvedClassLayout {
+        size,
+        align: max_align,
+        offsets,
+    }
+}
+
+fn primitive_size_align(ty: Ty, ptr_bytes: u32) -> (u32, u32) {
+    match ty {
+        Ty::U0 => (0, 1),
+        Ty::Bool => (1, 1),
+        Ty::Int(IntTy::I8) | Ty::Int(IntTy::U8) => (1, 1),
+        Ty::Int(IntTy::I16) | Ty::Int(IntTy::U16) => (2, 2),
+        Ty::Int(IntTy::I32) | Ty::Int(IntTy::U32) => (4, 4),
+        Ty::Int(IntTy::I64) | Ty::Int(IntTy::U64) => (8, 8),
+        Ty::Int(IntTy::ISize) | Ty::Int(IntTy::USize) => (ptr_bytes, ptr_bytes),
+        Ty::Float(FloatTy::F32) => (4, 4),
+        Ty::Float(FloatTy::F64) => (8, 8),
+        Ty::Rune => (4, 4),
+        // Phase 1 doesn't have nested-class fields. Fall back to
+        // pointer-sized just so codegen doesn't divide by zero.
+        _ => (ptr_bytes, ptr_bytes),
+    }
+}
+
+const fn align_up(v: u32, align: u32) -> u32 {
+    if align <= 1 {
+        return v;
+    }
+    let mask = align - 1;
+    (v + mask) & !mask
 }
 
 fn make_signature(module: &ObjectModule, f: &MirFn) -> ir::Signature {
@@ -172,22 +235,48 @@ fn define_fn(
     fbctx: &mut FunctionBuilderContext,
     module: &mut ObjectModule,
     fn_ids: &[cranelift_module::FuncId],
+    prog: &MirProgram,
     f: &MirFn,
 ) -> Result<(), CodegenError> {
     let mut builder = FunctionBuilder::new(&mut ctx.func, fbctx);
+    let ptr_bytes = module.target_config().pointer_bytes() as u32;
 
-    // Allocate one Cranelift Variable per MIR Local.
+    // Locals are allocated either as a Cranelift Variable (primitives,
+    // bool, rune) or as a StackSlot (class-typed locals). Variables
+    // get SSA-style def/use; StackSlots get stack_load / stack_store.
     let mut local_var: FxHashMap<Local, Variable> = FxHashMap::default();
+    let mut local_slot: FxHashMap<Local, StackSlot> = FxHashMap::default();
     for (i, decl) in f.locals.iter().enumerate() {
-        let var = Variable::from_u32(i as u32);
-        if let Some(clt) = clif_ty(decl.ty, module) {
-            builder.declare_var(var, clt);
-        } else {
-            // Allocate a placeholder for unit-typed locals so indices
-            // align; we never read these.
-            builder.declare_var(var, ir::types::I8);
+        let local = Local(i as u32);
+        match decl.ty {
+            Ty::Class(def_id) => {
+                let layout = prog
+                    .class_layouts
+                    .get(&def_id)
+                    .map(|cl| resolve_class_layout(cl, ptr_bytes))
+                    .unwrap_or(ResolvedClassLayout {
+                        size: ptr_bytes,
+                        align: ptr_bytes,
+                        offsets: Vec::new(),
+                    });
+                let slot = builder.create_sized_stack_slot(ir::StackSlotData::new(
+                    ir::StackSlotKind::ExplicitSlot,
+                    layout.size.max(1),
+                    layout.align.trailing_zeros() as u8,
+                ));
+                local_slot.insert(local, slot);
+            }
+            _ => {
+                let var = Variable::from_u32(i as u32);
+                if let Some(clt) = clif_ty(decl.ty, module) {
+                    builder.declare_var(var, clt);
+                } else {
+                    // Placeholder for unit-typed locals so indices align.
+                    builder.declare_var(var, ir::types::I8);
+                }
+                local_var.insert(local, var);
+            }
         }
-        local_var.insert(Local(i as u32), var);
     }
 
     // Allocate one Cranelift Block per MIR block.
@@ -198,7 +287,8 @@ fn define_fn(
     }
 
     // Append parameter values to the entry block and assign them to the
-    // parameter Variables.
+    // parameter Variables. (Class-typed parameters are forbidden by
+    // typeck in Phase 1.)
     let entry = clif_block[&BlockId(0)];
     builder.switch_to_block(entry);
     for (i, &param_local) in f.params.iter().enumerate() {
@@ -208,24 +298,26 @@ fn define_fn(
         };
         builder.append_block_param(entry, clt);
         let v = builder.block_params(entry)[i];
-        builder.def_var(local_var[&param_local], v);
+        if let Some(var) = local_var.get(&param_local) {
+            builder.def_var(*var, v);
+        }
     }
 
     // Lower each block. Cranelift requires every block to be sealed
     // after all predecessors are known; the simplest approach for a
     // first pass is to seal_all_blocks at the end.
+    let cx = LoweringCx {
+        prog,
+        ptr_bytes,
+        local_var: &local_var,
+        local_slot: &local_slot,
+        clif_block: &clif_block,
+        fn_ids,
+    };
     for (i, mir_block) in f.blocks.iter().enumerate() {
         let bb = clif_block[&BlockId(i as u32)];
         builder.switch_to_block(bb);
-        lower_block(
-            &mut builder,
-            module,
-            f,
-            fn_ids,
-            mir_block,
-            &local_var,
-            &clif_block,
-        );
+        lower_block(&mut builder, module, f, mir_block, &cx);
     }
 
     builder.seal_all_blocks();
@@ -233,44 +325,82 @@ fn define_fn(
     Ok(())
 }
 
+/// Bag of state passed down through codegen lowering. Lets us avoid
+/// threading half a dozen `&` references through every helper.
+struct LoweringCx<'a> {
+    prog: &'a MirProgram,
+    ptr_bytes: u32,
+    local_var: &'a FxHashMap<Local, Variable>,
+    local_slot: &'a FxHashMap<Local, StackSlot>,
+    clif_block: &'a FxHashMap<BlockId, ir::Block>,
+    fn_ids: &'a [cranelift_module::FuncId],
+}
+
+impl<'a> LoweringCx<'a> {
+    fn class_layout(&self, def_id: DefId) -> Option<ResolvedClassLayout> {
+        self.prog
+            .class_layouts
+            .get(&def_id)
+            .map(|cl| resolve_class_layout(cl, self.ptr_bytes))
+    }
+}
+
 fn lower_block(
     fb: &mut FunctionBuilder<'_>,
     module: &mut ObjectModule,
     f: &MirFn,
-    fn_ids: &[cranelift_module::FuncId],
     block: &MirBlock,
-    local_var: &FxHashMap<Local, Variable>,
-    clif_block: &FxHashMap<BlockId, ir::Block>,
+    cx: &LoweringCx<'_>,
 ) {
     for stmt in &block.statements {
         match stmt {
             MirStmt::Assign { dst, value } => {
-                let val = lower_rvalue(fb, module, f, value, local_var);
-                fb.def_var(local_var[dst], val);
+                lower_assign_stmt(fb, module, f, *dst, value, cx);
+            }
+            MirStmt::AssignField {
+                dst,
+                field_idx,
+                value,
+            } => {
+                let dst_ty = f.locals[dst.0 as usize].ty;
+                let class_id = match dst_ty {
+                    Ty::Class(id) => id,
+                    _ => continue, // typeck error already; nothing to do
+                };
+                let layout = match cx.class_layout(class_id) {
+                    Some(l) => l,
+                    None => continue,
+                };
+                let field_ty = cx.prog.class_layouts[&class_id].fields[*field_idx as usize].ty;
+                let offset = layout.offsets[*field_idx as usize];
+                let want = clif_ty(field_ty, module).unwrap_or(ir::types::I32);
+                let val = lower_rvalue(fb, module, f, value, cx, want);
+                let slot = cx.local_slot[dst];
+                fb.ins().stack_store(val, slot, offset as i32);
             }
         }
     }
     match &block.terminator {
         Terminator::Goto(target) => {
-            fb.ins().jump(clif_block[target], &[]);
+            fb.ins().jump(cx.clif_block[target], &[]);
         }
         Terminator::Branch {
             cond,
             then_bb,
             else_bb,
         } => {
-            let c = read_operand(fb, f, cond, local_var, ir::types::I8);
+            let c = read_operand(fb, f, cond, cx, ir::types::I8);
             // Cranelift's brif takes a boolean / integer condition; any
             // non-zero is true.
             fb.ins()
-                .brif(c, clif_block[then_bb], &[], clif_block[else_bb], &[]);
+                .brif(c, cx.clif_block[then_bb], &[], cx.clif_block[else_bb], &[]);
         }
         Terminator::Return(op) => {
             if matches!(f.return_ty, Ty::U0 | Ty::Error) {
                 fb.ins().return_(&[]);
             } else {
                 let want = clif_ty(f.return_ty, module).unwrap_or(ir::types::I32);
-                let v = read_operand(fb, f, op, local_var, want);
+                let v = read_operand(fb, f, op, cx, want);
                 fb.ins().return_(&[v]);
             }
         }
@@ -280,33 +410,80 @@ fn lower_block(
             dst,
             target_bb,
         } => {
-            let func_ref = module.declare_func_in_func(fn_ids[callee.0 as usize], fb.func);
+            let func_ref = module.declare_func_in_func(cx.fn_ids[callee.0 as usize], fb.func);
             let mut arg_vals = Vec::with_capacity(args.len());
-            let callee_fn = &f; // dummy
-            let _ = callee_fn;
-            // We need the callee's signature to know the expected arg
-            // types. The simplest approach: read off the FuncRef's
-            // signature from the function's declared signature.
             let sig_ref = fb.func.dfg.ext_funcs[func_ref].signature;
             for (i, op) in args.iter().enumerate() {
                 let want = fb.func.dfg.signatures[sig_ref].params[i].value_type;
-                arg_vals.push(read_operand(fb, f, op, local_var, want));
+                arg_vals.push(read_operand(fb, f, op, cx, want));
             }
             let inst = fb.ins().call(func_ref, &arg_vals);
-            // Capture the result(s) into `dst`.
             let results = fb.inst_results(inst).to_vec();
             if !results.is_empty() {
-                fb.def_var(local_var[dst], results[0]);
+                if let Some(var) = cx.local_var.get(dst) {
+                    fb.def_var(*var, results[0]);
+                }
             }
-            fb.ins().jump(clif_block[target_bb], &[]);
-            let _ = callee;
+            fb.ins().jump(cx.clif_block[target_bb], &[]);
         }
         Terminator::Unreachable => {
-            // Cranelift requires every block to have a terminator.
-            // Issue a trap with a synthetic code so codegen stays sound
-            // even if we accidentally reach this block at runtime.
             fb.ins().trap(ir::TrapCode::user(1).expect("trap code"));
         }
+    }
+}
+
+/// Lower a `MirStmt::Assign { dst, value }`. Branches on whether the
+/// destination local is primitive-typed (Variable + def_var) or
+/// class-typed (StackSlot + per-field copy).
+fn lower_assign_stmt(
+    fb: &mut FunctionBuilder<'_>,
+    module: &mut ObjectModule,
+    f: &MirFn,
+    dst: Local,
+    value: &Rvalue,
+    cx: &LoweringCx<'_>,
+) {
+    let dst_ty = f.locals[dst.0 as usize].ty;
+    if let Ty::Class(class_id) = dst_ty {
+        // Class-typed destination. Phase 1 only produces such Assigns
+        // via let-init shadowing of a struct literal: `let p =
+        // Foo {...};` allocates a class-typed temp inside lower_struct_lit
+        // and then Assigns it into the let's local. Lower as field-by-
+        // field memcpy from src slot to dst slot.
+        let Rvalue::Use(Operand::Local(src)) = value else {
+            // Other rvalue kinds for class dst are unreachable in Phase
+            // 1; play it safe and emit a trap.
+            fb.ins().trap(ir::TrapCode::user(3).expect("trap code"));
+            return;
+        };
+        let src_slot = match cx.local_slot.get(src) {
+            Some(s) => *s,
+            None => return,
+        };
+        let dst_slot = match cx.local_slot.get(&dst) {
+            Some(s) => *s,
+            None => return,
+        };
+        let layout = match cx.class_layout(class_id) {
+            Some(l) => l,
+            None => return,
+        };
+        let class_layout = &cx.prog.class_layouts[&class_id];
+        for (i, fld) in class_layout.fields.iter().enumerate() {
+            let off = layout.offsets[i] as i32;
+            let Some(ty) = clif_ty(fld.ty, module) else {
+                continue;
+            };
+            let v = fb.ins().stack_load(ty, src_slot, off);
+            fb.ins().stack_store(v, dst_slot, off);
+        }
+        return;
+    }
+    // Primitive dst.
+    let want = clif_ty(dst_ty, module).unwrap_or(ir::types::I32);
+    let val = lower_rvalue(fb, module, f, value, cx, want);
+    if let Some(var) = cx.local_var.get(&dst) {
+        fb.def_var(*var, val);
     }
 }
 
@@ -315,20 +492,40 @@ fn lower_rvalue(
     module: &mut ObjectModule,
     f: &MirFn,
     rv: &Rvalue,
-    local_var: &FxHashMap<Local, Variable>,
+    cx: &LoweringCx<'_>,
+    want_ty: ir::Type,
 ) -> ir::Value {
     match rv {
-        Rvalue::Use(op) => read_operand(fb, f, op, local_var, ir::types::I32),
+        Rvalue::Use(op) => read_operand(fb, f, op, cx, want_ty),
         Rvalue::BinOp { op, lhs, rhs, ty } => {
             let clt = clif_ty(*ty, module).unwrap_or(ir::types::I32);
-            let l = read_operand(fb, f, lhs, local_var, clt);
-            let r = read_operand(fb, f, rhs, local_var, clt);
+            let l = read_operand(fb, f, lhs, cx, clt);
+            let r = read_operand(fb, f, rhs, cx, clt);
             lower_binop(fb, *op, *ty, l, r)
         }
         Rvalue::UnOp { op, operand, ty } => {
             let clt = clif_ty(*ty, module).unwrap_or(ir::types::I32);
-            let v = read_operand(fb, f, operand, local_var, clt);
+            let v = read_operand(fb, f, operand, cx, clt);
             lower_unop(fb, *op, *ty, v)
+        }
+        Rvalue::Field {
+            base,
+            field_idx,
+            field_ty,
+        } => {
+            let base_ty = f.locals[base.0 as usize].ty;
+            let class_id = match base_ty {
+                Ty::Class(id) => id,
+                _ => return fb.ins().iconst(want_ty, 0),
+            };
+            let layout = match cx.class_layout(class_id) {
+                Some(l) => l,
+                None => return fb.ins().iconst(want_ty, 0),
+            };
+            let offset = layout.offsets[*field_idx as usize] as i32;
+            let slot = cx.local_slot[base];
+            let load_ty = clif_ty(*field_ty, module).unwrap_or(want_ty);
+            fb.ins().stack_load(load_ty, slot, offset)
         }
     }
 }
@@ -337,20 +534,24 @@ fn read_operand(
     fb: &mut FunctionBuilder<'_>,
     f: &MirFn,
     op: &Operand,
-    local_var: &FxHashMap<Local, Variable>,
+    cx: &LoweringCx<'_>,
     want: ir::Type,
 ) -> ir::Value {
     match op {
         Operand::Const(c) => emit_const(fb, c, want),
         Operand::Local(l) => {
-            let var = local_var[l];
-            let v = fb.use_var(var);
-            // For Phase 1 we trust the type checker to align operand
-            // and want types; if they ever diverge (e.g. shift count
-            // narrower than the value), Cranelift's verifier will trip.
-            let _ = f;
-            let _ = MemFlags::new(); // touch import
-            v
+            // Class-typed locals can't be "read" as a single value.
+            // Phase 1 paths that try to (e.g. Use(Operand::Local) of a
+            // class) are caught by `lower_assign_stmt`'s class-dst
+            // branch and don't reach here. For primitives, use_var.
+            if let Some(var) = cx.local_var.get(l) {
+                fb.use_var(*var)
+            } else {
+                // Fallback so codegen stays sound on unexpected paths.
+                let _ = f;
+                let _ = MemFlags::new();
+                fb.ins().iconst(want, 0)
+            }
         }
     }
 }

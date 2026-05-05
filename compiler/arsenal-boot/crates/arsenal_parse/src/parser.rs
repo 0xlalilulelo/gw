@@ -54,6 +54,12 @@ pub struct Parser<'src, 'arena, 'bump> {
     /// Diagnostics produced by both the lexer (forwarded in) and the
     /// parser.
     pub diags: DiagBag,
+    /// Whether `Ident {` should be parsed as a struct literal. Toggled
+    /// to `false` while parsing the condition of an `if`, `while`, or
+    /// `for` so the trailing `{` is left for the body. Same trick
+    /// rustc uses; without it, `if foo { ... }` would consume the
+    /// brace as part of a struct-literal continuation.
+    pub struct_literals_allowed: bool,
 }
 
 impl<'src, 'arena, 'bump> Parser<'src, 'arena, 'bump> {
@@ -72,6 +78,7 @@ impl<'src, 'arena, 'bump> Parser<'src, 'arena, 'bump> {
             builder: CstBuilder::new(arena),
             file: arena.file,
             diags,
+            struct_literals_allowed: true,
         }
     }
 

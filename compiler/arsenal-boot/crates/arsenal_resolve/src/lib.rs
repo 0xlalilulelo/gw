@@ -10,7 +10,7 @@
 //! Output: a [`ResolvedModule`] containing a flat map from names to
 //! [`DefId`]s plus the underlying CST root for downstream consumers.
 
-use arsenal_ast::{AstNode, FnDecl, Item, Module, SyntaxNode};
+use arsenal_ast::{AstNode, ClassDecl, FnDecl, Item, Module, SyntaxNode};
 use arsenal_lex::{DiagBag, Diagnostic, Label, SourceMap, Span};
 use rustc_hash::FxHashMap;
 
@@ -35,6 +35,8 @@ pub struct DefId(pub u32);
 pub enum DefKind {
     /// `fn name(...) -> ... { ... }`
     Fn,
+    /// `class Name { fields }` — POD aggregate type declaration.
+    Class,
 }
 
 /// One entry in the module symbol table.
@@ -89,6 +91,7 @@ pub fn resolve_module<'a>(
     for item in module.items() {
         match item {
             Item::Fn(f) => register_fn(f, sm, &mut defs, &mut by_name, diags),
+            Item::Class(c) => register_class(c, sm, &mut defs, &mut by_name, diags),
             _ => {
                 // Phase 0 parser already produced diagnostics for items
                 // it couldn't classify; the resolver doesn't add more.
@@ -143,6 +146,48 @@ fn register_fn<'a>(
         name,
         name_span,
         syntax: fn_decl.syntax(),
+    });
+}
+
+fn register_class<'a>(
+    class_decl: ClassDecl<'a>,
+    sm: &SourceMap,
+    defs: &mut Vec<Def<'a>>,
+    by_name: &mut FxHashMap<String, DefId>,
+    diags: &mut DiagBag,
+) {
+    let Some(name_span) = class_decl.name() else {
+        diags.push(Diagnostic::error(
+            ec::MISSING_NAME,
+            Label::new(class_decl.span(), ""),
+            "class declaration is missing its name",
+        ));
+        return;
+    };
+    let name = sm.slice(name_span).map(str::to_string).unwrap_or_default();
+    let id = DefId(defs.len() as u32);
+    if let Some(&prev_id) = by_name.get(&name) {
+        let prev = &defs[prev_id.0 as usize];
+        diags.push(
+            Diagnostic::error(
+                ec::DUPLICATE_DEFINITION,
+                Label::new(name_span, format!("`{name}` redefined here")),
+                format!("the name `{name}` is already defined in this module"),
+            )
+            .with_secondary(Label::new(
+                prev.name_span,
+                format!("previous definition of `{name}`"),
+            )),
+        );
+    } else {
+        by_name.insert(name.clone(), id);
+    }
+    defs.push(Def {
+        id,
+        kind: DefKind::Class,
+        name,
+        name_span,
+        syntax: class_decl.syntax(),
     });
 }
 

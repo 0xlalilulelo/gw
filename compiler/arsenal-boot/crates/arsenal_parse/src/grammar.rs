@@ -581,6 +581,19 @@ fn parse_expr_bp(p: &mut Parser<'_, '_, '_>, min_bp: u8) {
             continue;
         }
 
+        // Postfix: field access `.name`. Distinguished from float
+        // literals at the lexer level — `1.5` is a single FloatLit
+        // token, while `v.x` lexes as Ident Dot Ident.
+        if p.at(TokenKind::Dot) && p.peek_at(1) == TokenKind::Ident {
+            p.builder
+                .start_node_at(cp, SyntaxKind::FieldExpr, lhs_start);
+            p.bump_any(); // .
+            p.expect(TokenKind::Ident);
+            let end = p.cur_byte_start();
+            p.builder.finish_node(end);
+            continue;
+        }
+
         let op = p.current();
         let Some((l_bp, r_bp)) = infix_bp(op) else {
             break;
@@ -596,6 +609,32 @@ fn parse_expr_bp(p: &mut Parser<'_, '_, '_>, min_bp: u8) {
         let end = p.cur_byte_start();
         p.builder.finish_node(end);
     }
+}
+
+fn parse_struct_lit_field_list(p: &mut Parser<'_, '_, '_>) {
+    let start = p.cur_byte_start();
+    p.builder.start_node(SyntaxKind::StructLitFieldList, start);
+    p.expect(TokenKind::LBrace);
+    while !p.at(TokenKind::RBrace) && !p.at(TokenKind::Eof) {
+        parse_struct_lit_field(p);
+        if !p.eat(TokenKind::Comma) {
+            break;
+        }
+    }
+    p.expect(TokenKind::RBrace);
+    let end = p.cur_byte_start();
+    p.builder.finish_node(end);
+}
+
+fn parse_struct_lit_field(p: &mut Parser<'_, '_, '_>) {
+    let start = p.cur_byte_start();
+    p.builder.start_node(SyntaxKind::StructLitField, start);
+    p.expect(TokenKind::Dot);
+    p.expect(TokenKind::Ident);
+    p.expect(TokenKind::Eq);
+    parse_expr(p);
+    let end = p.cur_byte_start();
+    p.builder.finish_node(end);
 }
 
 fn parse_atom(p: &mut Parser<'_, '_, '_>) {
@@ -626,6 +665,9 @@ fn parse_atom(p: &mut Parser<'_, '_, '_>) {
             p.builder.finish_node(end);
         }
         TokenKind::Ident => {
+            // Take a checkpoint scoped to just the PathExpr so we can
+            // retroactively wrap it in a StructLitExpr if a `{` follows.
+            let path_cp = p.builder.checkpoint();
             p.builder.start_node(SyntaxKind::PathExpr, start);
             p.bump_any();
             while p.at(TokenKind::ColonColon) {
@@ -634,6 +676,16 @@ fn parse_atom(p: &mut Parser<'_, '_, '_>) {
             }
             let end = p.cur_byte_start();
             p.builder.finish_node(end);
+            // Struct literal continuation: `Foo { .x = 1, .y = 2 }`.
+            // Suppressed inside `if`/`while`/`for` conditions where the
+            // `{` belongs to the enclosing block (see `parse_cond_expr`).
+            if p.struct_literals_allowed && p.at(TokenKind::LBrace) {
+                p.builder
+                    .start_node_at(path_cp, SyntaxKind::StructLitExpr, start);
+                parse_struct_lit_field_list(p);
+                let end = p.cur_byte_start();
+                p.builder.finish_node(end);
+            }
         }
         TokenKind::LParen => {
             p.builder.start_node(SyntaxKind::ParenExpr, start);
@@ -688,7 +740,7 @@ fn parse_if_expr(p: &mut Parser<'_, '_, '_>) {
     let start = p.cur_byte_start();
     p.builder.start_node(SyntaxKind::IfExpr, start);
     p.expect(TokenKind::KwIf);
-    parse_expr(p);
+    parse_cond_expr(p);
     if p.at(TokenKind::LBrace) {
         parse_block(p);
     } else {
@@ -711,7 +763,7 @@ fn parse_while_expr(p: &mut Parser<'_, '_, '_>) {
     let start = p.cur_byte_start();
     p.builder.start_node(SyntaxKind::WhileExpr, start);
     p.expect(TokenKind::KwWhile);
-    parse_expr(p);
+    parse_cond_expr(p);
     if p.at(TokenKind::LBrace) {
         parse_block(p);
     } else {
@@ -719,6 +771,17 @@ fn parse_while_expr(p: &mut Parser<'_, '_, '_>) {
     }
     let end = p.cur_byte_start();
     p.builder.finish_node(end);
+}
+
+/// Parse an expression in a position where the *trailing* `{` belongs
+/// to the enclosing construct (the `if`/`while`/`for` body), not to a
+/// struct literal continuation. Toggles
+/// `parser.struct_literals_allowed` for the duration.
+fn parse_cond_expr(p: &mut Parser<'_, '_, '_>) {
+    let prev = p.struct_literals_allowed;
+    p.struct_literals_allowed = false;
+    parse_expr(p);
+    p.struct_literals_allowed = prev;
 }
 
 fn parse_return_expr(p: &mut Parser<'_, '_, '_>) {
@@ -764,12 +827,14 @@ fn parse_for_expr(p: &mut Parser<'_, '_, '_>) {
     // Phase 1 only supports range iterators: `for x in EXPR..EXPR { ... }`
     // and `for x in EXPR..=EXPR { ... }`. Range expressions outside `for`
     // are a Phase 2+ feature; we parse them inline here so the `..`
-    // tokens don't have to be added to `infix_bp`.
-    parse_expr(p);
+    // tokens don't have to be added to `infix_bp`. Both bounds are
+    // parsed in cond mode so a struct-literal `{` doesn't get glued
+    // onto the upper bound's tail.
+    parse_cond_expr(p);
     if !p.eat(TokenKind::DotDot) && !p.eat(TokenKind::DotDotEq) {
         p.unexpected("`..` or `..=` to begin a range");
     }
-    parse_expr(p);
+    parse_cond_expr(p);
     if p.at(TokenKind::LBrace) {
         parse_block(p);
     } else {

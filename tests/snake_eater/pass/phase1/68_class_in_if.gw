@@ -1,0 +1,6 @@
+class Pair { lo: i32, hi: i32 }
+fn main() -> i32 {
+    let p = Pair { .lo = 5, .hi = 7 };
+    if p.lo < p.hi { return p.hi; }
+    return p.lo;
+}

@@ -8,6 +8,7 @@ description            = "GW codegen — Phase 1 uses Cranelift; Phase 7 swaps i
 
 [dependencies]
 arsenal_lex     = { workspace = true }
+arsenal_resolve = { workspace = true }
 arsenal_typeck  = { workspace = true }
 arsenal_mir     = { workspace = true }
 cranelift-codegen   = { workspace = true }

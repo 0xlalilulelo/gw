@@ -1,0 +1,6 @@
+class Flags { active: bool, count: i32 }
+fn main() -> i32 {
+    let f = Flags { .active = true, .count = 30 };
+    if f.active { return f.count + 7; }
+    return 0;
+}

@@ -1,0 +1,6 @@
+class Sum { total: i32 }
+fn main() -> i32 {
+    let s = Sum { .total = 0 };
+    for i in 1..=10 { s.total = s.total + i; }
+    return s.total;
+}
