@@ -91,6 +91,10 @@ pub enum Ty {
     /// disallows classes in function signatures (a "Phase 2" deferred
     /// limitation, since cross-fn passing requires by-pointer ABI work).
     Class(DefId),
+    /// `[]T` — fat pointer (data + length) over an element type. Phase 1
+    /// only accepts `[]u8` for string literals; other element types and
+    /// cross-fn slice passing are deferred.
+    Slice(IntTy),
     /// Synthetic placeholder when type checking failed for an
     /// expression. Treated as compatible with any expected type so a
     /// single failure does not cascade.
@@ -185,6 +189,7 @@ impl std::fmt::Display for Ty {
             }),
             Self::Rune => f.write_str("rune"),
             Self::Class(def_id) => write!(f, "<class#{}>", def_id.0),
+            Self::Slice(elem) => write!(f, "[]{}", Self::Int(*elem)),
             Self::Error => f.write_str("<error>"),
         }
     }
@@ -398,12 +403,21 @@ fn check_class_layout(
             };
             // Phase 1 disallows nested class fields to keep codegen simple.
             // (Nested classes would require recursive size/offset
-            // computation that we punt to Phase 2.)
+            // computation that we punt to Phase 2.) Slice fields are
+            // similarly deferred — class layout would need to embed the
+            // slice's `(data, len)` pair.
             if matches!(ty, Ty::Class(_)) {
                 diags.push(Diagnostic::error(
                     ec::UNSUPPORTED_CONSTRUCT,
                     Label::new(fd.span(), ""),
                     "nested class fields are not yet supported in Phase 1",
+                ));
+            }
+            if matches!(ty, Ty::Slice(_)) {
+                diags.push(Diagnostic::error(
+                    ec::UNSUPPORTED_CONSTRUCT,
+                    Label::new(fd.span(), ""),
+                    "slice-typed class fields are not yet supported in Phase 1",
                 ));
             }
             fields.push(ClassField {
@@ -443,13 +457,20 @@ fn check_fn_signature(
                     Ty::Error
                 }
             };
-            // Phase 1 disallows class-typed params: cross-fn passing
-            // requires a by-pointer ABI we haven't built yet.
+            // Phase 1 disallows class- and slice-typed params: cross-fn
+            // passing requires a by-pointer ABI we haven't built yet.
             if matches!(ty, Ty::Class(_)) {
                 diags.push(Diagnostic::error(
                     ec::UNSUPPORTED_CONSTRUCT,
                     Label::new(p.span(), ""),
                     "class-typed parameters are not yet supported in Phase 1; pass primitive fields instead",
+                ));
+            }
+            if matches!(ty, Ty::Slice(_)) {
+                diags.push(Diagnostic::error(
+                    ec::UNSUPPORTED_CONSTRUCT,
+                    Label::new(p.span(), ""),
+                    "slice-typed parameters are not yet supported in Phase 1",
                 ));
             }
             params.push(Param {
@@ -477,6 +498,13 @@ fn check_fn_signature(
             "class-typed return values are not yet supported in Phase 1",
         ));
     }
+    if matches!(ret, Ty::Slice(_)) {
+        diags.push(Diagnostic::error(
+            ec::UNSUPPORTED_CONSTRUCT,
+            Label::new(fn_decl.span(), ""),
+            "slice-typed return values are not yet supported in Phase 1",
+        ));
+    }
     FnSig { params, ret }
 }
 
@@ -488,11 +516,33 @@ fn resolve_type(
 ) -> Ty {
     let path = match ty {
         Type::Path(p) => p,
+        Type::Slice(s) => {
+            // Phase 1 only supports `[]u8`; everything else is rejected
+            // until cross-fn slice passing and generic element types land.
+            let elem_ty = s
+                .element()
+                .map(|e| resolve_type(e, resolved, sm, diags))
+                .unwrap_or(Ty::Error);
+            return match elem_ty {
+                Ty::Int(IntTy::U8) => Ty::Slice(IntTy::U8),
+                Ty::Error => Ty::Error,
+                other => {
+                    diags.push(Diagnostic::error(
+                        ec::UNSUPPORTED_CONSTRUCT,
+                        Label::new(s.syntax().span, ""),
+                        format!(
+                            "Phase 1 only supports `[]u8` slices; element type `{other}` is not yet supported"
+                        ),
+                    ));
+                    Ty::Error
+                }
+            };
+        }
         _ => {
             diags.push(Diagnostic::error(
                 ec::UNSUPPORTED_CONSTRUCT,
                 Label::new(ty_span(&ty), ""),
-                "Phase 1 supports only path-typed primitives and classes",
+                "Phase 1 supports only path-typed primitives, classes, and `[]u8` slices",
             ));
             return Ty::Error;
         }
@@ -784,8 +834,9 @@ fn synth_literal(l: LiteralExpr<'_>, _cx: &mut Cx<'_, '_, '_, '_>) -> Ty {
         Some(SyntaxKind::KwNil) => Ty::Error, // requires `?T` context
         Some(SyntaxKind::RuneLit) => Ty::Rune,
         Some(SyntaxKind::ByteCharLit) => Ty::Int(IntTy::U8),
-        Some(SyntaxKind::StringLit | SyntaxKind::RawStringLit | SyntaxKind::CStringLit) => {
-            // Phase 1 doesn't yet model `[]u8` or `[*:0]u8`; placeholder.
+        Some(SyntaxKind::StringLit | SyntaxKind::RawStringLit) => Ty::Slice(IntTy::U8),
+        Some(SyntaxKind::CStringLit) => {
+            // `c"..."` (null-terminated `[*:0]u8`) is a Phase 2 concern.
             Ty::Error
         }
         _ => Ty::Error,
@@ -1162,6 +1213,36 @@ fn synth_field<'a>(fe: FieldExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
         Some(b) => synth_expr(b, cx),
         None => return Ty::Error,
     };
+    let Some(name_span) = fe.field_name() else {
+        return Ty::Error;
+    };
+    let Some(name) = cx.sm.slice(name_span) else {
+        return Ty::Error;
+    };
+    if let Ty::Slice(_) = base_ty {
+        // Phase 1 slice fields: `len` is exposed (usize); `data` is
+        // deferred to 11c when raw pointers land. Other names are
+        // genuinely unknown.
+        return match name {
+            "len" => Ty::Int(IntTy::USize),
+            "data" => {
+                cx.diags.push(Diagnostic::error(
+                    ec::UNSUPPORTED_CONSTRUCT,
+                    Label::new(name_span, ""),
+                    "slice `.data` is not yet supported in Phase 1; use `.len` for now",
+                ));
+                Ty::Error
+            }
+            _ => {
+                cx.diags.push(Diagnostic::error(
+                    ec::UNKNOWN_FIELD,
+                    Label::new(name_span, ""),
+                    format!("slice has no field `{name}`"),
+                ));
+                Ty::Error
+            }
+        };
+    }
     let class_id = match base_ty {
         Ty::Class(id) => id,
         Ty::Error => return Ty::Error,
@@ -1173,12 +1254,6 @@ fn synth_field<'a>(fe: FieldExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
             ));
             return Ty::Error;
         }
-    };
-    let Some(name_span) = fe.field_name() else {
-        return Ty::Error;
-    };
-    let Some(name) = cx.sm.slice(name_span) else {
-        return Ty::Error;
     };
     let layout = match cx.tm.classes.get(&class_id) {
         Some(l) => l.clone(),

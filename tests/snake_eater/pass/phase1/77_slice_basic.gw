@@ -1,0 +1,6 @@
+let a: []u8 = "Hello";
+let b: []u8 = "World!";
+if a.len < b.len {
+    return 7;
+}
+return 99;

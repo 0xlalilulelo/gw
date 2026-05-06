@@ -13,13 +13,12 @@ use arsenal_mir::{
     BinOp, BlockId, Const, Local, MirBlock, MirFn, MirProgram, MirStmt, Operand, Rvalue,
     Terminator, UnOp,
 };
-use arsenal_resolve::DefId;
 use arsenal_typeck::{ClassLayout, FloatTy, IntTy, Ty};
 use cranelift_codegen::ir::{self, AbiParam, InstBuilder, MemFlags, StackSlot};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::{isa, Context};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{DataDescription, DataId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -103,6 +102,38 @@ pub fn compile_program(
         fn_ids.push(id);
     }
 
+    // Pass 1b: declare and define one read-only data object per string
+    // literal referenced by the MIR. The data lives in `.rodata`; each
+    // `Const::DataAddr(id)` lowers to `global_value` of the matching
+    // `DataId`. Names are synthetic (`__gw_str_<i>`) and not exported.
+    let mut data_ids: Vec<DataId> = Vec::with_capacity(prog.string_literals.len());
+    for (i, bytes) in prog.string_literals.iter().enumerate() {
+        let name = format!("__gw_str_{i}");
+        let id = module
+            .declare_data(
+                &name,
+                Linkage::Local,
+                /* writable */ false,
+                /* tls */ false,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        let mut desc = DataDescription::new();
+        // Cranelift rejects empty data definitions; pad zero-length
+        // literals to a single byte so the symbol still resolves. The
+        // GW-level length stays 0 because that comes from the slice's
+        // len field, not the data object's size.
+        let payload: Vec<u8> = if bytes.is_empty() {
+            vec![0]
+        } else {
+            bytes.clone()
+        };
+        desc.define(payload.into_boxed_slice());
+        module
+            .define_data(id, &desc)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        data_ids.push(id);
+    }
+
     // Pass 2: define each non-extern function.
     let mut ctx = module.make_context();
     let mut fbctx = FunctionBuilderContext::new();
@@ -111,7 +142,15 @@ pub fn compile_program(
             continue;
         }
         ctx.func.signature = make_signature(&module, f);
-        define_fn(&mut ctx, &mut fbctx, &mut module, &fn_ids, prog, f)?;
+        define_fn(
+            &mut ctx,
+            &mut fbctx,
+            &mut module,
+            &fn_ids,
+            &data_ids,
+            prog,
+            f,
+        )?;
         module
             .define_function(fn_ids[i], &mut ctx)
             .map_err(|e| CodegenError::Module(e.to_string()))?;
@@ -235,6 +274,7 @@ fn define_fn(
     fbctx: &mut FunctionBuilderContext,
     module: &mut ObjectModule,
     fn_ids: &[cranelift_module::FuncId],
+    data_ids: &[DataId],
     prog: &MirProgram,
     f: &MirFn,
 ) -> Result<(), CodegenError> {
@@ -242,19 +282,17 @@ fn define_fn(
     let ptr_bytes = module.target_config().pointer_bytes() as u32;
 
     // Locals are allocated either as a Cranelift Variable (primitives,
-    // bool, rune) or as a StackSlot (class-typed locals). Variables
-    // get SSA-style def/use; StackSlots get stack_load / stack_store.
+    // bool, rune) or as a StackSlot (class- and slice-typed locals).
+    // Variables get SSA-style def/use; StackSlots get stack_load /
+    // stack_store.
     let mut local_var: FxHashMap<Local, Variable> = FxHashMap::default();
     let mut local_slot: FxHashMap<Local, StackSlot> = FxHashMap::default();
     for (i, decl) in f.locals.iter().enumerate() {
         let local = Local(i as u32);
         match decl.ty {
-            Ty::Class(def_id) => {
-                let layout = prog
-                    .class_layouts
-                    .get(&def_id)
-                    .map(|cl| resolve_class_layout(cl, ptr_bytes))
-                    .unwrap_or(ResolvedClassLayout {
+            Ty::Class(_) | Ty::Slice(_) => {
+                let layout =
+                    aggregate_layout(decl.ty, prog, ptr_bytes).unwrap_or(ResolvedClassLayout {
                         size: ptr_bytes,
                         align: ptr_bytes,
                         offsets: Vec::new(),
@@ -277,6 +315,16 @@ fn define_fn(
                 local_var.insert(local, var);
             }
         }
+    }
+
+    // Pre-declare each program-level data object inside this function
+    // so `Const::DataAddr` lowers to `ins.global_value` against a cached
+    // GlobalValue rather than needing `&mut module` deep in the rvalue
+    // path.
+    let mut data_gvs: Vec<ir::GlobalValue> = Vec::with_capacity(data_ids.len());
+    for &did in data_ids {
+        let gv = module.declare_data_in_func(did, builder.func);
+        data_gvs.push(gv);
     }
 
     // Allocate one Cranelift Block per MIR block.
@@ -313,6 +361,7 @@ fn define_fn(
         local_slot: &local_slot,
         clif_block: &clif_block,
         fn_ids,
+        data_gvs: &data_gvs,
     };
     for (i, mir_block) in f.blocks.iter().enumerate() {
         let bb = clif_block[&BlockId(i as u32)];
@@ -334,14 +383,59 @@ struct LoweringCx<'a> {
     local_slot: &'a FxHashMap<Local, StackSlot>,
     clif_block: &'a FxHashMap<BlockId, ir::Block>,
     fn_ids: &'a [cranelift_module::FuncId],
+    /// One [`ir::GlobalValue`] per [`StringLitId`], pre-declared in this
+    /// function's scope so `Const::DataAddr` lowers without `&mut module`.
+    data_gvs: &'a [ir::GlobalValue],
 }
 
 impl<'a> LoweringCx<'a> {
-    fn class_layout(&self, def_id: DefId) -> Option<ResolvedClassLayout> {
-        self.prog
+    fn aggregate_layout(&self, ty: Ty) -> Option<ResolvedClassLayout> {
+        aggregate_layout(ty, self.prog, self.ptr_bytes)
+    }
+
+    fn ptr_ty(&self) -> ir::Type {
+        match self.ptr_bytes {
+            8 => ir::types::I64,
+            4 => ir::types::I32,
+            _ => ir::types::I64,
+        }
+    }
+}
+
+/// Compute the offset/size/align layout for an aggregate-typed local
+/// (class or slice). Slices have a fixed two-field shape: data pointer
+/// at offset 0, `len: usize` at offset `ptr_bytes`. Classes consult the
+/// `class_layouts` map populated by typeck.
+fn aggregate_layout(ty: Ty, prog: &MirProgram, ptr_bytes: u32) -> Option<ResolvedClassLayout> {
+    match ty {
+        Ty::Class(def_id) => prog
             .class_layouts
             .get(&def_id)
-            .map(|cl| resolve_class_layout(cl, self.ptr_bytes))
+            .map(|cl| resolve_class_layout(cl, ptr_bytes)),
+        Ty::Slice(_) => Some(ResolvedClassLayout {
+            size: 2 * ptr_bytes,
+            align: ptr_bytes,
+            offsets: vec![0, ptr_bytes],
+        }),
+        _ => None,
+    }
+}
+
+/// The GW-level type of an aggregate's `field_idx`th field, used by
+/// codegen to pick the load/store width. For slices, both fields are
+/// pointer-sized in Phase 1; reporting `usize` for the data pointer is
+/// a small lie that yields the correct codegen width and is invisible
+/// at the surface (slice `.data` access is not exposed yet).
+fn aggregate_field_ty(ty: Ty, field_idx: u32, prog: &MirProgram) -> Ty {
+    match ty {
+        Ty::Class(def_id) => prog
+            .class_layouts
+            .get(&def_id)
+            .and_then(|cl| cl.fields.get(field_idx as usize))
+            .map(|f| f.ty)
+            .unwrap_or(Ty::Error),
+        Ty::Slice(_) => Ty::Int(IntTy::USize),
+        _ => Ty::Error,
     }
 }
 
@@ -363,17 +457,13 @@ fn lower_block(
                 value,
             } => {
                 let dst_ty = f.locals[dst.0 as usize].ty;
-                let class_id = match dst_ty {
-                    Ty::Class(id) => id,
-                    _ => continue, // typeck error already; nothing to do
-                };
-                let layout = match cx.class_layout(class_id) {
+                let layout = match cx.aggregate_layout(dst_ty) {
                     Some(l) => l,
                     None => continue,
                 };
-                let field_ty = cx.prog.class_layouts[&class_id].fields[*field_idx as usize].ty;
+                let field_ty = aggregate_field_ty(dst_ty, *field_idx, cx.prog);
                 let offset = layout.offsets[*field_idx as usize];
-                let want = clif_ty(field_ty, module).unwrap_or(ir::types::I32);
+                let want = clif_ty(field_ty, module).unwrap_or(cx.ptr_ty());
                 let val = lower_rvalue(fb, module, f, value, cx, want);
                 let slot = cx.local_slot[dst];
                 fb.ins().stack_store(val, slot, offset as i32);
@@ -434,7 +524,8 @@ fn lower_block(
 
 /// Lower a `MirStmt::Assign { dst, value }`. Branches on whether the
 /// destination local is primitive-typed (Variable + def_var) or
-/// class-typed (StackSlot + per-field copy).
+/// aggregate-typed (StackSlot + per-field copy). "Aggregate" covers
+/// both classes and slices in Phase 1.
 fn lower_assign_stmt(
     fb: &mut FunctionBuilder<'_>,
     module: &mut ObjectModule,
@@ -444,15 +535,16 @@ fn lower_assign_stmt(
     cx: &LoweringCx<'_>,
 ) {
     let dst_ty = f.locals[dst.0 as usize].ty;
-    if let Ty::Class(class_id) = dst_ty {
-        // Class-typed destination. Phase 1 only produces such Assigns
-        // via let-init shadowing of a struct literal: `let p =
-        // Foo {...};` allocates a class-typed temp inside lower_struct_lit
-        // and then Assigns it into the let's local. Lower as field-by-
-        // field memcpy from src slot to dst slot.
+    if matches!(dst_ty, Ty::Class(_) | Ty::Slice(_)) {
+        // Aggregate-typed destination. Phase 1 only produces such
+        // Assigns via let-init shadowing of a struct/string literal
+        // temp: `let p = Foo {...};` or `let s: []u8 = "...";` allocates
+        // a temp inside the lit lowering, emits per-field AssignFields,
+        // and then Assigns the temp into the let's local. Lower as
+        // field-by-field memcpy from src slot to dst slot.
         let Rvalue::Use(Operand::Local(src)) = value else {
-            // Other rvalue kinds for class dst are unreachable in Phase
-            // 1; play it safe and emit a trap.
+            // Other rvalue kinds for aggregate dst are unreachable in
+            // Phase 1; play it safe and emit a trap.
             fb.ins().trap(ir::TrapCode::user(3).expect("trap code"));
             return;
         };
@@ -464,18 +556,17 @@ fn lower_assign_stmt(
             Some(s) => *s,
             None => return,
         };
-        let layout = match cx.class_layout(class_id) {
+        let layout = match cx.aggregate_layout(dst_ty) {
             Some(l) => l,
             None => return,
         };
-        let class_layout = &cx.prog.class_layouts[&class_id];
-        for (i, fld) in class_layout.fields.iter().enumerate() {
-            let off = layout.offsets[i] as i32;
-            let Some(ty) = clif_ty(fld.ty, module) else {
+        for (i, &off) in layout.offsets.iter().enumerate() {
+            let field_ty = aggregate_field_ty(dst_ty, i as u32, cx.prog);
+            let Some(ty) = clif_ty(field_ty, module) else {
                 continue;
             };
-            let v = fb.ins().stack_load(ty, src_slot, off);
-            fb.ins().stack_store(v, dst_slot, off);
+            let v = fb.ins().stack_load(ty, src_slot, off as i32);
+            fb.ins().stack_store(v, dst_slot, off as i32);
         }
         return;
     }
@@ -514,11 +605,7 @@ fn lower_rvalue(
             field_ty,
         } => {
             let base_ty = f.locals[base.0 as usize].ty;
-            let class_id = match base_ty {
-                Ty::Class(id) => id,
-                _ => return fb.ins().iconst(want_ty, 0),
-            };
-            let layout = match cx.class_layout(class_id) {
+            let layout = match cx.aggregate_layout(base_ty) {
                 Some(l) => l,
                 None => return fb.ins().iconst(want_ty, 0),
             };
@@ -538,12 +625,12 @@ fn read_operand(
     want: ir::Type,
 ) -> ir::Value {
     match op {
-        Operand::Const(c) => emit_const(fb, c, want),
+        Operand::Const(c) => emit_const(fb, c, want, cx),
         Operand::Local(l) => {
-            // Class-typed locals can't be "read" as a single value.
-            // Phase 1 paths that try to (e.g. Use(Operand::Local) of a
-            // class) are caught by `lower_assign_stmt`'s class-dst
-            // branch and don't reach here. For primitives, use_var.
+            // Aggregate-typed locals (class, slice) can't be "read" as a
+            // single value. Phase 1 paths that try to are caught by
+            // `lower_assign_stmt`'s aggregate-dst branch and don't reach
+            // here. For primitives, use_var.
             if let Some(var) = cx.local_var.get(l) {
                 fb.use_var(*var)
             } else {
@@ -556,7 +643,12 @@ fn read_operand(
     }
 }
 
-fn emit_const(fb: &mut FunctionBuilder<'_>, c: &Const, want: ir::Type) -> ir::Value {
+fn emit_const(
+    fb: &mut FunctionBuilder<'_>,
+    c: &Const,
+    want: ir::Type,
+    cx: &LoweringCx<'_>,
+) -> ir::Value {
     match c {
         Const::Int { value, ty } => {
             let clt = match ty {
@@ -576,6 +668,13 @@ fn emit_const(fb: &mut FunctionBuilder<'_>, c: &Const, want: ir::Type) -> ir::Va
             FloatTy::F32 => fb.ins().f32const(f32::from_bits(*bits as u32)),
             FloatTy::F64 => fb.ins().f64const(f64::from_bits(*bits)),
         },
+        Const::DataAddr(id) => {
+            // Materialise the rodata payload's address as a pointer-
+            // sized value via the pre-declared GlobalValue cached in
+            // `cx.data_gvs`.
+            let gv = cx.data_gvs[id.0 as usize];
+            fb.ins().global_value(cx.ptr_ty(), gv)
+        }
         Const::Unit | Const::Error => fb.ins().iconst(want, 0),
     }
 }

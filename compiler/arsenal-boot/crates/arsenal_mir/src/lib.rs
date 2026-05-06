@@ -22,9 +22,9 @@ use arsenal_resolve::{DefId, DefKind, ResolvedModule};
 use arsenal_typeck::{BindingId, ClassLayout, FloatTy, FnSig, IntTy, NodePtr, Ty, TypedModule};
 use rustc_hash::FxHashMap;
 
-/// The whole Phase-1 program: a flat list of functions plus the
-/// class layout table copied from typeck so codegen doesn't need a
-/// back-pointer to the type checker.
+/// The whole Phase-1 program: a flat list of functions, the class
+/// layout table copied from typeck, and any string-literal payloads
+/// that need to land in `.rodata` (Phase 1 increment 11b).
 #[derive(Debug)]
 pub struct MirProgram {
     /// Functions in the order their [`DefId`]s were assigned.
@@ -32,7 +32,15 @@ pub struct MirProgram {
     /// Class layouts indexed by [`DefId`]. Used by codegen to compute
     /// stack-slot sizes and field byte offsets.
     pub class_layouts: FxHashMap<DefId, ClassLayout>,
+    /// Bytes of each string literal referenced by [`Const::DataAddr`].
+    /// Indices are [`StringLitId`]s. Codegen materialises one Cranelift
+    /// data object per entry.
+    pub string_literals: Vec<Vec<u8>>,
 }
+
+/// Index into [`MirProgram::string_literals`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct StringLitId(pub u32);
 
 /// One lowered function.
 #[derive(Debug)]
@@ -154,6 +162,10 @@ pub enum Const {
     Bool(bool),
     /// `u0` unit value.
     Unit,
+    /// Pointer-sized address of a `.rodata` payload. The id is an
+    /// index into [`MirProgram::string_literals`]. Codegen lowers via
+    /// `module.declare_data_in_func` + `ins.global_value`.
+    DataAddr(StringLitId),
     /// Placeholder when lowering encountered an error.
     Error,
 }
@@ -250,6 +262,7 @@ pub fn lower<'a>(
     }
 
     let mut functions = Vec::new();
+    let mut string_literals: Vec<Vec<u8>> = Vec::new();
     for def in &resolved.defs {
         match def.kind {
             DefKind::Fn => {
@@ -258,13 +271,22 @@ pub fn lower<'a>(
                     params: Vec::new(),
                     ret: Ty::Error,
                 });
-                let mir_fn = lower_fn(def.name.clone(), fn_decl, &sig, typed, sm, &def_to_fn);
+                let mir_fn = lower_fn(
+                    def.name.clone(),
+                    fn_decl,
+                    &sig,
+                    typed,
+                    sm,
+                    &def_to_fn,
+                    &mut string_literals,
+                );
                 functions.push(mir_fn);
             }
             DefKind::SyntheticMain => {
                 let module =
                     Module::cast(def.syntax).expect("DefKind::SyntheticMain syntax must be Module");
-                let mir_fn = lower_synthetic_main(module, typed, sm, &def_to_fn);
+                let mir_fn =
+                    lower_synthetic_main(module, typed, sm, &def_to_fn, &mut string_literals);
                 functions.push(mir_fn);
             }
             DefKind::Class => {
@@ -275,6 +297,7 @@ pub fn lower<'a>(
     MirProgram {
         functions,
         class_layouts: typed.classes.clone(),
+        string_literals,
     }
 }
 
@@ -288,6 +311,7 @@ fn lower_synthetic_main<'a>(
     typed: &TypedModule<'a>,
     sm: &SourceMap,
     def_to_fn: &FxHashMap<DefId, FnIdx>,
+    string_literals: &mut Vec<Vec<u8>>,
 ) -> MirFn {
     let mut b = Builder::new();
     let entry = b.alloc_block();
@@ -298,6 +322,7 @@ fn lower_synthetic_main<'a>(
         sm,
         def_to_fn,
         binding_to_local: FxHashMap::default(),
+        string_literals,
     };
     for stmt in module.stmts() {
         lower_stmt(&mut b, stmt, &mut lcx);
@@ -330,6 +355,7 @@ fn lower_fn<'a>(
     typed: &TypedModule<'a>,
     sm: &SourceMap,
     def_to_fn: &FxHashMap<DefId, FnIdx>,
+    string_literals: &mut Vec<Vec<u8>>,
 ) -> MirFn {
     let mut b = Builder::new();
 
@@ -376,6 +402,7 @@ fn lower_fn<'a>(
                 sm,
                 def_to_fn,
                 binding_to_local,
+                string_literals,
             };
             let _ = lower_block(&mut b, body, &mut lcx);
         }
@@ -493,17 +520,21 @@ impl Builder {
     }
 }
 
-struct LowerCx<'a, 'tm, 'sm, 'm> {
+struct LowerCx<'a, 'tm, 'sm, 'm, 'sl> {
     typed: &'tm TypedModule<'a>,
     sm: &'sm SourceMap,
     def_to_fn: &'m FxHashMap<DefId, FnIdx>,
     binding_to_local: FxHashMap<BindingId, Local>,
+    /// Program-level string-literal bytes table; lowering appends here
+    /// when it sees a string literal expression and uses the resulting
+    /// index as the [`StringLitId`].
+    string_literals: &'sl mut Vec<Vec<u8>>,
 }
 
 fn lower_block<'a>(
     b: &mut Builder,
     block: Block<'a>,
-    lcx: &mut LowerCx<'a, '_, '_, '_>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
 ) -> Operand {
     for stmt in block.stmts() {
         lower_stmt(b, stmt, lcx);
@@ -515,7 +546,7 @@ fn lower_block<'a>(
     }
 }
 
-fn lower_stmt<'a>(b: &mut Builder, stmt: Stmt<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) {
+fn lower_stmt<'a>(b: &mut Builder, stmt: Stmt<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>) {
     match stmt {
         Stmt::Let(l) => lower_let(b, l, lcx),
         Stmt::Expr(es) => lower_expr_stmt(b, es, lcx),
@@ -523,7 +554,7 @@ fn lower_stmt<'a>(b: &mut Builder, stmt: Stmt<'a>, lcx: &mut LowerCx<'a, '_, '_,
     }
 }
 
-fn lower_let<'a>(b: &mut Builder, let_stmt: LetStmt<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) {
+fn lower_let<'a>(b: &mut Builder, let_stmt: LetStmt<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>) {
     let init_ty = let_stmt
         .init()
         .and_then(|e| lcx.typed.expr_types.get(&NodePtr(e.syntax())).copied())
@@ -570,15 +601,19 @@ fn lower_let<'a>(b: &mut Builder, let_stmt: LetStmt<'a>, lcx: &mut LowerCx<'a, '
     }
 }
 
-fn lower_expr_stmt<'a>(b: &mut Builder, es: ExprStmt<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) {
+fn lower_expr_stmt<'a>(b: &mut Builder, es: ExprStmt<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>) {
     if let Some(e) = es.expr() {
         let _ = lower_expr(b, e, lcx);
     }
 }
 
-fn lower_expr<'a>(b: &mut Builder, expr: Expr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) -> Operand {
+fn lower_expr<'a>(
+    b: &mut Builder,
+    expr: Expr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
+) -> Operand {
     match expr {
-        Expr::Literal(l) => lower_literal(l, lcx),
+        Expr::Literal(l) => lower_literal(b, l, lcx),
         Expr::Path(p) => lower_path(p, lcx),
         Expr::Paren(p) => lower_paren(b, p, lcx),
         Expr::Binary(bin) => {
@@ -603,7 +638,11 @@ fn lower_expr<'a>(b: &mut Builder, expr: Expr<'a>, lcx: &mut LowerCx<'a, '_, '_,
     }
 }
 
-fn lower_literal<'a>(l: LiteralExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) -> Operand {
+fn lower_literal<'a>(
+    b: &mut Builder,
+    l: LiteralExpr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
+) -> Operand {
     let ty = lcx
         .typed
         .expr_types
@@ -640,9 +679,86 @@ fn lower_literal<'a>(l: LiteralExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) -> O
             };
             Operand::Const(Const::Float { bits, ty: float_ty })
         }
-        // Strings, runes, byte chars — Phase 1 doesn't yet handle.
+        Some(SyntaxKind::StringLit | SyntaxKind::RawStringLit) => {
+            lower_string_literal(b, l, raw, lcx)
+        }
+        // Runes, byte chars — Phase 1 doesn't yet handle.
         _ => Operand::Const(Const::Error),
     }
+}
+
+/// Lower a `"..."` string literal to a `[]u8` slice value. Allocates a
+/// fresh slice-typed local and emits two `AssignField` statements:
+/// `field_idx 0` (data ptr) ← `Const::DataAddr(id)`, and `field_idx 1`
+/// (length, usize) ← the byte count of the decoded payload. The
+/// underlying bytes are interned in `lcx.string_literals` so codegen
+/// can declare exactly one `.rodata` data object per occurrence.
+fn lower_string_literal<'a>(
+    b: &mut Builder,
+    l: LiteralExpr<'a>,
+    raw: &str,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
+) -> Operand {
+    let bytes = decode_string_literal(raw);
+    let id = StringLitId(lcx.string_literals.len() as u32);
+    let len = bytes.len();
+    lcx.string_literals.push(bytes);
+    let span = l.syntax().span;
+    let dst = b.alloc_local(LocalDecl {
+        ty: Ty::Slice(IntTy::U8),
+        span,
+    });
+    b.push_stmt(MirStmt::AssignField {
+        dst,
+        field_idx: 0,
+        value: Rvalue::Use(Operand::Const(Const::DataAddr(id))),
+    });
+    b.push_stmt(MirStmt::AssignField {
+        dst,
+        field_idx: 1,
+        value: Rvalue::Use(Operand::Const(Const::Int {
+            value: len as i128,
+            ty: IntTy::USize,
+        })),
+    });
+    Operand::Local(dst)
+}
+
+/// Decode a `"..."` string literal token into its raw bytes. Strips the
+/// surrounding double quotes the lexer leaves on the token text and
+/// processes the small set of Phase-1-supported escape sequences:
+/// `\n`, `\t`, `\r`, `\0`, `\\`, `\"`, `\'`. Unknown escapes pass
+/// through literally (the leading backslash + the following byte).
+fn decode_string_literal(raw: &str) -> Vec<u8> {
+    let inner = raw
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(raw);
+    let mut out = Vec::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push(b'\n'),
+            Some('t') => out.push(b'\t'),
+            Some('r') => out.push(b'\r'),
+            Some('0') => out.push(0),
+            Some('\\') => out.push(b'\\'),
+            Some('"') => out.push(b'"'),
+            Some('\'') => out.push(b'\''),
+            Some(other) => {
+                out.push(b'\\');
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            }
+            None => out.push(b'\\'),
+        }
+    }
+    out
 }
 
 fn parse_int_literal(raw: &str) -> Option<i128> {
@@ -658,7 +774,7 @@ fn parse_int_literal(raw: &str) -> Option<i128> {
     }
 }
 
-fn lower_path<'a>(p: PathExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) -> Operand {
+fn lower_path<'a>(p: PathExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>) -> Operand {
     if let Some(binding_id) = lcx.typed.path_bindings.get(&NodePtr(p.syntax())) {
         if let Some(local) = lcx.binding_to_local.get(binding_id) {
             return Operand::Local(*local);
@@ -670,7 +786,7 @@ fn lower_path<'a>(p: PathExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) -> Operand
 fn lower_paren<'a>(
     b: &mut Builder,
     p: ParenExpr<'a>,
-    lcx: &mut LowerCx<'a, '_, '_, '_>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
 ) -> Operand {
     p.inner()
         .map(|e| lower_expr(b, e, lcx))
@@ -684,7 +800,7 @@ fn lower_paren<'a>(
 fn lower_assign<'a>(
     b: &mut Builder,
     bin: BinaryExpr<'a>,
-    lcx: &mut LowerCx<'a, '_, '_, '_>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
 ) -> Operand {
     let rhs_val = bin
         .rhs()
@@ -726,7 +842,7 @@ fn lower_assign<'a>(
 /// class-typed local and the field is declared by that class.
 fn resolve_field_lvalue<'a>(
     fe: FieldExpr<'a>,
-    lcx: &LowerCx<'a, '_, '_, '_>,
+    lcx: &LowerCx<'a, '_, '_, '_, '_>,
 ) -> Option<(Local, u32)> {
     let base = fe.base()?;
     let base_local = match base {
@@ -736,6 +852,18 @@ fn resolve_field_lvalue<'a>(
         }
         _ => return None,
     };
+    // Slice bases use a hardcoded 2-field layout: data at index 0,
+    // len at index 1. Matches the synthetic layout codegen materialises.
+    if let Some(Ty::Slice(_)) = lcx.typed.expr_types.get(&NodePtr(base.syntax())).copied() {
+        let name_span = fe.field_name()?;
+        let name = lcx.sm.slice(name_span)?;
+        let idx = match name {
+            "data" => 0,
+            "len" => 1,
+            _ => return None,
+        };
+        return Some((base_local, idx));
+    }
     // Look up class via the base's expr type (typeck recorded it).
     let class_id = match lcx.typed.expr_types.get(&NodePtr(base.syntax())).copied()? {
         Ty::Class(id) => id,
@@ -751,7 +879,7 @@ fn resolve_field_lvalue<'a>(
 fn lower_binary<'a>(
     b: &mut Builder,
     bin: BinaryExpr<'a>,
-    lcx: &mut LowerCx<'a, '_, '_, '_>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
 ) -> Operand {
     // Capture each operand's type *before* lowering: the codegen needs
     // the operand width, which differs from the result width for
@@ -798,7 +926,7 @@ fn lower_binary<'a>(
 fn lower_unary<'a>(
     b: &mut Builder,
     u: UnaryExpr<'a>,
-    lcx: &mut LowerCx<'a, '_, '_, '_>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
 ) -> Operand {
     let operand = u
         .operand()
@@ -829,7 +957,7 @@ fn lower_unary<'a>(
     Operand::Local(local)
 }
 
-fn lower_if<'a>(b: &mut Builder, i: IfExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) -> Operand {
+fn lower_if<'a>(b: &mut Builder, i: IfExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>) -> Operand {
     // cond
     let cond = i
         .cond()
@@ -910,7 +1038,7 @@ fn lower_if<'a>(b: &mut Builder, i: IfExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_
 fn lower_while<'a>(
     b: &mut Builder,
     w: WhileExpr<'a>,
-    lcx: &mut LowerCx<'a, '_, '_, '_>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
 ) -> Operand {
     let header_bb = b.alloc_block();
     let body_bb = b.alloc_block();
@@ -992,7 +1120,11 @@ fn lower_continue(b: &mut Builder) -> Operand {
 /// ```
 ///
 /// Continues jump to `step`, breaks jump to `exit`.
-fn lower_for<'a>(b: &mut Builder, fe: ForExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) -> Operand {
+fn lower_for<'a>(
+    b: &mut Builder,
+    fe: ForExpr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
+) -> Operand {
     // Determine the iteration type from the start bound's typeck record.
     let iter_ty = fe
         .range_start()
@@ -1119,7 +1251,7 @@ fn lower_for<'a>(b: &mut Builder, fe: ForExpr<'a>, lcx: &mut LowerCx<'a, '_, '_,
 fn lower_return<'a>(
     b: &mut Builder,
     r: ReturnExpr<'a>,
-    lcx: &mut LowerCx<'a, '_, '_, '_>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
 ) -> Operand {
     let val = match r.value() {
         Some(e) => lower_expr(b, e, lcx),
@@ -1133,7 +1265,11 @@ fn lower_return<'a>(
     Operand::Const(Const::Error)
 }
 
-fn lower_call<'a>(b: &mut Builder, c: CallExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_>) -> Operand {
+fn lower_call<'a>(
+    b: &mut Builder,
+    c: CallExpr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
+) -> Operand {
     let Some(target) = lcx.typed.call_targets.get(&NodePtr(c.syntax())).copied() else {
         return Operand::Const(Const::Error);
     };
@@ -1178,7 +1314,7 @@ fn lower_call<'a>(b: &mut Builder, c: CallExpr<'a>, lcx: &mut LowerCx<'a, '_, '_
 fn lower_struct_lit<'a>(
     b: &mut Builder,
     s: StructLitExpr<'a>,
-    lcx: &mut LowerCx<'a, '_, '_, '_>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
 ) -> Operand {
     let class_ty = lcx
         .typed
@@ -1230,7 +1366,7 @@ fn lower_struct_lit<'a>(
 fn lower_field<'a>(
     b: &mut Builder,
     fe: FieldExpr<'a>,
-    lcx: &mut LowerCx<'a, '_, '_, '_>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
 ) -> Operand {
     let Some((base_local, field_idx)) = resolve_field_lvalue(fe, lcx) else {
         // Best-effort: still lower the base so any side effects fire.

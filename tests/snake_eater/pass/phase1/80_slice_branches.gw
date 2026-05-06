@@ -1,0 +1,11 @@
+// Slice values flow through nested branches; identical-length
+// strings should not satisfy the `<` comparison.
+let a: []u8 = "abc";
+let b: []u8 = "xyz";
+if a.len < b.len {
+    return 1;
+}
+if b.len < a.len {
+    return 2;
+}
+return 42;

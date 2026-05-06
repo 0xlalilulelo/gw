@@ -1,0 +1,7 @@
+// "Hello\n" decodes to 6 bytes; the bare "Hi" stays at 2.
+let greet: []u8 = "Hello\n";
+let short: []u8 = "Hi";
+if greet.len > short.len {
+    return 13;
+}
+return 99;

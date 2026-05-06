@@ -1,0 +1,6 @@
+let s: []u8 = "";
+let t: []u8 = "x";
+if s.len < t.len {
+    return 0;
+}
+return 99;
