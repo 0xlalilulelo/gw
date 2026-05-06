@@ -396,6 +396,15 @@ fn parse_type(p: &mut Parser<'_, '_, '_>) {
             let end = p.cur_byte_start();
             p.builder.finish_node(end);
         }
+        TokenKind::Star => {
+            // `*T` — raw pointer (spec §5.4). Phase 1 only accepts
+            // `*u8`/`*i8` element types; typeck enforces the restriction.
+            p.builder.start_node(SyntaxKind::PtrType, start);
+            p.bump_any(); // *
+            parse_type(p);
+            let end = p.cur_byte_start();
+            p.builder.finish_node(end);
+        }
         TokenKind::LBracket => {
             // `[]T` (slice) or `[N]T` (array). Decide by peeking past the
             // opening bracket's significant tokens.

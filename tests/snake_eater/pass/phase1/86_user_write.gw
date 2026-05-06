@@ -1,0 +1,6 @@
+// User declares write themselves and calls it via slice.data/.len.
+// The implicit-Print scan should reuse this declaration's FnIdx.
+extern fn write(fd: i32, buf: *u8, count: usize) -> isize;
+let msg: []u8 = "manual\n";
+write(1, msg.data, msg.len);
+"and-implicit\n";

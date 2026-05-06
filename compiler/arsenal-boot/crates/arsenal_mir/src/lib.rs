@@ -261,6 +261,25 @@ pub fn lower<'a>(
         def_to_fn.insert(def.id, FnIdx(i as u32));
     }
 
+    // Phase 1 increment 11c: a bare string literal at statement
+    // position desugars to a `write(1, str.data, str.len)` call. We
+    // either reuse the user's `extern fn write` declaration if they
+    // wrote one (assuming the conventional libc signature) or inject a
+    // synthetic extern at the end of `functions`.
+    let needs_print = module_needs_print_desugar(resolved);
+    let user_write_fnidx = find_user_write_extern(resolved, &def_to_fn);
+    let real_fn_count = resolved
+        .defs
+        .iter()
+        .filter(|d| matches!(d.kind, DefKind::Fn | DefKind::SyntheticMain))
+        .count();
+    let print_write_fnidx = if needs_print {
+        Some(user_write_fnidx.unwrap_or(FnIdx(real_fn_count as u32)))
+    } else {
+        None
+    };
+    let inject_synthetic_write = needs_print && user_write_fnidx.is_none();
+
     let mut functions = Vec::new();
     let mut string_literals: Vec<Vec<u8>> = Vec::new();
     for def in &resolved.defs {
@@ -279,20 +298,30 @@ pub fn lower<'a>(
                     sm,
                     &def_to_fn,
                     &mut string_literals,
+                    print_write_fnidx,
                 );
                 functions.push(mir_fn);
             }
             DefKind::SyntheticMain => {
                 let module =
                     Module::cast(def.syntax).expect("DefKind::SyntheticMain syntax must be Module");
-                let mir_fn =
-                    lower_synthetic_main(module, typed, sm, &def_to_fn, &mut string_literals);
+                let mir_fn = lower_synthetic_main(
+                    module,
+                    typed,
+                    sm,
+                    &def_to_fn,
+                    &mut string_literals,
+                    print_write_fnidx,
+                );
                 functions.push(mir_fn);
             }
             DefKind::Class => {
                 // Classes have no MIR function.
             }
         }
+    }
+    if inject_synthetic_write {
+        functions.push(synthesise_write_extern());
     }
     MirProgram {
         functions,
@@ -301,17 +330,150 @@ pub fn lower<'a>(
     }
 }
 
+/// Synthesise an `extern fn write(fd: i32, buf: *u8, count: usize) -> isize;`
+/// declaration. Phase 1 increment 11c uses this when the user did not
+/// declare `write` themselves but the program contains a Print desugar.
+/// The Cranelift backend lowers this with `Linkage::Import`, so the
+/// system linker resolves the symbol against libc.
+fn synthesise_write_extern() -> MirFn {
+    MirFn {
+        name: "write".to_string(),
+        params: vec![Local(0), Local(1), Local(2)],
+        return_ty: Ty::Int(IntTy::ISize),
+        locals: vec![
+            LocalDecl {
+                ty: Ty::Int(IntTy::I32),
+                span: Span::synthetic(),
+            },
+            LocalDecl {
+                ty: Ty::Ptr(IntTy::U8),
+                span: Span::synthetic(),
+            },
+            LocalDecl {
+                ty: Ty::Int(IntTy::USize),
+                span: Span::synthetic(),
+            },
+        ],
+        blocks: Vec::new(),
+        is_extern: true,
+    }
+}
+
+/// Check whether the user declared a top-level `extern fn write` we can
+/// reuse for Print desugaring. Phase 1 trusts the user-declared
+/// signature; if it conflicts with `(i32, *u8, usize) -> isize` codegen
+/// will report the duplicate-declare error.
+fn find_user_write_extern(
+    resolved: &ResolvedModule<'_>,
+    def_to_fn: &FxHashMap<DefId, FnIdx>,
+) -> Option<FnIdx> {
+    let def = resolved.lookup("write")?;
+    if def.kind != DefKind::Fn {
+        return None;
+    }
+    let fn_decl = FnDecl::cast(def.syntax)?;
+    if !fn_decl.is_extern() {
+        return None;
+    }
+    def_to_fn.get(&def.id).copied()
+}
+
+/// Pre-scan the resolved module for any statement-position string
+/// literal. Returns `true` as soon as one is found anywhere reachable
+/// from a function body or the synthetic main's top-level stmts. The
+/// scan recurses through `if`/`while`/`for`/block bodies.
+fn module_needs_print_desugar(resolved: &ResolvedModule<'_>) -> bool {
+    for def in &resolved.defs {
+        match def.kind {
+            DefKind::Fn => {
+                if let Some(fn_decl) = FnDecl::cast(def.syntax) {
+                    if let Some(body) = fn_decl.body() {
+                        if block_contains_print_stmt(body) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            DefKind::SyntheticMain => {
+                if let Some(module) = Module::cast(def.syntax) {
+                    for stmt in module.stmts() {
+                        if stmt_contains_print(stmt) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            DefKind::Class => {}
+        }
+    }
+    false
+}
+
+fn block_contains_print_stmt<'a>(block: Block<'a>) -> bool {
+    for stmt in block.stmts() {
+        if stmt_contains_print(stmt) {
+            return true;
+        }
+    }
+    false
+}
+
+fn stmt_contains_print<'a>(stmt: Stmt<'a>) -> bool {
+    match stmt {
+        Stmt::Let(l) => l.init().is_some_and(expr_contains_print_stmt),
+        Stmt::Expr(es) => {
+            let Some(expr) = es.expr() else {
+                return false;
+            };
+            if expr_is_string_literal(&expr) {
+                return true;
+            }
+            expr_contains_print_stmt(expr)
+        }
+        Stmt::Stub(_) | Stmt::Error(_) => false,
+    }
+}
+
+fn expr_is_string_literal<'a>(expr: &Expr<'a>) -> bool {
+    let Expr::Literal(lit) = expr else {
+        return false;
+    };
+    matches!(
+        lit.token_kind(),
+        Some(SyntaxKind::StringLit | SyntaxKind::RawStringLit)
+    )
+}
+
+fn expr_contains_print_stmt<'a>(expr: Expr<'a>) -> bool {
+    match expr {
+        Expr::If(i) => {
+            i.then_block().is_some_and(block_contains_print_stmt)
+                || i.else_branch().is_some_and(expr_contains_print_stmt)
+        }
+        Expr::While(w) => w.body().is_some_and(block_contains_print_stmt),
+        Expr::For(fe) => fe.body().is_some_and(block_contains_print_stmt),
+        Expr::Block(b) => block_contains_print_stmt(b),
+        // Other expression forms don't contain statement-position
+        // contexts. Bare string literals at expression position (e.g.
+        // `let s = "hi"`) are *not* desugared — only `"hi";` at a
+        // statement boundary is.
+        _ => false,
+    }
+}
+
 /// Lower the synthetic `main` produced by Phase 1 increment 11a from
 /// top-level statements. The signature is `() -> i32`; if control falls
 /// off the end of the body without an explicit `return`, an implicit
 /// `Return(Const::Int { value: 0, ty: I32 })` is appended so the program
 /// exits 0 by default.
+#[allow(clippy::too_many_arguments)]
 fn lower_synthetic_main<'a>(
     module: Module<'a>,
     typed: &TypedModule<'a>,
     sm: &SourceMap,
     def_to_fn: &FxHashMap<DefId, FnIdx>,
     string_literals: &mut Vec<Vec<u8>>,
+    print_write_fnidx: Option<FnIdx>,
 ) -> MirFn {
     let mut b = Builder::new();
     let entry = b.alloc_block();
@@ -323,6 +485,7 @@ fn lower_synthetic_main<'a>(
         def_to_fn,
         binding_to_local: FxHashMap::default(),
         string_literals,
+        print_write_fnidx,
     };
     for stmt in module.stmts() {
         lower_stmt(&mut b, stmt, &mut lcx);
@@ -348,6 +511,7 @@ fn lower_synthetic_main<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_fn<'a>(
     name: String,
     fn_decl: FnDecl<'a>,
@@ -356,6 +520,7 @@ fn lower_fn<'a>(
     sm: &SourceMap,
     def_to_fn: &FxHashMap<DefId, FnIdx>,
     string_literals: &mut Vec<Vec<u8>>,
+    print_write_fnidx: Option<FnIdx>,
 ) -> MirFn {
     let mut b = Builder::new();
 
@@ -403,6 +568,7 @@ fn lower_fn<'a>(
                 def_to_fn,
                 binding_to_local,
                 string_literals,
+                print_write_fnidx,
             };
             let _ = lower_block(&mut b, body, &mut lcx);
         }
@@ -529,6 +695,10 @@ struct LowerCx<'a, 'tm, 'sm, 'm, 'sl> {
     /// when it sees a string literal expression and uses the resulting
     /// index as the [`StringLitId`].
     string_literals: &'sl mut Vec<Vec<u8>>,
+    /// `FnIdx` of the `write` extern declaration to use for Phase 1
+    /// implicit Print desugaring. `None` if the program contains no
+    /// statement-position string literals (so `write` was not injected).
+    print_write_fnidx: Option<FnIdx>,
 }
 
 fn lower_block<'a>(
@@ -602,9 +772,110 @@ fn lower_let<'a>(b: &mut Builder, let_stmt: LetStmt<'a>, lcx: &mut LowerCx<'a, '
 }
 
 fn lower_expr_stmt<'a>(b: &mut Builder, es: ExprStmt<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>) {
-    if let Some(e) = es.expr() {
-        let _ = lower_expr(b, e, lcx);
+    let Some(e) = es.expr() else {
+        return;
+    };
+    // Phase 1 increment 11c: a bare string-literal at statement
+    // position desugars to an implicit `Print` (spec §5.15.1). We
+    // recognise the shape here and emit the `write(1, str.data,
+    // str.len)` call inline.
+    if let Expr::Literal(lit) = e {
+        if matches!(
+            lit.token_kind(),
+            Some(SyntaxKind::StringLit | SyntaxKind::RawStringLit)
+        ) {
+            lower_implicit_print(b, lit, lcx);
+            return;
+        }
     }
+    let _ = lower_expr(b, e, lcx);
+}
+
+/// Lower a statement-position string literal as `write(1, slice.data,
+/// slice.len)` (Phase 1 increment 11c). The literal is first lowered
+/// the usual way to materialise a slice-typed temp local, then we
+/// extract its `data` and `len` fields into primitive locals and emit
+/// a `Terminator::Call` against the program's chosen `write` fn idx.
+/// The call's return value (an `isize`, the byte count actually
+/// written) is captured into a discarded local since spec §5.15.1's
+/// Print is statement-positioned and produces no value.
+fn lower_implicit_print<'a>(
+    b: &mut Builder,
+    lit: LiteralExpr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
+) {
+    // If the pre-scan never registered a write fn idx, the desugar
+    // can't run. This can happen if the scan and lowering disagree
+    // about whether a string-stmt exists (it shouldn't); fall back to
+    // dropping the literal silently rather than producing a bad call.
+    let Some(write_fnidx) = lcx.print_write_fnidx else {
+        let _ = lower_literal(b, lit, lcx);
+        return;
+    };
+
+    // Step 1: lower the literal as a normal `[]u8` slice (allocates a
+    // temp slice local, populates the rodata table, and emits the two
+    // AssignField stmts setting `data` and `len`).
+    let slice_op = lower_literal(b, lit, lcx);
+    let Operand::Local(slice_local) = slice_op else {
+        return;
+    };
+
+    let span = lit.syntax().span;
+
+    // Step 2: extract `slice.data` into a `*u8` primitive local.
+    let data_local = b.alloc_local(LocalDecl {
+        ty: Ty::Ptr(IntTy::U8),
+        span,
+    });
+    b.push_stmt(MirStmt::Assign {
+        dst: data_local,
+        value: Rvalue::Field {
+            base: slice_local,
+            field_idx: 0,
+            field_ty: Ty::Ptr(IntTy::U8),
+        },
+    });
+
+    // Step 3: extract `slice.len` into a `usize` primitive local.
+    let len_local = b.alloc_local(LocalDecl {
+        ty: Ty::Int(IntTy::USize),
+        span,
+    });
+    b.push_stmt(MirStmt::Assign {
+        dst: len_local,
+        value: Rvalue::Field {
+            base: slice_local,
+            field_idx: 1,
+            field_ty: Ty::Int(IntTy::USize),
+        },
+    });
+
+    // Step 4: discardable destination for `write`'s `isize` return.
+    let ret_local = b.alloc_local(LocalDecl {
+        ty: Ty::Int(IntTy::ISize),
+        span,
+    });
+
+    // Step 5: emit the call and continue lowering in a fresh block.
+    let cont = b.alloc_block();
+    b.set_terminator(
+        b.cur,
+        Terminator::Call {
+            callee: write_fnidx,
+            args: vec![
+                Operand::Const(Const::Int {
+                    value: 1, // STDOUT_FILENO
+                    ty: IntTy::I32,
+                }),
+                Operand::Local(data_local),
+                Operand::Local(len_local),
+            ],
+            dst: ret_local,
+            target_bb: cont,
+        },
+    );
+    b.cur = cont;
 }
 
 fn lower_expr<'a>(

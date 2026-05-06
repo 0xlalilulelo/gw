@@ -1082,6 +1082,8 @@ pub enum Type<'a> {
     Slice(SliceType<'a>),
     /// `[N]T`.
     Array(ArrayType<'a>),
+    /// `*T` — raw pointer.
+    Ptr(PtrType<'a>),
     /// Recognised but not yet typed.
     Stub(&'a SyntaxNode<'a>),
     /// Parser-recovery node.
@@ -1098,9 +1100,10 @@ impl<'a> Type<'a> {
             OptType => Self::Opt(self::OptType(n)),
             SliceType => Self::Slice(self::SliceType(n)),
             ArrayType => Self::Array(self::ArrayType(n)),
+            PtrType => Self::Ptr(self::PtrType(n)),
             // Hooks
-            PtrType | ManyPtrType | SentinelPtrType | ErrorUnionType | TupleType | FnType
-            | DynArrayType | GenericArgs => Self::Stub(n),
+            ManyPtrType | SentinelPtrType | ErrorUnionType | TupleType | FnType | DynArrayType
+            | GenericArgs => Self::Stub(n),
             ErrorNode => Self::Error(n),
             _ => return None,
         })
@@ -1190,6 +1193,27 @@ impl<'a> AstNode<'a> for SliceType<'a> {
 
 impl<'a> SliceType<'a> {
     /// Element type.
+    pub fn element(self) -> Option<Type<'a>> {
+        self.0.child_nodes().find_map(Type::cast)
+    }
+}
+
+/// Raw-pointer type: `*T` (spec §5.4). Phase 1 accepts only `*u8` and
+/// `*i8`; typeck rejects other element types.
+#[derive(Copy, Clone)]
+pub struct PtrType<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for PtrType<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::PtrType).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> PtrType<'a> {
+    /// Pointee type.
     pub fn element(self) -> Option<Type<'a>> {
         self.0.child_nodes().find_map(Type::cast)
     }

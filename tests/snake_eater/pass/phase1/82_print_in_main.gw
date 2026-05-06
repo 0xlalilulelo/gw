@@ -1,0 +1,4 @@
+fn main() -> i32 {
+    "inside main\n";
+    return 0;
+}

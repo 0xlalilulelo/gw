@@ -1,0 +1,7 @@
+let x: i32 = 5;
+if x > 0 {
+    "positive\n";
+} else {
+    "non-positive\n";
+}
+return x;

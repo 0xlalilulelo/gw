@@ -95,6 +95,11 @@ pub enum Ty {
     /// only accepts `[]u8` for string literals; other element types and
     /// cross-fn slice passing are deferred.
     Slice(IntTy),
+    /// `*T` — raw pointer (spec §5.4). Phase 1 accepts only `*u8` /
+    /// `*i8` and only in extern fn signatures and as the type of
+    /// `slice.data`. Cross-fn pointer passing in non-extern fns is
+    /// deferred (memory model + borrow-checker work).
+    Ptr(IntTy),
     /// Synthetic placeholder when type checking failed for an
     /// expression. Treated as compatible with any expected type so a
     /// single failure does not cascade.
@@ -190,6 +195,7 @@ impl std::fmt::Display for Ty {
             Self::Rune => f.write_str("rune"),
             Self::Class(def_id) => write!(f, "<class#{}>", def_id.0),
             Self::Slice(elem) => write!(f, "[]{}", Self::Int(*elem)),
+            Self::Ptr(elem) => write!(f, "*{}", Self::Int(*elem)),
             Self::Error => f.write_str("<error>"),
         }
     }
@@ -436,6 +442,7 @@ fn check_fn_signature(
     sm: &SourceMap,
     diags: &mut DiagBag,
 ) -> FnSig {
+    let is_extern = fn_decl.is_extern();
     let mut params = Vec::new();
     if let Some(plist) = fn_decl.params() {
         for p in plist.params() {
@@ -473,6 +480,17 @@ fn check_fn_signature(
                     "slice-typed parameters are not yet supported in Phase 1",
                 ));
             }
+            // Raw pointers (`*T`) are only allowed at the FFI boundary —
+            // i.e. `extern fn` declarations. Cross-fn pointer flow inside
+            // user code is deferred to a later increment along with the
+            // memory model.
+            if matches!(ty, Ty::Ptr(_)) && !is_extern {
+                diags.push(Diagnostic::error(
+                    ec::UNSUPPORTED_CONSTRUCT,
+                    Label::new(p.span(), ""),
+                    "raw pointer parameters are only allowed in `extern fn` declarations in Phase 1",
+                ));
+            }
             params.push(Param {
                 name,
                 name_span: name_span.unwrap_or_else(Span::synthetic),
@@ -496,6 +514,13 @@ fn check_fn_signature(
             ec::UNSUPPORTED_CONSTRUCT,
             Label::new(fn_decl.span(), ""),
             "class-typed return values are not yet supported in Phase 1",
+        ));
+    }
+    if matches!(ret, Ty::Ptr(_)) && !is_extern {
+        diags.push(Diagnostic::error(
+            ec::UNSUPPORTED_CONSTRUCT,
+            Label::new(fn_decl.span(), ""),
+            "raw pointer return types are only allowed in `extern fn` declarations in Phase 1",
         ));
     }
     if matches!(ret, Ty::Slice(_)) {
@@ -538,11 +563,34 @@ fn resolve_type(
                 }
             };
         }
+        Type::Ptr(p) => {
+            // Phase 1 only supports `*u8` / `*i8`; richer pointee types
+            // require the memory model that lands with the borrow checker.
+            let elem_ty = p
+                .element()
+                .map(|e| resolve_type(e, resolved, sm, diags))
+                .unwrap_or(Ty::Error);
+            return match elem_ty {
+                Ty::Int(IntTy::U8) => Ty::Ptr(IntTy::U8),
+                Ty::Int(IntTy::I8) => Ty::Ptr(IntTy::I8),
+                Ty::Error => Ty::Error,
+                other => {
+                    diags.push(Diagnostic::error(
+                        ec::UNSUPPORTED_CONSTRUCT,
+                        Label::new(p.syntax().span, ""),
+                        format!(
+                            "Phase 1 only supports `*u8` / `*i8` raw pointers; pointee `{other}` is not yet supported"
+                        ),
+                    ));
+                    Ty::Error
+                }
+            };
+        }
         _ => {
             diags.push(Diagnostic::error(
                 ec::UNSUPPORTED_CONSTRUCT,
                 Label::new(ty_span(&ty), ""),
-                "Phase 1 supports only path-typed primitives, classes, and `[]u8` slices",
+                "Phase 1 supports only path-typed primitives, classes, `[]u8` slices, and `*u8` / `*i8` raw pointers",
             ));
             return Ty::Error;
         }
@@ -588,6 +636,7 @@ fn ty_span(t: &Type<'_>) -> Span {
         Type::Opt(p) => p.syntax().span,
         Type::Slice(p) => p.syntax().span,
         Type::Array(p) => p.syntax().span,
+        Type::Ptr(p) => p.syntax().span,
         Type::Stub(n) | Type::Error(n) => n.span,
     }
 }
@@ -1219,20 +1268,13 @@ fn synth_field<'a>(fe: FieldExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     let Some(name) = cx.sm.slice(name_span) else {
         return Ty::Error;
     };
-    if let Ty::Slice(_) = base_ty {
+    if let Ty::Slice(elem) = base_ty {
         // Phase 1 slice fields: `len` is exposed (usize); `data` is
-        // deferred to 11c when raw pointers land. Other names are
-        // genuinely unknown.
+        // a raw pointer to the slice's element type (added in
+        // increment 11c). Other names are genuinely unknown.
         return match name {
             "len" => Ty::Int(IntTy::USize),
-            "data" => {
-                cx.diags.push(Diagnostic::error(
-                    ec::UNSUPPORTED_CONSTRUCT,
-                    Label::new(name_span, ""),
-                    "slice `.data` is not yet supported in Phase 1; use `.len` for now",
-                ));
-                Ty::Error
-            }
+            "data" => Ty::Ptr(elem),
             _ => {
                 cx.diags.push(Diagnostic::error(
                     ec::UNKNOWN_FIELD,
@@ -1573,5 +1615,87 @@ mod tests {
     #[test]
     fn let_binds_type() {
         assert_eq!(check("fn f() -> i32 { let x: i32 = 1; return x; }"), 0);
+    }
+
+    // ─── Phase 1 increment 11b: slice type ────────────────────────────────
+
+    #[test]
+    fn slice_display_format() {
+        assert_eq!(format!("{}", Ty::Slice(IntTy::U8)), "[]u8");
+    }
+
+    #[test]
+    fn string_lit_types_as_slice_u8() {
+        // `let s: []u8 = "hi";` should typecheck cleanly with no errors.
+        assert_eq!(
+            check(r#"fn f() -> i32 { let s: []u8 = "hi"; return 0; }"#),
+            0
+        );
+    }
+
+    #[test]
+    fn slice_len_is_usize() {
+        // `s.len` flowing into a `usize` binding must agree on type.
+        let src = r#"fn f() -> i32 { let s: []u8 = "abc"; let n: usize = s.len; return 0; }"#;
+        // Note: `n: usize` rejects `s.len` if `.len` returned anything
+        // other than usize. This test will fail (not 0 errors) until the
+        // typing path lands.
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn non_u8_slice_element_diagnoses() {
+        assert!(check("fn f() -> i32 { let s: []i32; return 0; }") >= 1);
+    }
+
+    #[test]
+    fn slice_typed_param_diagnoses() {
+        assert!(check("fn g(s: []u8) -> i32 { return 0; }") >= 1);
+    }
+
+    // ─── Phase 1 increment 11c: raw pointers + implicit Print ─────────────
+
+    #[test]
+    fn ptr_display_format() {
+        assert_eq!(format!("{}", Ty::Ptr(IntTy::U8)), "*u8");
+        assert_eq!(format!("{}", Ty::Ptr(IntTy::I8)), "*i8");
+    }
+
+    #[test]
+    fn ptr_in_extern_fn_sig_is_clean() {
+        let src =
+            "extern fn write(fd: i32, buf: *u8, count: usize) -> isize; fn f() -> i32 { return 0; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn ptr_in_non_extern_fn_param_diagnoses() {
+        // Raw pointers are FFI-only in Phase 1; bare `fn` rejects them.
+        assert!(check("fn g(p: *u8) -> i32 { return 0; }") >= 1);
+    }
+
+    #[test]
+    fn ptr_in_non_extern_fn_return_diagnoses() {
+        assert!(check("fn g() -> *u8 { return 0; }") >= 1);
+    }
+
+    #[test]
+    fn slice_data_typed_as_ptr_u8() {
+        // `extern fn write` accepts `*u8`; `slice.data` must produce
+        // exactly that type for the call to typecheck.
+        let src = r#"
+            extern fn write(fd: i32, buf: *u8, count: usize) -> isize;
+            fn f() -> i32 {
+                let s: []u8 = "hi";
+                write(1, s.data, s.len);
+                return 0;
+            }
+        "#;
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn non_byte_pointee_diagnoses() {
+        assert!(check("extern fn f(p: *i32) -> i32;") >= 1);
     }
 }

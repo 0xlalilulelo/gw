@@ -212,6 +212,7 @@ fn primitive_size_align(ty: Ty, ptr_bytes: u32) -> (u32, u32) {
         Ty::Float(FloatTy::F32) => (4, 4),
         Ty::Float(FloatTy::F64) => (8, 8),
         Ty::Rune => (4, 4),
+        Ty::Ptr(_) => (ptr_bytes, ptr_bytes),
         // Phase 1 doesn't have nested-class fields. Fall back to
         // pointer-sized just so codegen doesn't divide by zero.
         _ => (ptr_bytes, ptr_bytes),
@@ -242,6 +243,11 @@ fn make_signature(module: &ObjectModule, f: &MirFn) -> ir::Signature {
 
 fn clif_ty(ty: Ty, module: &ObjectModule) -> Option<ir::Type> {
     let ptr_bits = module.target_config().pointer_bits() as u32;
+    let ptr_clt = match ptr_bits {
+        64 => ir::types::I64,
+        32 => ir::types::I32,
+        _ => ir::types::I64,
+    };
     Some(match ty {
         Ty::U0 => return None,
         Ty::Bool => ir::types::I8,
@@ -249,23 +255,16 @@ fn clif_ty(ty: Ty, module: &ObjectModule) -> Option<ir::Type> {
         Ty::Int(IntTy::I16) | Ty::Int(IntTy::U16) => ir::types::I16,
         Ty::Int(IntTy::I32) | Ty::Int(IntTy::U32) => ir::types::I32,
         Ty::Int(IntTy::I64) | Ty::Int(IntTy::U64) => ir::types::I64,
-        Ty::Int(IntTy::ISize) | Ty::Int(IntTy::USize) => match ptr_bits {
-            64 => ir::types::I64,
-            32 => ir::types::I32,
-            _ => ir::types::I64,
-        },
+        Ty::Int(IntTy::ISize) | Ty::Int(IntTy::USize) => ptr_clt,
         Ty::Float(FloatTy::F32) => ir::types::F32,
         Ty::Float(FloatTy::F64) => ir::types::F64,
         Ty::Rune => ir::types::I32,
+        Ty::Ptr(_) => ptr_clt,
         Ty::Error => ir::types::I32,
-        // Phase 1 doesn't model classes, slices, refs, etc. yet; if the
-        // type checker hands us one, fall back to a pointer-width int
-        // so codegen still produces something. Future Ty variants land
-        // through this arm until they get explicit lowering rules.
-        _ => match ptr_bits {
-            64 => ir::types::I64,
-            _ => ir::types::I32,
-        },
+        // Phase 1 doesn't model class- or slice-typed scalars (those are
+        // stack-slotted by the time they reach a `read_operand` call);
+        // if anything still slips through, fall back to pointer-width.
+        _ => ptr_clt,
     })
 }
 
