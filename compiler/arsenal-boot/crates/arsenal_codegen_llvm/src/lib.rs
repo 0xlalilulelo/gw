@@ -4,35 +4,43 @@
 //! `MirProgram → object bytes`. The driver picks between the two backends
 //! at `arsenal build --backend=fast|llvm`.
 //!
-//! Supported MIR subset (B.1 → B.2):
-//! - integer + bool params and returns; `u0` returns
-//! - integer + bool locals (alloca-backed; mem2reg promotion is left to
-//!   LLVM's later opt-level when we add one)
-//! - `Rvalue::Use` / `BinOp` / `UnOp` over integers and bools
-//! - `Operand::Const(Int|Bool|Unit)`, `Operand::Local`
+//! Supported MIR subset (B.1 → B.3):
+//! - integer + bool + float params and returns; `u0` returns
+//! - integer + bool + float locals (alloca-backed; mem2reg promotion is
+//!   left to LLVM's later opt-level when we add one)
+//! - `Rvalue::Use` / `BinOp` / `UnOp` over integers, bools, and floats
+//!   (float comparison via `OEQ`/`ONE`/`OLT`/etc., matching the
+//!   Cranelift backend's "ordered, NaN→false" semantics)
+//! - `Rvalue::Cast` across the full numeric matrix: int↔int (sext /
+//!   zext / trunc / no-op), int↔float (sitofp / uitofp / saturating
+//!   fptosi / fptoui via `llvm.fpto{si,ui}.sat` intrinsics), float↔float
+//!   (fpext / fptrunc / no-op). Float→int matches Rust ≥ 1.45 / Cranelift
+//!   `fcvt_to_*_sat`: saturating with NaN→0, no extra branch needed.
+//! - `Operand::Const(Int|Bool|Float|Unit)`, `Operand::Local`
 //! - `Terminator::{Goto, Branch, Return, Call, Unreachable}`
 //!
-//! Deferred (B.3+): floats, `as` casts, classes, slices, `*T` raw
-//! pointers, string literals + Print desugar, `Rvalue::Field` /
-//! `MirStmt::AssignField`. Anything outside the supported set returns
+//! Deferred to B.4+: classes, slices, `*T` raw pointers, string
+//! literals + Print desugar, `Rvalue::Field` / `MirStmt::AssignField`.
+//! Anything outside the supported set returns
 //! [`CodegenError::Unsupported`] with a descriptive message.
 
 use arsenal_mir::{
-    BinOp, BlockId, Const, FnIdx, Local, MirFn, MirProgram, MirStmt, Operand, Rvalue, Terminator,
-    UnOp,
+    BinOp, BlockId, CastKind, Const, FnIdx, Local, MirFn, MirProgram, MirStmt, Operand, Rvalue,
+    Terminator, UnOp,
 };
-use arsenal_typeck::{IntTy, Ty};
+use arsenal_typeck::{FloatTy, IntTy, Ty};
 use inkwell::basic_block::BasicBlock;
 use inkwell::context::Context;
-use inkwell::module::Linkage;
+use inkwell::intrinsics::Intrinsic;
+use inkwell::module::{Linkage, Module};
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetTriple,
 };
-use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType, IntType};
+use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FloatType, FunctionType, IntType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue,
+    BasicMetadataValueEnum, BasicValueEnum, FloatValue, FunctionValue, IntValue, PointerValue,
 };
-use inkwell::{IntPredicate, OptimizationLevel};
+use inkwell::{FloatPredicate, IntPredicate, OptimizationLevel};
 use rustc_hash::FxHashMap;
 use target_lexicon::Triple;
 
@@ -115,7 +123,7 @@ pub fn compile_program(
         if f.is_extern {
             continue;
         }
-        define_fn(&context, f, fn_values[i], &fn_values, prog)?;
+        define_fn(&context, &module, f, fn_values[i], &fn_values, prog)?;
     }
 
     // Verify the module before emitting. Catches malformed IR with a
@@ -136,6 +144,9 @@ pub fn compile_program(
 /// State threaded through statement / rvalue / operand lowering.
 struct LoweringCx<'ctx, 'a> {
     context: &'ctx Context,
+    /// Needed by `lower_cast` for intrinsic lookup
+    /// (`llvm.fptosi.sat` / `llvm.fptoui.sat`).
+    module: &'a Module<'ctx>,
     f: &'a MirFn,
     /// Stack-slot pointer per non-`u0` local. `u0` locals have no
     /// storage — they're never read or written.
@@ -149,6 +160,7 @@ struct LoweringCx<'ctx, 'a> {
 
 fn define_fn<'ctx>(
     context: &'ctx Context,
+    module: &Module<'ctx>,
     f: &MirFn,
     function: FunctionValue<'ctx>,
     fn_values: &[FunctionValue<'ctx>],
@@ -171,7 +183,7 @@ fn define_fn<'ctx>(
         }
         let lty = llvm_basic_type(context, decl.ty).ok_or_else(|| {
             CodegenError::Unsupported(format!(
-                "fn `{}` local {} has type {:?}; B.2 supports integers and bool only",
+                "fn `{}` local {} has type {:?}; B.3 supports integers, bool, and floats",
                 f.name, i, decl.ty
             ))
         })?;
@@ -199,6 +211,7 @@ fn define_fn<'ctx>(
 
     let cx = LoweringCx {
         context,
+        module,
         f,
         allocas,
         bbs,
@@ -269,10 +282,156 @@ fn lower_rvalue<'ctx>(
         Rvalue::Field { .. } => Err(CodegenError::Unsupported(
             "Rvalue::Field (class field read) — deferred to B.4".into(),
         )),
-        Rvalue::Cast { .. } => Err(CodegenError::Unsupported(
-            "Rvalue::Cast (`as` casts) — deferred to B.3".into(),
-        )),
+        Rvalue::Cast {
+            kind,
+            operand,
+            src_ty,
+            dst_ty,
+        } => {
+            let v = read_operand(builder, cx, operand, *src_ty)?;
+            lower_cast(builder, cx, *kind, v, *src_ty, *dst_ty)
+        }
     }
+}
+
+/// Lower an `as` cast. Each `CastKind` maps to one LLVM op (or no op
+/// for the `*Bitcast` arms — LLVM integer types don't carry signedness,
+/// and same-width float bitcast is identity).
+///
+/// Float→int uses LLVM's `llvm.fpto{si,ui}.sat` intrinsics so out-of-
+/// range values saturate to dst::MIN/MAX and NaN→0 — matching Rust ≥
+/// 1.45 / Cranelift `fcvt_to_*_sat`. The plain `fptosi` / `fptoui`
+/// instructions have UB for the same inputs and are deliberately not
+/// used. The intrinsics' overload signatures are
+/// `<dst_int> @llvm.fptosi.sat.<dst_int>.<src_float>(<src_float>)`,
+/// so we feed both type-overload tokens to `Intrinsic::get_declaration`.
+fn lower_cast<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    cx: &LoweringCx<'ctx, '_>,
+    kind: CastKind,
+    v: BasicValueEnum<'ctx>,
+    _src_ty: Ty,
+    dst_ty: Ty,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let context = cx.context;
+    Ok(match kind {
+        CastKind::IntWiden { signed: true } => {
+            let dst = match dst_ty {
+                Ty::Int(it) => llvm_int_type(context, it),
+                _ => return Err(unexpected_cast_dst("IntWiden", dst_ty)),
+            };
+            builder
+                .build_int_s_extend(v.into_int_value(), dst, "sext")
+                .map_err(be)?
+                .into()
+        }
+        CastKind::IntWiden { signed: false } => {
+            let dst = match dst_ty {
+                Ty::Int(it) => llvm_int_type(context, it),
+                _ => return Err(unexpected_cast_dst("IntWiden", dst_ty)),
+            };
+            builder
+                .build_int_z_extend(v.into_int_value(), dst, "zext")
+                .map_err(be)?
+                .into()
+        }
+        CastKind::IntTrunc => {
+            let dst = match dst_ty {
+                Ty::Int(it) => llvm_int_type(context, it),
+                _ => return Err(unexpected_cast_dst("IntTrunc", dst_ty)),
+            };
+            builder
+                .build_int_truncate(v.into_int_value(), dst, "trunc")
+                .map_err(be)?
+                .into()
+        }
+        // Same-width signedness reinterpretation: LLVM integers are
+        // unsigned-by-bit-pattern, identical to Cranelift, so the
+        // operand value is already correct.
+        CastKind::IntBitcast => v,
+        CastKind::IntToFloat { signed: true } => {
+            let dst = match dst_ty {
+                Ty::Float(ft) => llvm_float_type(context, ft),
+                _ => return Err(unexpected_cast_dst("IntToFloat", dst_ty)),
+            };
+            builder
+                .build_signed_int_to_float(v.into_int_value(), dst, "sitofp")
+                .map_err(be)?
+                .into()
+        }
+        CastKind::IntToFloat { signed: false } => {
+            let dst = match dst_ty {
+                Ty::Float(ft) => llvm_float_type(context, ft),
+                _ => return Err(unexpected_cast_dst("IntToFloat", dst_ty)),
+            };
+            builder
+                .build_unsigned_int_to_float(v.into_int_value(), dst, "uitofp")
+                .map_err(be)?
+                .into()
+        }
+        CastKind::FloatToInt { signed } => {
+            let dst = match dst_ty {
+                Ty::Int(it) => llvm_int_type(context, it),
+                _ => return Err(unexpected_cast_dst("FloatToInt", dst_ty)),
+            };
+            let src_fv = v.into_float_value();
+            let intrinsic_name = if signed {
+                "llvm.fptosi.sat"
+            } else {
+                "llvm.fptoui.sat"
+            };
+            let intrinsic = Intrinsic::find(intrinsic_name).ok_or_else(|| {
+                CodegenError::Builder(format!("intrinsic `{intrinsic_name}` not found"))
+            })?;
+            // Overload tokens: <dst_int>, <src_float>. inkwell looks up
+            // (or creates) the per-overload declaration in the module.
+            let func = intrinsic
+                .get_declaration(cx.module, &[dst.into(), src_fv.get_type().into()])
+                .ok_or_else(|| {
+                    CodegenError::Builder(format!(
+                        "intrinsic `{intrinsic_name}` declaration with overload \
+                         (dst={dst:?}, src={:?}) not found",
+                        src_fv.get_type()
+                    ))
+                })?;
+            let call = builder
+                .build_call(func, &[src_fv.into()], "fcvtsat")
+                .map_err(be)?;
+            call.try_as_basic_value().left().ok_or_else(|| {
+                CodegenError::Builder(format!(
+                    "intrinsic `{intrinsic_name}` returned void unexpectedly"
+                ))
+            })?
+        }
+        CastKind::FloatExt => {
+            let dst = match dst_ty {
+                Ty::Float(ft) => llvm_float_type(context, ft),
+                _ => return Err(unexpected_cast_dst("FloatExt", dst_ty)),
+            };
+            builder
+                .build_float_ext(v.into_float_value(), dst, "fpext")
+                .map_err(be)?
+                .into()
+        }
+        CastKind::FloatTrunc => {
+            let dst = match dst_ty {
+                Ty::Float(ft) => llvm_float_type(context, ft),
+                _ => return Err(unexpected_cast_dst("FloatTrunc", dst_ty)),
+            };
+            builder
+                .build_float_trunc(v.into_float_value(), dst, "fptrunc")
+                .map_err(be)?
+                .into()
+        }
+        // Same float width: nothing to do.
+        CastKind::FloatBitcast => v,
+    })
+}
+
+fn unexpected_cast_dst(kind: &str, dst_ty: Ty) -> CodegenError {
+    CodegenError::Builder(format!(
+        "CastKind::{kind} produced for non-matching dst type {dst_ty:?}"
+    ))
 }
 
 fn lower_binop<'ctx>(
@@ -283,9 +442,7 @@ fn lower_binop<'ctx>(
     r: BasicValueEnum<'ctx>,
 ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
     if ty.is_float() {
-        return Err(CodegenError::Unsupported(format!(
-            "BinOp::{op:?} on float operands — deferred to B.3"
-        )));
+        return lower_float_binop(builder, op, l.into_float_value(), r.into_float_value());
     }
     let l_int = l.into_int_value();
     let r_int = r.into_int_value();
@@ -394,6 +551,67 @@ fn lower_binop<'ctx>(
     Ok(v.into())
 }
 
+/// Float arms split out of [`lower_binop`] so the int path stays
+/// readable. Comparisons use ordered LLVM predicates (`OEQ`, `OLT`,
+/// etc.) which return false against NaN — same semantics as the
+/// Cranelift backend's `FloatCC::Equal` family. `Mod` and `Pow` on
+/// floats are not produced by typeck today; left as Unsupported until
+/// they show up in a corpus program.
+fn lower_float_binop<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    op: BinOp,
+    l: FloatValue<'ctx>,
+    r: FloatValue<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let v: BasicValueEnum<'ctx> = match op {
+        BinOp::Add => builder.build_float_add(l, r, "fadd").map_err(be)?.into(),
+        BinOp::Sub => builder.build_float_sub(l, r, "fsub").map_err(be)?.into(),
+        BinOp::Mul => builder.build_float_mul(l, r, "fmul").map_err(be)?.into(),
+        BinOp::Div => builder.build_float_div(l, r, "fdiv").map_err(be)?.into(),
+        BinOp::Mod | BinOp::Pow => {
+            return Err(CodegenError::Unsupported(format!(
+                "BinOp::{op:?} on float operands — typeck doesn't currently emit this"
+            )));
+        }
+        BinOp::BitAnd
+        | BinOp::BitOr
+        | BinOp::BitXor
+        | BinOp::Shl
+        | BinOp::Shr
+        | BinOp::LogAnd
+        | BinOp::LogOr => {
+            return Err(CodegenError::Unsupported(format!(
+                "BinOp::{op:?} on float operands — typeck rejects bitwise / logical ops on floats"
+            )));
+        }
+        BinOp::Eq => builder
+            .build_float_compare(FloatPredicate::OEQ, l, r, "feq")
+            .map_err(be)?
+            .into(),
+        BinOp::Ne => builder
+            .build_float_compare(FloatPredicate::ONE, l, r, "fne")
+            .map_err(be)?
+            .into(),
+        BinOp::Lt => builder
+            .build_float_compare(FloatPredicate::OLT, l, r, "flt")
+            .map_err(be)?
+            .into(),
+        BinOp::Le => builder
+            .build_float_compare(FloatPredicate::OLE, l, r, "fle")
+            .map_err(be)?
+            .into(),
+        BinOp::Gt => builder
+            .build_float_compare(FloatPredicate::OGT, l, r, "fgt")
+            .map_err(be)?
+            .into(),
+        BinOp::Ge => builder
+            .build_float_compare(FloatPredicate::OGE, l, r, "fge")
+            .map_err(be)?
+            .into(),
+    };
+    Ok(v)
+}
+
 fn lower_unop<'ctx>(
     builder: &inkwell::builder::Builder<'ctx>,
     op: UnOp,
@@ -401,9 +619,15 @@ fn lower_unop<'ctx>(
     v: BasicValueEnum<'ctx>,
 ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
     if ty.is_float() {
-        return Err(CodegenError::Unsupported(format!(
-            "UnOp::{op:?} on float operand — deferred to B.3"
-        )));
+        return match op {
+            UnOp::Neg => Ok(builder
+                .build_float_neg(v.into_float_value(), "fneg")
+                .map_err(be)?
+                .into()),
+            UnOp::Not | UnOp::BitNot => Err(CodegenError::Unsupported(format!(
+                "UnOp::{op:?} on float operand — typeck rejects this"
+            ))),
+        };
     }
     let v_int = v.into_int_value();
     let result: IntValue<'ctx> = match op {
@@ -443,7 +667,7 @@ fn read_operand<'ctx>(
     ty: Ty,
 ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
     match op {
-        Operand::Const(c) => emit_const(cx.context, c, ty),
+        Operand::Const(c) => emit_const(builder, cx.context, c, ty),
         Operand::Local(l) => {
             let ptr = *cx.allocas.get(l).ok_or_else(|| {
                 CodegenError::Builder(format!(
@@ -453,7 +677,7 @@ fn read_operand<'ctx>(
             })?;
             let lty = llvm_basic_type(cx.context, ty).ok_or_else(|| {
                 CodegenError::Unsupported(format!(
-                    "fn `{}` reads local {l:?} with type {:?}; B.2 supports integers and bool only",
+                    "fn `{}` reads local {l:?} with type {:?}; B.3 supports integers, bool, and floats",
                     cx.f.name, ty
                 ))
             })?;
@@ -463,6 +687,7 @@ fn read_operand<'ctx>(
 }
 
 fn emit_const<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
     context: &'ctx Context,
     c: &Const,
     ty: Ty,
@@ -491,9 +716,31 @@ fn emit_const<'ctx>(
                 "`Const::Unit` used as a value in non-void context (expected ty {ty:?})"
             )))
         }
-        Const::Float { .. } => Err(CodegenError::Unsupported(
-            "`Const::Float` — deferred to B.3".into(),
-        )),
+        Const::Float { bits, ty: float_ty } => {
+            // Build the constant by bitcasting an integer of matching
+            // width to the float type at runtime. LLVM constant-folds
+            // this immediately so it ends up as a literal in `.text`
+            // — but going through bitcast (rather than
+            // `FloatType::const_float(f64)`) preserves NaN payloads
+            // exactly, which an `f64` round-trip on the F32 path would
+            // lose.
+            let f_ty = llvm_float_type(context, *float_ty);
+            let v = match float_ty {
+                FloatTy::F32 => {
+                    let int_const = context.i32_type().const_int(*bits & 0xFFFF_FFFF, false);
+                    builder
+                        .build_bit_cast(int_const, f_ty, "fbits")
+                        .map_err(be)?
+                }
+                FloatTy::F64 => {
+                    let int_const = context.i64_type().const_int(*bits, false);
+                    builder
+                        .build_bit_cast(int_const, f_ty, "fbits")
+                        .map_err(be)?
+                }
+            };
+            Ok(v)
+        }
         Const::DataAddr(_) => Err(CodegenError::Unsupported(
             "`Const::DataAddr` (string literal) — deferred to B.5".into(),
         )),
@@ -605,7 +852,7 @@ fn make_fn_type<'ctx>(
         let pty = f.locals[param_local.0 as usize].ty;
         let lty = llvm_basic_type(context, pty).ok_or_else(|| {
             CodegenError::Unsupported(format!(
-                "fn `{}` param {:?} type {:?}; B.2 supports integers and bool only",
+                "fn `{}` param {:?} type {:?}; B.3 supports integers, bool, and floats",
                 f.name, param_local, pty
             ))
         })?;
@@ -615,9 +862,10 @@ fn make_fn_type<'ctx>(
         Ty::U0 => context.void_type().fn_type(&params, false),
         Ty::Int(int_ty) => llvm_int_type(context, int_ty).fn_type(&params, false),
         Ty::Bool => context.bool_type().fn_type(&params, false),
+        Ty::Float(float_ty) => llvm_float_type(context, float_ty).fn_type(&params, false),
         ref other => {
             return Err(CodegenError::Unsupported(format!(
-                "fn `{}` return type {:?}; B.2 supports `u0`, integers, and bool",
+                "fn `{}` return type {:?}; B.3 supports `u0`, integers, bool, and floats",
                 f.name, other
             )));
         }
@@ -625,15 +873,16 @@ fn make_fn_type<'ctx>(
 }
 
 /// Map a [`Ty`] to its LLVM `BasicTypeEnum`, or `None` for `u0` and
-/// any type B.2 doesn't yet handle (caller turns `None` into an
+/// any type B.3 doesn't yet handle (caller turns `None` into an
 /// `Unsupported` error).
 fn llvm_basic_type<'ctx>(context: &'ctx Context, ty: Ty) -> Option<BasicTypeEnum<'ctx>> {
     match ty {
         Ty::U0 => None,
         Ty::Bool => Some(context.bool_type().into()),
         Ty::Int(int_ty) => Some(llvm_int_type(context, int_ty).into()),
-        // Floats land in B.3, aggregates / pointers in B.4+.
-        Ty::Float(_) | Ty::Class(_) | Ty::Slice(_) | Ty::Ptr(_) | Ty::Rune | Ty::Error => None,
+        Ty::Float(float_ty) => Some(llvm_float_type(context, float_ty).into()),
+        // Aggregates / pointers in B.4+.
+        Ty::Class(_) | Ty::Slice(_) | Ty::Ptr(_) | Ty::Rune | Ty::Error => None,
         // `Ty` is non-exhaustive (Phase 2 will add `?T`, `!T`, etc.);
         // anything new lands here as Unsupported until handled.
         _ => None,
@@ -650,5 +899,12 @@ fn llvm_int_type<'ctx>(context: &'ctx Context, ty: IntTy) -> IntType<'ctx> {
         // 32-bit target ships. Matches the typeck simplification noted
         // in HANDOFF decision #16.
         IntTy::ISize | IntTy::USize => context.i64_type(),
+    }
+}
+
+fn llvm_float_type<'ctx>(context: &'ctx Context, ty: FloatTy) -> FloatType<'ctx> {
+    match ty {
+        FloatTy::F32 => context.f32_type(),
+        FloatTy::F64 => context.f64_type(),
     }
 }

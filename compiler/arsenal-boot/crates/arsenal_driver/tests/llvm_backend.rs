@@ -5,12 +5,12 @@
 //! `.expected_stdout` is present) is matched against the corpus's
 //! expectation files — same protocol as `phase1_run.rs`.
 //!
-//! Frontier as of B.2: 135 of the 226 corpus programs. Adding `as`
-//! casts (B.3), aggregate ABI (B.4), and string literals + the Print
-//! desugar (B.5) closes the remaining 91. Anything not in `SUPPORTED`
-//! exercises a MIR construct B.2 doesn't yet handle (`Const::Float`,
-//! `Rvalue::Cast`, `Rvalue::Field`, `Const::DataAddr`, the implicit
-//! Print desugar, or class-/slice-typed signatures).
+//! Frontier as of B.3: 168 of the 226 corpus programs. Adding the
+//! aggregate ABI (B.4) and string literals + the Print desugar (B.5)
+//! closes the remaining 58. Anything not in `SUPPORTED` exercises a
+//! MIR construct B.3 doesn't yet handle (`Rvalue::Field`,
+//! `MirStmt::AssignField`, `Const::DataAddr`, the implicit Print
+//! desugar, or class-/slice-typed signatures).
 //!
 //! Skipped on Windows for the same reason as `phase1_run.rs`: the
 //! driver shells out to `cc`.
@@ -25,7 +25,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-/// Programs the LLVM backend can compile end-to-end as of B.2.
+/// Programs the LLVM backend can compile end-to-end as of B.3.
 /// Curated by running `arsenal build --backend=llvm` against every
 /// corpus `.gw` and collecting the ones that produce a runnable binary
 /// matching its `.expected_exit` (and `.expected_stdout` when present).
@@ -98,6 +98,22 @@ const SUPPORTED: &[&str] = &[
     "74_top_level_if_controls_exit",
     "75_top_level_calls_user_fn",
     "76_top_level_for_loop",
+    // B.3 surface — float arithmetic / comparison / control flow:
+    "89_float_basic_add",
+    "90_float_sub",
+    "91_float_mul",
+    "92_float_div",
+    "93_float_neg",
+    "94_float_cmp_lt",
+    "95_float_cmp_le",
+    "96_float_cmp_gt",
+    "97_float_cmp_ge",
+    "98_float_cmp_ne",
+    "99_float_paren_precedence",
+    "100_float_chained_arith",
+    "101_float_param",
+    "102_float_loop_accumulate",
+    "103_float_recursion",
     "104_and_short_skips_rhs",
     "105_or_short_skips_rhs",
     "106_and_evaluates_rhs",
@@ -157,6 +173,11 @@ const SUPPORTED: &[&str] = &[
     "182_u64_bitwise",
     "183_i64_negative_arith",
     "184_i64_shift",
+    // B.3 surface — float corner cases:
+    "185_float_neg_zero",
+    "186_float_div_by_int_pattern",
+    "187_float_compare_zero",
+    "188_float_loop_sum",
     "189_for_inclusive",
     "190_nested_for",
     "191_break_continue_nested",
@@ -165,6 +186,21 @@ const SUPPORTED: &[&str] = &[
     "197_paren_depth",
     "198_chained_compare_via_and",
     "199_return_from_deep",
+    // B.3 surface — `as` cast matrix (incl. float→int saturation):
+    "201_cast_widen_signed",
+    "202_cast_widen_unsigned",
+    "203_cast_narrow_truncates",
+    "204_cast_signedness_reinterpret",
+    "205_cast_widens_for_overflow_safe_mul",
+    "206_cast_at_call_site",
+    "207_cast_chain_through_widths",
+    "208_cast_negated_literal",
+    "209_cast_int_to_float",
+    "210_cast_uint_to_float",
+    "211_cast_float_to_int_truncates",
+    "212_cast_float_widths",
+    "213_cast_float_in_arith",
+    "214_cast_float_saturates",
 ];
 
 fn corpus_dir() -> PathBuf {
