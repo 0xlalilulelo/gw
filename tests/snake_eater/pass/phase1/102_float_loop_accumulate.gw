@@ -1,0 +1,10 @@
+fn main() -> i32 {
+    let sum: f64 = 0.0;
+    let i: i32 = 0;
+    while i < 4 {
+        sum = sum + 0.25;
+        i = i + 1;
+    }
+    if sum == 1.0 { return 100; }
+    return 0;
+}

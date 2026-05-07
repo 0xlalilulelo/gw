@@ -1,0 +1,9 @@
+fn add(x: f64, y: f64) -> f64 {
+    return x + y;
+}
+
+fn main() -> i32 {
+    let r: f64 = add(2.5, 4.5);
+    if r == 7.0 { return 70; }
+    return 0;
+}

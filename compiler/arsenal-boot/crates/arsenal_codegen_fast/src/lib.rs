@@ -745,44 +745,81 @@ fn lower_binop(
         }
         BinOp::LogAnd => fb.ins().band(l, r),
         BinOp::LogOr => fb.ins().bor(l, r),
-        BinOp::Eq => fb.ins().icmp(ir::condcodes::IntCC::Equal, l, r),
-        BinOp::Ne => fb.ins().icmp(ir::condcodes::IntCC::NotEqual, l, r),
-        BinOp::Lt => fb.ins().icmp(
-            if signed {
-                ir::condcodes::IntCC::SignedLessThan
+        BinOp::Eq => {
+            if is_float {
+                fb.ins().fcmp(ir::condcodes::FloatCC::Equal, l, r)
             } else {
-                ir::condcodes::IntCC::UnsignedLessThan
-            },
-            l,
-            r,
-        ),
-        BinOp::Le => fb.ins().icmp(
-            if signed {
-                ir::condcodes::IntCC::SignedLessThanOrEqual
+                fb.ins().icmp(ir::condcodes::IntCC::Equal, l, r)
+            }
+        }
+        BinOp::Ne => {
+            if is_float {
+                fb.ins().fcmp(ir::condcodes::FloatCC::NotEqual, l, r)
             } else {
-                ir::condcodes::IntCC::UnsignedLessThanOrEqual
-            },
-            l,
-            r,
-        ),
-        BinOp::Gt => fb.ins().icmp(
-            if signed {
-                ir::condcodes::IntCC::SignedGreaterThan
+                fb.ins().icmp(ir::condcodes::IntCC::NotEqual, l, r)
+            }
+        }
+        BinOp::Lt => {
+            if is_float {
+                fb.ins().fcmp(ir::condcodes::FloatCC::LessThan, l, r)
             } else {
-                ir::condcodes::IntCC::UnsignedGreaterThan
-            },
-            l,
-            r,
-        ),
-        BinOp::Ge => fb.ins().icmp(
-            if signed {
-                ir::condcodes::IntCC::SignedGreaterThanOrEqual
+                fb.ins().icmp(
+                    if signed {
+                        ir::condcodes::IntCC::SignedLessThan
+                    } else {
+                        ir::condcodes::IntCC::UnsignedLessThan
+                    },
+                    l,
+                    r,
+                )
+            }
+        }
+        BinOp::Le => {
+            if is_float {
+                fb.ins().fcmp(ir::condcodes::FloatCC::LessThanOrEqual, l, r)
             } else {
-                ir::condcodes::IntCC::UnsignedGreaterThanOrEqual
-            },
-            l,
-            r,
-        ),
+                fb.ins().icmp(
+                    if signed {
+                        ir::condcodes::IntCC::SignedLessThanOrEqual
+                    } else {
+                        ir::condcodes::IntCC::UnsignedLessThanOrEqual
+                    },
+                    l,
+                    r,
+                )
+            }
+        }
+        BinOp::Gt => {
+            if is_float {
+                fb.ins().fcmp(ir::condcodes::FloatCC::GreaterThan, l, r)
+            } else {
+                fb.ins().icmp(
+                    if signed {
+                        ir::condcodes::IntCC::SignedGreaterThan
+                    } else {
+                        ir::condcodes::IntCC::UnsignedGreaterThan
+                    },
+                    l,
+                    r,
+                )
+            }
+        }
+        BinOp::Ge => {
+            if is_float {
+                fb.ins()
+                    .fcmp(ir::condcodes::FloatCC::GreaterThanOrEqual, l, r)
+            } else {
+                fb.ins().icmp(
+                    if signed {
+                        ir::condcodes::IntCC::SignedGreaterThanOrEqual
+                    } else {
+                        ir::condcodes::IntCC::UnsignedGreaterThanOrEqual
+                    },
+                    l,
+                    r,
+                )
+            }
+        }
     }
 }
 
@@ -807,11 +844,86 @@ fn lower_unop(fb: &mut FunctionBuilder<'_>, op: UnOp, ty: Ty, v: ir::Value) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cranelift_codegen::ir::{Function, Opcode, Signature, UserFuncName};
+    use cranelift_codegen::isa::CallConv;
 
     #[test]
     fn host_triple_resolves() {
         // Smoke test: the host triple should be lookup-able. This
         // verifies cranelift's ISA detection works on the dev box.
         let _isa = isa::lookup(Triple::host()).expect("host isa");
+    }
+
+    /// Build a single-block function, run [`lower_binop`] inside it,
+    /// and return every opcode it emitted.
+    fn opcodes_for_binop(op: BinOp, ty: Ty, operand_ty: ir::Type) -> Vec<Opcode> {
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(operand_ty));
+        sig.params.push(AbiParam::new(operand_ty));
+        sig.returns.push(AbiParam::new(ir::types::I8));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let mut fbctx = FunctionBuilderContext::new();
+        let mut fb = FunctionBuilder::new(&mut func, &mut fbctx);
+        let block = fb.create_block();
+        fb.append_block_params_for_function_params(block);
+        fb.switch_to_block(block);
+        fb.seal_block(block);
+        let l = fb.block_params(block)[0];
+        let r = fb.block_params(block)[1];
+        let v = lower_binop(&mut fb, op, ty, l, r);
+        fb.ins().return_(&[v]);
+        fb.finalize();
+        let mut opcodes = Vec::new();
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                opcodes.push(func.dfg.insts[inst].opcode());
+            }
+        }
+        opcodes
+    }
+
+    /// Regression: comparison BinOps used to lower unconditionally to
+    /// `icmp`, which Cranelift's verifier rejects when the operands
+    /// are F32/F64. The fix branches on `ty.is_float()` and emits
+    /// `fcmp` for floats.
+    #[test]
+    fn float_eq_lowers_to_fcmp_not_icmp() {
+        let ops = opcodes_for_binop(BinOp::Eq, Ty::Float(FloatTy::F64), ir::types::F64);
+        assert!(
+            ops.contains(&Opcode::Fcmp),
+            "expected Fcmp for float ==, saw {ops:?}"
+        );
+        assert!(
+            !ops.contains(&Opcode::Icmp),
+            "icmp leaked into a float comparison: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn float_lt_le_gt_ge_ne_all_lower_to_fcmp() {
+        for op in [BinOp::Ne, BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge] {
+            let ops = opcodes_for_binop(op, Ty::Float(FloatTy::F32), ir::types::F32);
+            assert!(
+                ops.contains(&Opcode::Fcmp),
+                "expected Fcmp for float {op:?}, saw {ops:?}"
+            );
+            assert!(
+                !ops.contains(&Opcode::Icmp),
+                "icmp leaked into float {op:?}: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_eq_still_lowers_to_icmp() {
+        let ops = opcodes_for_binop(BinOp::Eq, Ty::Int(IntTy::I32), ir::types::I32);
+        assert!(
+            ops.contains(&Opcode::Icmp),
+            "expected Icmp for int ==, saw {ops:?}"
+        );
+        assert!(
+            !ops.contains(&Opcode::Fcmp),
+            "fcmp leaked into int comparison: {ops:?}"
+        );
     }
 }

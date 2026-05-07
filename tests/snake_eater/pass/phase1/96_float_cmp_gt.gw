@@ -1,0 +1,6 @@
+fn main() -> i32 {
+    let a: f64 = 3.5;
+    let b: f64 = 2.5;
+    if a > b { return 13; }
+    return 0;
+}

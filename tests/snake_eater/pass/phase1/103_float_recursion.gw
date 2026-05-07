@@ -1,0 +1,10 @@
+fn pow2(n: i32) -> f64 {
+    if n == 0 { return 1.0; }
+    return 2.0 * pow2(n - 1);
+}
+
+fn main() -> i32 {
+    let r: f64 = pow2(5);
+    if r == 32.0 { return 32; }
+    return 0;
+}

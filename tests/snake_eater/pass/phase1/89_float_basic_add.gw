@@ -1,0 +1,7 @@
+fn main() -> i32 {
+    let x: f64 = 1.5;
+    let y: f64 = 0.5;
+    let z: f64 = x + y;
+    if z == 2.0 { return 42; }
+    return 0;
+}
