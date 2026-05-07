@@ -1,0 +1,15 @@
+fn power(base: i32, exp: i32) -> i32 {
+    let r: i32 = 1;
+    let i: i32 = 0;
+    while i < exp {
+        r = r * base;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn main() -> i32 {
+    let r: i32 = power(2, 10);
+    if r == 1024 { return 42; }
+    return 0;
+}

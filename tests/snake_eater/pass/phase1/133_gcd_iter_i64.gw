@@ -1,0 +1,16 @@
+fn gcd(a: i64, b: i64) -> i64 {
+    let x: i64 = a;
+    let y: i64 = b;
+    while y != 0 {
+        let t: i64 = y;
+        y = x % y;
+        x = t;
+    }
+    return x;
+}
+
+fn main() -> i32 {
+    let r: i64 = gcd(48, 18);
+    if r == 6 { return 42; }
+    return 0;
+}

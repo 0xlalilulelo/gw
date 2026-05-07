@@ -1,0 +1,19 @@
+fn collatz_steps(n: i32) -> i32 {
+    let v: i32 = n;
+    let steps: i32 = 0;
+    while v != 1 {
+        if v % 2 == 0 {
+            v = v / 2;
+        } else {
+            v = 3 * v + 1;
+        }
+        steps = steps + 1;
+    }
+    return steps;
+}
+
+fn main() -> i32 {
+    let r: i32 = collatz_steps(27);
+    if r == 111 { return 42; }
+    return 0;
+}

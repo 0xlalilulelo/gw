@@ -1,0 +1,22 @@
+fn isqrt(n: i32) -> i32 {
+    if n < 2 { return n; }
+    let x: i32 = n;
+    let y: i32 = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    return x;
+}
+
+fn main() -> i32 {
+    let a: i32 = isqrt(100);
+    let b: i32 = isqrt(81);
+    let c: i32 = isqrt(150);
+    if a == 10 {
+        if b == 9 {
+            if c == 12 { return 42; }
+        }
+    }
+    return 0;
+}

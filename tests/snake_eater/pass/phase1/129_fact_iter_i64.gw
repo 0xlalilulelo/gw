@@ -1,0 +1,15 @@
+fn fact(n: i64) -> i64 {
+    let r: i64 = 1;
+    let i: i64 = 2;
+    while i <= n {
+        r = r * i;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn main() -> i32 {
+    let r: i64 = fact(20);
+    if r == 2432902008176640000 { return 42; }
+    return 0;
+}

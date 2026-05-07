@@ -1,0 +1,10 @@
+fn fact(n: i64) -> i64 {
+    if n < 2 { return 1; }
+    return n * fact(n - 1);
+}
+
+fn main() -> i32 {
+    let r: i64 = fact(15);
+    if r == 1307674368000 { return 42; }
+    return 0;
+}

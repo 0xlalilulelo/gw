@@ -831,6 +831,16 @@ fn check_expr_stmt<'a>(es: ExprStmt<'a>, cx: &mut Cx<'a, '_, '_, '_>) {
 /// type of `expr` must match it. The actual type of the expression is
 /// recorded in `cx.tm.expr_types` and returned for caller convenience.
 fn check_expr<'a>(expr: Expr<'a>, expected: Ty, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
+    // Bidirectional narrowing for unsuffixed numeric literals: if the
+    // caller wants an integer type and the expression is an integer
+    // literal whose value fits, type the literal at the expected
+    // width. Same for float literals against a float context. This is
+    // the minimum bidirectional inference Phase 1 needs so that
+    // `let n: i64 = 5;` and `fact(10): i64` work without an `as` cast.
+    if let Some(narrowed) = try_narrow_literal(expr, expected, cx) {
+        cx.tm.expr_types.insert(NodePtr(expr.syntax()), narrowed);
+        return narrowed;
+    }
     let synth = synth_expr(expr, cx);
     if expected != Ty::Error && synth != Ty::Error && !ty_assignable(synth, expected) {
         cx.diags.push(Diagnostic::error(
@@ -840,6 +850,78 @@ fn check_expr<'a>(expr: Expr<'a>, expected: Ty, cx: &mut Cx<'a, '_, '_, '_>) -> 
         ));
     }
     synth
+}
+
+/// If `expr` is an unsuffixed integer or float literal and `expected`
+/// is a compatible numeric type, return the narrowed type. Emits a
+/// diagnostic and returns `Some(Ty::Error)` if the integer literal
+/// does not fit the requested width. Returns `None` for any other
+/// shape (compound expressions, mismatched kinds, error contexts) so
+/// the caller falls back to the default synthesise-then-check path.
+///
+/// Negative literals are parsed as `Unary(Minus, IntLit)` and so do
+/// not enter this path; an explicitly-typed `let x: i8 = -1;` keeps
+/// using the standard check.
+fn try_narrow_literal<'a>(expr: Expr<'a>, expected: Ty, cx: &mut Cx<'a, '_, '_, '_>) -> Option<Ty> {
+    if expected == Ty::Error {
+        return None;
+    }
+    let lit = match expr {
+        Expr::Literal(l) => l,
+        _ => return None,
+    };
+    let (kind, span) = lit.token()?;
+    match (kind, expected) {
+        (SyntaxKind::IntLit, Ty::Int(target)) => {
+            let raw = cx.sm.slice(span)?;
+            let value = parse_unsigned_int_literal(raw)?;
+            if value_fits_int(value, target) {
+                Some(Ty::Int(target))
+            } else {
+                cx.diags.push(Diagnostic::error(
+                    ec::TYPE_MISMATCH,
+                    Label::new(span, ""),
+                    format!("integer literal `{raw}` does not fit in `{expected}`"),
+                ));
+                Some(Ty::Error)
+            }
+        }
+        (SyntaxKind::FloatLit, Ty::Float(_)) => Some(expected),
+        _ => None,
+    }
+}
+
+/// Parse the source text of an `IntLit` token. Token text is always
+/// non-negative (unary minus is a separate AST node); the result fits
+/// in `i128` for any Phase-1-supported width up to `u64`.
+fn parse_unsigned_int_literal(raw: &str) -> Option<i128> {
+    let s = raw.replace('_', "");
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        i128::from_str_radix(rest, 16).ok()
+    } else if let Some(rest) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
+        i128::from_str_radix(rest, 8).ok()
+    } else if let Some(rest) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+        i128::from_str_radix(rest, 2).ok()
+    } else {
+        s.parse::<i128>().ok()
+    }
+}
+
+/// Whether a non-negative integer literal value fits in `ty`'s range.
+/// `ISize`/`USize` use 64-bit bounds (Phase 1 only targets 64-bit
+/// platforms; revisit if a 32-bit target ships).
+fn value_fits_int(v: i128, ty: IntTy) -> bool {
+    let (min, max): (i128, i128) = match ty {
+        IntTy::I8 => (i8::MIN as i128, i8::MAX as i128),
+        IntTy::U8 => (0, u8::MAX as i128),
+        IntTy::I16 => (i16::MIN as i128, i16::MAX as i128),
+        IntTy::U16 => (0, u16::MAX as i128),
+        IntTy::I32 => (i32::MIN as i128, i32::MAX as i128),
+        IntTy::U32 => (0, u32::MAX as i128),
+        IntTy::I64 | IntTy::ISize => (i64::MIN as i128, i64::MAX as i128),
+        IntTy::U64 | IntTy::USize => (0, u64::MAX as i128),
+    };
+    v >= min && v <= max
 }
 
 fn synth_expr<'a>(expr: Expr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
@@ -947,8 +1029,13 @@ fn synth_binary<'a>(b: BinaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     if matches!(b.op_kind(), Some(SyntaxKind::Eq)) {
         return synth_assign(b, cx);
     }
-    let lhs = b.lhs().map(|e| synth_expr(e, cx)).unwrap_or(Ty::Error);
-    let rhs = b.rhs().map(|e| synth_expr(e, cx)).unwrap_or(Ty::Error);
+    // Narrow free numeric literals to the other side's type when one
+    // side has a concrete numeric type and the other is just a bare
+    // `IntLit` / `FloatLit`. Without this, expressions like `n < 2`
+    // (where `n: i64`) reject because the literal `2` synth'd as i32.
+    // The asymmetric case dominates — both-literal and both-typed
+    // cases fall back to the plain synth path on each side.
+    let (lhs, rhs) = synth_binop_operands(b, cx);
     let Some(op) = b.op_kind() else {
         return Ty::Error;
     };
@@ -974,6 +1061,58 @@ fn synth_binary<'a>(b: BinaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
             Ty::Bool
         }
         _ => Ty::Error,
+    }
+}
+
+/// Synthesise both operands of a binary expression with a one-shot
+/// bidirectional rule: if exactly one operand is a bare numeric
+/// literal and the other has a concrete int/float type, narrow the
+/// literal side to match. Both-literal and both-typed cases fall back
+/// to the plain synthesise-each-side path.
+fn synth_binop_operands<'a>(b: BinaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> (Ty, Ty) {
+    let (Some(l_expr), Some(r_expr)) = (b.lhs(), b.rhs()) else {
+        return (
+            b.lhs().map(|e| synth_expr(e, cx)).unwrap_or(Ty::Error),
+            b.rhs().map(|e| synth_expr(e, cx)).unwrap_or(Ty::Error),
+        );
+    };
+    let l_lit = is_free_numeric_literal(l_expr);
+    let r_lit = is_free_numeric_literal(r_expr);
+    match (l_lit, r_lit) {
+        (true, false) => {
+            let r_ty = synth_expr(r_expr, cx);
+            let l_ty = if matches!(r_ty, Ty::Int(_) | Ty::Float(_)) {
+                check_expr(l_expr, r_ty, cx)
+            } else {
+                synth_expr(l_expr, cx)
+            };
+            (l_ty, r_ty)
+        }
+        (false, true) => {
+            let l_ty = synth_expr(l_expr, cx);
+            let r_ty = if matches!(l_ty, Ty::Int(_) | Ty::Float(_)) {
+                check_expr(r_expr, l_ty, cx)
+            } else {
+                synth_expr(r_expr, cx)
+            };
+            (l_ty, r_ty)
+        }
+        _ => (synth_expr(l_expr, cx), synth_expr(r_expr, cx)),
+    }
+}
+
+/// Whether `e` is a bare integer or float literal, possibly wrapped in
+/// parentheses. Used by [`synth_binop_operands`] to recognise the
+/// narrowable side. Negated literals (`-7`) are `Unary(Minus, IntLit)`
+/// and don't count — that path keeps using the default synth logic.
+fn is_free_numeric_literal(e: Expr<'_>) -> bool {
+    match e {
+        Expr::Literal(l) => matches!(
+            l.token_kind(),
+            Some(SyntaxKind::IntLit | SyntaxKind::FloatLit)
+        ),
+        Expr::Paren(p) => p.inner().is_some_and(is_free_numeric_literal),
+        _ => false,
     }
 }
 
@@ -1697,5 +1836,60 @@ mod tests {
     #[test]
     fn non_byte_pointee_diagnoses() {
         assert!(check("extern fn f(p: *i32) -> i32;") >= 1);
+    }
+
+    /// Regression: integer literals in `let` initializers were stuck
+    /// at `i32` and rejected against any other typed binding —
+    /// `let n: i64 = 5;` errored "expected i64, found i32". Fix wires
+    /// bidirectional narrowing through `check_expr` so the literal
+    /// adopts the expected width when the value fits.
+    #[test]
+    fn int_literal_narrows_in_let_init() {
+        assert_eq!(check("fn f() -> i32 { let n: i64 = 5; return 0; }"), 0);
+        assert_eq!(check("fn f() -> i32 { let n: u8 = 200; return 0; }"), 0);
+        assert_eq!(check("fn f() -> i32 { let n: usize = 1024; return 0; }"), 0);
+    }
+
+    /// Out-of-range narrowing is still a type error; the diagnostic
+    /// names the requested type so the user knows what's wrong.
+    #[test]
+    fn int_literal_narrowing_out_of_range_diagnoses() {
+        assert!(check("fn f() -> i32 { let n: u8 = 256; return 0; }") >= 1);
+        assert!(check("fn f() -> i32 { let n: i8 = 200; return 0; }") >= 1);
+    }
+
+    /// Narrowing also fires inside binary operators when one side has
+    /// a known type and the other is a free literal — needed for
+    /// shapes like `n < 2`, `r == 3628800`, `n - 1` where `n: i64`.
+    #[test]
+    fn int_literal_narrows_across_binop_with_typed_side() {
+        let src = "fn fact(n: i64) -> i64 {
+                if n < 2 { return 1; }
+                return n * fact(n - 1);
+            }
+            fn main() -> i32 {
+                let r: i64 = fact(10);
+                if r == 3628800 { return 42; }
+                return 0;
+            }";
+        assert_eq!(check(src), 0);
+    }
+
+    /// Float literals should narrow analogously: `let x: f32 = 1.5;`
+    /// previously errored "expected f32, found f64".
+    #[test]
+    fn float_literal_narrows_in_let_init() {
+        assert_eq!(check("fn f() -> i32 { let x: f32 = 1.5; return 0; }"), 0);
+    }
+
+    /// Call argument narrowing: positional args at function calls
+    /// already used `check_expr`; the literal-narrowing path through
+    /// `check_expr` makes wide-int call sites work without per-call
+    /// casts.
+    #[test]
+    fn int_literal_narrows_in_call_arg() {
+        let src = "fn g(n: i64) -> i64 { return n; }
+                   fn f() -> i32 { let r: i64 = g(42); return 0; }";
+        assert_eq!(check(src), 0);
     }
 }

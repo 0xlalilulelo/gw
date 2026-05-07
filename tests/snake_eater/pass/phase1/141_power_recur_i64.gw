@@ -1,0 +1,10 @@
+fn power(base: i64, exp: i64) -> i64 {
+    if exp == 0 { return 1; }
+    return base * power(base, exp - 1);
+}
+
+fn main() -> i32 {
+    let r: i64 = power(2, 40);
+    if r == 1099511627776 { return 42; }
+    return 0;
+}

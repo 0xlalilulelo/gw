@@ -1,0 +1,18 @@
+fn fib(n: i64) -> i64 {
+    let a: i64 = 0;
+    let b: i64 = 1;
+    let i: i64 = 0;
+    while i < n {
+        let t: i64 = a + b;
+        a = b;
+        b = t;
+        i = i + 1;
+    }
+    return a;
+}
+
+fn main() -> i32 {
+    let r: i64 = fib(50);
+    if r == 12586269025 { return 42; }
+    return 0;
+}
