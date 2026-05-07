@@ -887,13 +887,11 @@ fn lower_expr<'a>(
         Expr::Literal(l) => lower_literal(b, l, lcx),
         Expr::Path(p) => lower_path(p, lcx),
         Expr::Paren(p) => lower_paren(b, p, lcx),
-        Expr::Binary(bin) => {
-            if matches!(bin.op_kind(), Some(SyntaxKind::Eq)) {
-                lower_assign(b, bin, lcx)
-            } else {
-                lower_binary(b, bin, lcx)
-            }
-        }
+        Expr::Binary(bin) => match bin.op_kind() {
+            Some(SyntaxKind::Eq) => lower_assign(b, bin, lcx),
+            Some(SyntaxKind::AmpAmp | SyntaxKind::PipePipe) => lower_short_circuit(b, bin, lcx),
+            _ => lower_binary(b, bin, lcx),
+        },
         Expr::Unary(u) => lower_unary(b, u, lcx),
         Expr::Block(blk) => lower_block(b, blk, lcx),
         Expr::If(i) => lower_if(b, i, lcx),
@@ -1192,6 +1190,86 @@ fn lower_binary<'a>(
     });
     b.push_stmt(MirStmt::Assign { dst: local, value });
     Operand::Local(local)
+}
+
+/// Lower `lhs && rhs` and `lhs || rhs` with short-circuit semantics.
+///
+/// Both operators desugar to control flow: the RHS is only evaluated
+/// when the LHS does not already determine the result.
+///
+/// Shape (for `&&`; `||` swaps the then/else targets):
+/// ```text
+///     branch on lhs:
+///       true  -> rhs_bb
+///       false -> short_bb (assigns false, gotos join)
+///     rhs_bb: <evaluate rhs>; result = rhs; goto join
+///     short_bb: result = false; goto join
+///     join: continue with `Operand::Local(result)`
+/// ```
+fn lower_short_circuit<'a>(
+    b: &mut Builder,
+    bin: BinaryExpr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
+) -> Operand {
+    let is_and = matches!(bin.op_kind(), Some(SyntaxKind::AmpAmp));
+
+    // The result local lives in whatever block we came from; it is
+    // assigned in both the rhs-eval block and the short-circuit block,
+    // and read at the join.
+    let result = b.alloc_local(LocalDecl {
+        ty: Ty::Bool,
+        span: bin.syntax().span,
+    });
+
+    let lhs = bin
+        .lhs()
+        .map(|e| lower_expr(b, e, lcx))
+        .unwrap_or(Operand::Const(Const::Bool(!is_and)));
+
+    let rhs_bb = b.alloc_block();
+    let short_bb = b.alloc_block();
+    let join_bb = b.alloc_block();
+
+    // For `&&`: take rhs_bb when lhs is true, short_bb when false.
+    // For `||`: take short_bb when lhs is true, rhs_bb when false.
+    let (then_bb, else_bb) = if is_and {
+        (rhs_bb, short_bb)
+    } else {
+        (short_bb, rhs_bb)
+    };
+    b.set_terminator(
+        b.cur,
+        Terminator::Branch {
+            cond: lhs,
+            then_bb,
+            else_bb,
+        },
+    );
+
+    // Short-circuit block: result is `false` for `&&`, `true` for `||`.
+    b.cur = short_bb;
+    b.push_stmt(MirStmt::Assign {
+        dst: result,
+        value: Rvalue::Use(Operand::Const(Const::Bool(!is_and))),
+    });
+    b.set_terminator(b.cur, Terminator::Goto(join_bb));
+
+    // RHS-eval block.
+    b.cur = rhs_bb;
+    let rhs = bin
+        .rhs()
+        .map(|e| lower_expr(b, e, lcx))
+        .unwrap_or(Operand::Const(Const::Bool(is_and)));
+    // `lower_expr` for the rhs may have introduced its own blocks
+    // (e.g. nested `&&`); use the builder's current block, not rhs_bb.
+    b.push_stmt(MirStmt::Assign {
+        dst: result,
+        value: Rvalue::Use(rhs),
+    });
+    b.set_terminator(b.cur, Terminator::Goto(join_bb));
+
+    b.cur = join_bb;
+    Operand::Local(result)
 }
 
 fn lower_unary<'a>(
@@ -1902,5 +1980,58 @@ mod tests {
             "else arm should itself branch on the nested if; got {:?}",
             else_block.terminator,
         );
+    }
+
+    /// Regression: `&&` and `||` lowered to `BinOp::LogAnd` /
+    /// `BinOp::LogOr` (eager `band`/`bor` at codegen) instead of
+    /// short-circuit control flow. With the bug, `false && side(c)`
+    /// would still evaluate `side(c)`. The fix routes `AmpAmp` /
+    /// `PipePipe` through `lower_short_circuit`, which emits a
+    /// branch on the LHS, evaluates the RHS only on the take-branch,
+    /// and joins both arms into a single result local.
+    #[test]
+    fn logical_and_or_lowers_as_branches_not_eager_binops() {
+        let prog = lower_src(
+            "fn f(a: bool, b: bool) -> bool { return a && b; }
+             fn g(a: bool, b: bool) -> bool { return a || b; }
+             fn main() -> i32 { return 0; }",
+        );
+        for name in ["f", "g"] {
+            let func = prog
+                .functions
+                .iter()
+                .find(|fn_| fn_.name == name)
+                .expect("fn lowered");
+            // Must contain at least one Branch terminator (the
+            // short-circuit branch on the LHS).
+            let has_branch = func
+                .blocks
+                .iter()
+                .any(|blk| matches!(blk.terminator, Terminator::Branch { .. }));
+            assert!(
+                has_branch,
+                "{name}: short-circuit should emit a Branch terminator"
+            );
+            // Must NOT contain a BinOp::LogAnd or BinOp::LogOr — those
+            // are the eager-evaluation rvalues the bug produced.
+            let has_log_binop = func.blocks.iter().any(|blk| {
+                blk.statements.iter().any(|s| {
+                    matches!(
+                        s,
+                        MirStmt::Assign {
+                            value: Rvalue::BinOp {
+                                op: BinOp::LogAnd | BinOp::LogOr,
+                                ..
+                            },
+                            ..
+                        }
+                    )
+                })
+            });
+            assert!(
+                !has_log_binop,
+                "{name}: short-circuit must not emit BinOp::LogAnd / LogOr"
+            );
+        }
     }
 }

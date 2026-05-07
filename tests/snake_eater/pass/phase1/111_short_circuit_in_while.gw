@@ -1,0 +1,13 @@
+fn safe(x: i32) -> bool {
+    return 100 / x > 0;
+}
+
+fn main() -> i32 {
+    let i: i32 = 0;
+    let count: i32 = 0;
+    while i < 5 && safe(i + 1) {
+        count = count + 1;
+        i = i + 1;
+    }
+    return count;
+}

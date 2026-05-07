@@ -1,0 +1,12 @@
+extern fn putchar(c: i32) -> i32;
+
+fn side(c: i32) -> bool {
+    putchar(c);
+    return true;
+}
+
+fn main() -> i32 {
+    if false && side(65) { return 1; }
+    if true || side(66) { return 42; }
+    return 0;
+}

@@ -1,0 +1,9 @@
+fn main() -> i32 {
+    let a: bool = false;
+    let b: bool = true;
+    let c: bool = true;
+    if a || b && c {
+        return 42;
+    }
+    return 0;
+}
