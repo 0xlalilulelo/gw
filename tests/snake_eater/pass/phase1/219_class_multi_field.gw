@@ -1,0 +1,12 @@
+// Phase 1 increment A.3: multi-field class through the by-pointer
+// ABI. Tests that `copy_aggregate_from_ptr` walks every offset in
+// the class layout (not just offset 0) when materialising the
+// caller's slot into the callee's local.
+class Pair { a: i32, b: i32 }
+fn sum(p: Pair) -> i32 {
+    return p.a + p.b;
+}
+fn main() -> i32 {
+    let p = Pair { .a = 10, .b = 32 };
+    return sum(p);
+}

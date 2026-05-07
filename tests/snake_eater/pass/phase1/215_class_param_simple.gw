@@ -1,0 +1,12 @@
+// Phase 1 increment A.3: class-typed parameter via the by-pointer ABI.
+// `read_value(c)` materialises its parameter into a fresh stack slot
+// (codegen copies field-by-field at fn entry), then field-reads the
+// slot like any other class local.
+class Counter { value: i32 }
+fn read_value(c: Counter) -> i32 {
+    return c.value;
+}
+fn main() -> i32 {
+    let c = Counter { .value = 11 };
+    return read_value(c);
+}

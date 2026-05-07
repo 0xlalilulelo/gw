@@ -302,9 +302,20 @@ pub fn lower<'a>(
     resolved: &ResolvedModule<'a>,
     sm: &SourceMap,
 ) -> MirProgram {
+    // Map each fn-shaped def to its index in `functions`. Class defs
+    // share `resolved.defs` but never appear in `functions`, so we
+    // skip them while incrementing the index. (Pre-A.3 this map
+    // stored the def's position in `resolved.defs` directly; that
+    // worked only because no program with a class def ever called a
+    // fn defined later in the same module — A.3's class-by-pointer
+    // ABI surfaces the off-by-N immediately.)
     let mut def_to_fn: FxHashMap<DefId, FnIdx> = FxHashMap::default();
-    for (i, def) in resolved.defs.iter().enumerate() {
-        def_to_fn.insert(def.id, FnIdx(i as u32));
+    let mut next_fn_idx = 0u32;
+    for def in &resolved.defs {
+        if matches!(def.kind, DefKind::Fn | DefKind::SyntheticMain) {
+            def_to_fn.insert(def.id, FnIdx(next_fn_idx));
+            next_fn_idx += 1;
+        }
     }
 
     // Phase 1 increment 11c: a bare string literal at statement
@@ -2313,5 +2324,43 @@ mod tests {
         );
         assert_eq!(cast_kind_in(&prog, "id32"), CastKind::FloatBitcast);
         assert_eq!(cast_kind_in(&prog, "id64"), CastKind::FloatBitcast);
+    }
+
+    // ─── Phase 1 increment A.3: class-by-pointer ABI ──────────────────────
+
+    /// Regression: `def_to_fn` previously stored each def's position
+    /// in `resolved.defs` (including `DefKind::Class`), so a class
+    /// declared before a fn would shift every subsequent fn's FnIdx
+    /// by one. No pre-A.3 program exercised the path because class-
+    /// typed params/returns were rejected, but the bug was real and
+    /// would surface as soon as A.3 enabled the call. The fix only
+    /// counts `Fn` / `SyntheticMain` defs when assigning indices.
+    #[test]
+    fn def_to_fn_skips_class_defs_when_assigning_indices() {
+        let prog = lower_src(
+            "class C { x: i32 }\n\
+             fn helper(c: C) -> i32 { return c.x; }\n\
+             fn main() -> i32 { let c = C { .x = 9 }; return helper(c); }",
+        );
+        // Find main, locate its Call terminator, and confirm the
+        // FnIdx resolves to `helper` (not `main` or out-of-bounds).
+        let main = prog
+            .functions
+            .iter()
+            .find(|f| f.name == "main")
+            .expect("main lowered");
+        for blk in &main.blocks {
+            if let Terminator::Call { callee, .. } = &blk.terminator {
+                let target = &prog.functions[callee.0 as usize];
+                assert_eq!(
+                    target.name, "helper",
+                    "main's call must resolve to helper, not {}",
+                    target.name
+                );
+                assert_eq!(target.params.len(), 1);
+                return;
+            }
+        }
+        panic!("expected main to contain a Call terminator");
     }
 }

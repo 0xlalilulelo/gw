@@ -1,0 +1,11 @@
+// Phase 1 increment A.3: class with non-i32 field types crossing
+// the by-pointer ABI. The aggregate copy in/out must use the
+// correct Cranelift load/store width per field — F64 here, not I32.
+class Vec { x: f64, y: f64 }
+fn norm_sq_int(v: Vec) -> i32 {
+    return (v.x * v.x + v.y * v.y) as i32;
+}
+fn main() -> i32 {
+    let v = Vec { .x = 3.0, .y = 4.0 };
+    return norm_sq_int(v);
+}

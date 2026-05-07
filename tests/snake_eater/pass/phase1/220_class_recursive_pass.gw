@@ -1,0 +1,14 @@
+// Phase 1 increment A.3: recursive class-by-pointer call. Each
+// frame allocates its own param slot and result slot; the chain
+// reduces n to 0 while incrementing c.value, and the final
+// returned Counter rolls back up through 5 hidden out-pointers.
+class Counter { value: i32 }
+fn inc_n(c: Counter, n: i32) -> Counter {
+    if n == 0 { return c; }
+    return inc_n(Counter { .value = c.value + 1 }, n - 1);
+}
+fn main() -> i32 {
+    let c = Counter { .value = 0 };
+    let r = inc_n(c, 5);
+    return r.value;
+}

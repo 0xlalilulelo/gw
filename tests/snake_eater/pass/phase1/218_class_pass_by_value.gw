@@ -1,0 +1,18 @@
+// Phase 1 increment A.3: pass-by-value semantics. The callee
+// receives its own copy of the class — modifying its local view
+// must not affect the caller's `c`. `copy_aggregate_from_ptr` at
+// fn entry creates the fresh copy that makes this work.
+class Counter { value: i32 }
+fn try_modify(c: Counter) -> i32 {
+    c.value = 999;
+    return c.value;
+}
+fn main() -> i32 {
+    let c = Counter { .value = 7 };
+    let local_view = try_modify(c);
+    if local_view == 999 {
+        if c.value == 7 { return 0; }
+        return 2;
+    }
+    return 1;
+}

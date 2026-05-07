@@ -1,0 +1,15 @@
+// Phase 1 increment A.3: two class arguments to one fn. Each arg
+// gets its own pointer in the call's arg list (after the hidden
+// out-pointer for the Counter return). Verifies the codegen loop
+// over `callee_fn.params` correctly drives one stack_addr per
+// aggregate parameter.
+class Counter { value: i32 }
+fn merge(a: Counter, b: Counter) -> Counter {
+    return Counter { .value = a.value + b.value };
+}
+fn main() -> i32 {
+    let a = Counter { .value = 17 };
+    let b = Counter { .value = 25 };
+    let r = merge(a, b);
+    return r.value;
+}

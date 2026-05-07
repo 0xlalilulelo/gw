@@ -464,15 +464,8 @@ fn check_fn_signature(
                     Ty::Error
                 }
             };
-            // Phase 1 disallows class- and slice-typed params: cross-fn
-            // passing requires a by-pointer ABI we haven't built yet.
-            if matches!(ty, Ty::Class(_)) {
-                diags.push(Diagnostic::error(
-                    ec::UNSUPPORTED_CONSTRUCT,
-                    Label::new(p.span(), ""),
-                    "class-typed parameters are not yet supported in Phase 1; pass primitive fields instead",
-                ));
-            }
+            // Class-typed params are accepted via the by-pointer ABI
+            // landed in increment A.3. Slice-typed params follow in A.4.
             if matches!(ty, Ty::Slice(_)) {
                 diags.push(Diagnostic::error(
                     ec::UNSUPPORTED_CONSTRUCT,
@@ -509,13 +502,9 @@ fn check_fn_signature(
             Ty::Error
         }
     };
-    if matches!(ret, Ty::Class(_)) {
-        diags.push(Diagnostic::error(
-            ec::UNSUPPORTED_CONSTRUCT,
-            Label::new(fn_decl.span(), ""),
-            "class-typed return values are not yet supported in Phase 1",
-        ));
-    }
+    // Class-typed returns are accepted via the by-pointer ABI from
+    // increment A.3 (hidden out-pointer). Slice-typed returns follow
+    // in A.4 — see the slice-return rejection below.
     if matches!(ret, Ty::Ptr(_)) && !is_extern {
         diags.push(Diagnostic::error(
             ec::UNSUPPORTED_CONSTRUCT,
@@ -2066,5 +2055,39 @@ mod tests {
     #[test]
     fn cast_bool_to_float_still_diagnoses() {
         assert!(check("fn f() -> f64 { return true as f64; }") >= 1);
+    }
+
+    // ─── Phase 1 increment A.3: class-by-pointer ABI ──────────────────────
+
+    #[test]
+    fn class_typed_param_typechecks_clean() {
+        // Pre-A.3 this rejected with UNSUPPORTED_CONSTRUCT.
+        let src = "class C { x: i32 }\n\
+                   fn f(c: C) -> i32 { return c.x; }\n\
+                   fn main() -> i32 { let c = C { .x = 0 }; return f(c); }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn class_typed_return_typechecks_clean() {
+        // Pre-A.3 this rejected with UNSUPPORTED_CONSTRUCT.
+        let src = "class C { x: i32 }\n\
+                   fn make() -> C { return C { .x = 0 }; }\n\
+                   fn main() -> i32 { let c = make(); return c.x; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn class_param_and_return_compose() {
+        let src = "class C { x: i32 }\n\
+                   fn doubled(c: C) -> C { return C { .x = c.x + c.x }; }\n\
+                   fn main() -> i32 { let c = C { .x = 3 }; let d = doubled(c); return d.x; }";
+        assert_eq!(check(src), 0);
+    }
+
+    /// Slice-typed params and returns still reject — A.4 lifts those.
+    #[test]
+    fn slice_typed_param_still_diagnoses() {
+        assert!(check("fn f(s: []u8) -> i32 { return 0; } fn main() -> i32 { return 0; }") >= 1);
     }
 }

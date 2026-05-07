@@ -1,0 +1,12 @@
+// Phase 1 increment A.3: class-typed return via hidden out-pointer.
+// The caller allocates a stack slot for the result and passes its
+// address as a synthetic first argument; the callee writes its
+// return value through the pointer and returns void.
+class Counter { value: i32 }
+fn make() -> Counter {
+    return Counter { .value = 7 };
+}
+fn main() -> i32 {
+    let c = make();
+    return c.value;
+}

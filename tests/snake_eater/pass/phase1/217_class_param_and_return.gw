@@ -1,0 +1,13 @@
+// Phase 1 increment A.3: param and return both class-typed.
+// Caller passes a Counter by pointer AND an out-pointer for the
+// result. Two stack slots flow through the call: source `c` and
+// destination `d`.
+class Counter { value: i32 }
+fn doubled(c: Counter) -> Counter {
+    return Counter { .value = c.value + c.value };
+}
+fn main() -> i32 {
+    let c = Counter { .value = 21 };
+    let d = doubled(c);
+    return d.value;
+}

@@ -229,16 +229,89 @@ const fn align_up(v: u32, align: u32) -> u32 {
 
 fn make_signature(module: &ObjectModule, f: &MirFn) -> ir::Signature {
     let mut sig = module.make_signature();
+    let ptr_clt = pointer_clif_ty(module);
+    // Aggregate return is a hidden out-pointer prepended to the param
+    // list; the function then returns void. Aggregate params pass the
+    // address of the caller's source slot.
+    if is_aggregate_ty(f.return_ty) {
+        sig.params.push(AbiParam::new(ptr_clt));
+    }
     for &param_local in &f.params {
         let ty = f.locals[param_local.0 as usize].ty;
-        if let Some(clt) = clif_ty(ty, module) {
+        if is_aggregate_ty(ty) {
+            sig.params.push(AbiParam::new(ptr_clt));
+        } else if let Some(clt) = clif_ty(ty, module) {
             sig.params.push(AbiParam::new(clt));
         }
     }
-    if let Some(clt) = clif_ty(f.return_ty, module) {
-        sig.returns.push(AbiParam::new(clt));
+    if !is_aggregate_ty(f.return_ty) {
+        if let Some(clt) = clif_ty(f.return_ty, module) {
+            sig.returns.push(AbiParam::new(clt));
+        }
     }
     sig
+}
+
+/// Whether `ty` is passed and returned by hidden pointer in Phase 1.
+/// Classes and slices share the by-pointer ABI; primitive types are
+/// passed in registers.
+fn is_aggregate_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::Class(_) | Ty::Slice(_))
+}
+
+fn pointer_clif_ty(module: &ObjectModule) -> ir::Type {
+    match module.target_config().pointer_bits() as u32 {
+        64 => ir::types::I64,
+        32 => ir::types::I32,
+        _ => ir::types::I64,
+    }
+}
+
+/// Field-by-field copy from `[src_ptr + offset]` into `dst_slot`. Used
+/// at function entry to materialise an aggregate parameter from the
+/// caller's slot into a fresh local slot so the body's stack_load /
+/// stack_store paths (which target the local's slot) keep working.
+fn copy_aggregate_from_ptr(
+    fb: &mut FunctionBuilder<'_>,
+    module: &ObjectModule,
+    ty: Ty,
+    layout: &ResolvedClassLayout,
+    src_ptr: ir::Value,
+    dst_slot: StackSlot,
+    prog: &MirProgram,
+) {
+    let mflags = MemFlags::trusted();
+    for (i, &off) in layout.offsets.iter().enumerate() {
+        let field_ty = aggregate_field_ty(ty, i as u32, prog);
+        let Some(clt) = clif_ty(field_ty, module) else {
+            continue;
+        };
+        let v = fb.ins().load(clt, mflags, src_ptr, off as i32);
+        fb.ins().stack_store(v, dst_slot, off as i32);
+    }
+}
+
+/// Field-by-field copy from `src_slot` into `[dst_ptr + offset]`. Used
+/// at return time to write an aggregate result through the hidden
+/// out-pointer the caller passed in.
+fn copy_aggregate_to_ptr(
+    fb: &mut FunctionBuilder<'_>,
+    module: &ObjectModule,
+    ty: Ty,
+    layout: &ResolvedClassLayout,
+    src_slot: StackSlot,
+    dst_ptr: ir::Value,
+    prog: &MirProgram,
+) {
+    let mflags = MemFlags::trusted();
+    for (i, &off) in layout.offsets.iter().enumerate() {
+        let field_ty = aggregate_field_ty(ty, i as u32, prog);
+        let Some(clt) = clif_ty(field_ty, module) else {
+            continue;
+        };
+        let v = fb.ins().stack_load(clt, src_slot, off as i32);
+        fb.ins().store(mflags, v, dst_ptr, off as i32);
+    }
 }
 
 fn clif_ty(ty: Ty, module: &ObjectModule) -> Option<ir::Type> {
@@ -333,22 +406,33 @@ fn define_fn(
         clif_block.insert(BlockId(i as u32), bb);
     }
 
-    // Append parameter values to the entry block and assign them to the
-    // parameter Variables. (Class-typed parameters are forbidden by
-    // typeck in Phase 1.)
+    // Append parameter values to the entry block. Order must match
+    // `make_signature`: aggregate-return out-pointer first (if any),
+    // then user params (each aggregate replaced by a pointer). We do
+    // this *without* switching into the entry block — `append_block_param`
+    // is a metadata mutation, and Cranelift forbids `switch_to_block`
+    // out of an unfilled block. We'll switch when the lower_block loop
+    // reaches BlockId(0) and emit the param-copy instructions there.
     let entry = clif_block[&BlockId(0)];
-    builder.switch_to_block(entry);
-    for (i, &param_local) in f.params.iter().enumerate() {
+    let ptr_clt = pointer_clif_ty(module);
+    let returns_aggregate = is_aggregate_ty(f.return_ty);
+    if returns_aggregate {
+        builder.append_block_param(entry, ptr_clt);
+    }
+    for &param_local in f.params.iter() {
         let ty = f.locals[param_local.0 as usize].ty;
-        let Some(clt) = clif_ty(ty, module) else {
-            continue;
-        };
-        builder.append_block_param(entry, clt);
-        let v = builder.block_params(entry)[i];
-        if let Some(var) = local_var.get(&param_local) {
-            builder.def_var(*var, v);
+        if is_aggregate_ty(ty) {
+            builder.append_block_param(entry, ptr_clt);
+        } else if let Some(clt) = clif_ty(ty, module) {
+            builder.append_block_param(entry, clt);
         }
     }
+    let block_params: Vec<ir::Value> = builder.block_params(entry).to_vec();
+    let ret_out_ptr = if returns_aggregate {
+        block_params.first().copied()
+    } else {
+        None
+    };
 
     // Lower each block. Cranelift requires every block to be sealed
     // after all predecessors are known; the simplest approach for a
@@ -361,10 +445,42 @@ fn define_fn(
         clif_block: &clif_block,
         fn_ids,
         data_gvs: &data_gvs,
+        ret_out_ptr,
     };
     for (i, mir_block) in f.blocks.iter().enumerate() {
         let bb = clif_block[&BlockId(i as u32)];
         builder.switch_to_block(bb);
+        if i == 0 {
+            // Bind block params now that entry is the current block.
+            // The hidden out-pointer (if any) was already stashed in
+            // `cx.ret_out_ptr`; aggregate user params copy from their
+            // incoming pointer into the local's stack slot so body
+            // statements keep using stack_load / stack_store unchanged.
+            let mut bp_iter = block_params.iter().copied();
+            if returns_aggregate {
+                bp_iter.next();
+            }
+            for &param_local in f.params.iter() {
+                let ty = f.locals[param_local.0 as usize].ty;
+                if is_aggregate_ty(ty) {
+                    let Some(src_ptr) = bp_iter.next() else {
+                        continue;
+                    };
+                    let Some(layout) = aggregate_layout(ty, prog, ptr_bytes) else {
+                        continue;
+                    };
+                    let Some(&slot) = local_slot.get(&param_local) else {
+                        continue;
+                    };
+                    copy_aggregate_from_ptr(&mut builder, module, ty, &layout, src_ptr, slot, prog);
+                } else if clif_ty(ty, module).is_some() {
+                    let Some(v) = bp_iter.next() else { continue };
+                    if let Some(var) = local_var.get(&param_local) {
+                        builder.def_var(*var, v);
+                    }
+                }
+            }
+        }
         lower_block(&mut builder, module, f, mir_block, &cx);
     }
 
@@ -385,6 +501,11 @@ struct LoweringCx<'a> {
     /// One [`ir::GlobalValue`] per [`StringLitId`], pre-declared in this
     /// function's scope so `Const::DataAddr` lowers without `&mut module`.
     data_gvs: &'a [ir::GlobalValue],
+    /// Hidden out-pointer block_param, if this function returns an
+    /// aggregate (Phase 1 increment A.3 / A.4). At return time we
+    /// field-by-field copy the result slot into `*out_ptr` and return
+    /// void instead of a scalar value.
+    ret_out_ptr: Option<ir::Value>,
 }
 
 impl<'a> LoweringCx<'a> {
@@ -485,7 +606,24 @@ fn lower_block(
                 .brif(c, cx.clif_block[then_bb], &[], cx.clif_block[else_bb], &[]);
         }
         Terminator::Return(op) => {
-            if matches!(f.return_ty, Ty::U0 | Ty::Error) {
+            if is_aggregate_ty(f.return_ty) {
+                // Aggregate return: copy result slot into the hidden
+                // out-pointer the caller passed in, then return void.
+                let Operand::Local(src) = op else {
+                    fb.ins().return_(&[]);
+                    return;
+                };
+                let (Some(&src_slot), Some(out_ptr), Some(layout)) = (
+                    cx.local_slot.get(src),
+                    cx.ret_out_ptr,
+                    cx.aggregate_layout(f.return_ty),
+                ) else {
+                    fb.ins().return_(&[]);
+                    return;
+                };
+                copy_aggregate_to_ptr(fb, module, f.return_ty, &layout, src_slot, out_ptr, cx.prog);
+                fb.ins().return_(&[]);
+            } else if matches!(f.return_ty, Ty::U0 | Ty::Error) {
                 fb.ins().return_(&[]);
             } else {
                 let want = clif_ty(f.return_ty, module).unwrap_or(ir::types::I32);
@@ -500,15 +638,48 @@ fn lower_block(
             target_bb,
         } => {
             let func_ref = module.declare_func_in_func(cx.fn_ids[callee.0 as usize], fb.func);
-            let mut arg_vals = Vec::with_capacity(args.len());
             let sig_ref = fb.func.dfg.ext_funcs[func_ref].signature;
+            let callee_fn = &cx.prog.functions[callee.0 as usize];
+            let returns_aggregate = is_aggregate_ty(callee_fn.return_ty);
+
+            let mut arg_vals: Vec<ir::Value> = Vec::with_capacity(args.len() + 1);
+            // Hidden out-pointer for aggregate return goes first; the
+            // dst local already has its stack slot allocated.
+            if returns_aggregate {
+                if let Some(&dst_slot) = cx.local_slot.get(dst) {
+                    arg_vals.push(fb.ins().stack_addr(cx.ptr_ty(), dst_slot, 0));
+                }
+            }
             for (i, op) in args.iter().enumerate() {
-                let want = fb.func.dfg.signatures[sig_ref].params[i].value_type;
-                arg_vals.push(read_operand(fb, f, op, cx, want));
+                let param_local = callee_fn.params[i];
+                let param_ty = callee_fn.locals[param_local.0 as usize].ty;
+                if is_aggregate_ty(param_ty) {
+                    // Pass the address of the source slot. The operand
+                    // is always `Operand::Local(class_local)` because
+                    // aggregates can't be const-folded; lower_struct_lit
+                    // and lower_path both produce a local.
+                    let Operand::Local(src_local) = op else {
+                        // Defensive: shouldn't happen on legal MIR.
+                        arg_vals.push(fb.ins().iconst(cx.ptr_ty(), 0));
+                        continue;
+                    };
+                    if let Some(&src_slot) = cx.local_slot.get(src_local) {
+                        arg_vals.push(fb.ins().stack_addr(cx.ptr_ty(), src_slot, 0));
+                    } else {
+                        arg_vals.push(fb.ins().iconst(cx.ptr_ty(), 0));
+                    }
+                } else {
+                    let sig_idx = arg_vals.len();
+                    let want = fb.func.dfg.signatures[sig_ref].params[sig_idx].value_type;
+                    arg_vals.push(read_operand(fb, f, op, cx, want));
+                }
             }
             let inst = fb.ins().call(func_ref, &arg_vals);
             let results = fb.inst_results(inst).to_vec();
-            if !results.is_empty() {
+            // Aggregate results land in the dst slot we passed by ptr;
+            // nothing to bind. Scalar results def_var the dst Variable
+            // as before.
+            if !returns_aggregate && !results.is_empty() {
                 if let Some(var) = cx.local_var.get(dst) {
                     fb.def_var(*var, results[0]);
                 }
