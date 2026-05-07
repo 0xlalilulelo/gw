@@ -1,0 +1,14 @@
+extern fn putchar(c: i32) -> i32;
+
+fn print_int(n: i32) -> u0 {
+    if n >= 10 {
+        print_int(n / 10);
+    }
+    putchar(48 + (n % 10));
+}
+
+fn main() -> i32 {
+    print_int(12345);
+    putchar(10);
+    return 0;
+}

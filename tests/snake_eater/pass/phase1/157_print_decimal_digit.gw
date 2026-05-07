@@ -1,0 +1,15 @@
+extern fn putchar(c: i32) -> i32;
+
+fn print_digit(d: i32) -> u0 {
+    putchar(48 + d);
+}
+
+fn main() -> i32 {
+    let i: i32 = 0;
+    while i < 10 {
+        print_digit(i);
+        i = i + 1;
+    }
+    putchar(10);
+    return 0;
+}

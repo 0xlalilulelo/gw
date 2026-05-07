@@ -1,0 +1,8 @@
+fn main() -> i32 {
+    let i: i32 = 0;
+    while i < 3 {
+        "tick\n";
+        i = i + 1;
+    }
+    return 0;
+}

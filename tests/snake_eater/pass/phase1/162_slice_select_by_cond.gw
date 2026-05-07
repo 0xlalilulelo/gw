@@ -1,0 +1,13 @@
+extern fn write(fd: i32, buf: *u8, count: usize) -> isize;
+
+fn main() -> i32 {
+    let yes: []u8 = "yes\n";
+    let no: []u8 = "no\n";
+    let n: i32 = 7;
+    if n > 5 {
+        write(1, yes.data, yes.len);
+    } else {
+        write(1, no.data, no.len);
+    }
+    return 0;
+}

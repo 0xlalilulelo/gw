@@ -1,0 +1,16 @@
+extern fn putchar(c: i32) -> i32;
+
+fn pad(n: i32) -> u0 {
+    let i: i32 = 0;
+    while i < n {
+        putchar(32);
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    pad(4);
+    putchar(42);
+    putchar(10);
+    return 0;
+}

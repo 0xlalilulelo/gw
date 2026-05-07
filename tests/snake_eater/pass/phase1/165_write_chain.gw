@@ -1,0 +1,12 @@
+extern fn write(fd: i32, buf: *u8, count: usize) -> isize;
+
+fn main() -> i32 {
+    let prefix: []u8 = "[";
+    let body: []u8 = "msg";
+    let suffix: []u8 = "]\n";
+    write(1, prefix.data, prefix.len);
+    write(1, body.data, body.len);
+    write(1, suffix.data, suffix.len);
+    "next-implicit\n";
+    return 0;
+}

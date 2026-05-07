@@ -1,0 +1,9 @@
+extern fn write(fd: i32, buf: *u8, count: usize) -> isize;
+
+fn main() -> i32 {
+    let a: []u8 = "first\n";
+    let b: []u8 = "second\n";
+    write(1, a.data, a.len);
+    write(1, b.data, b.len);
+    return 0;
+}

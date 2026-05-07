@@ -1,0 +1,14 @@
+extern fn putchar(c: i32) -> i32;
+
+class Counter { n: i32 }
+
+fn main() -> i32 {
+    let c = Counter { .n = 0 };
+    while c.n < 4 {
+        putchar(65 + c.n);
+        putchar(58);
+        c.n = c.n + 1;
+    }
+    putchar(10);
+    return c.n;
+}
