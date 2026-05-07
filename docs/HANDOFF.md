@@ -2,11 +2,12 @@
 
 This document is the entry point for the next development session. Read it first.
 
-> **Last updated:** after Phase 1 increment 12h (full increment 12 complete).
+> **Last updated:** after Phase 1 increment A.4 (Option-A follow-up complete).
 > **Repo root:** `/Users/silmaril/Documents/GitHub/gw`
-> **Workspace test count:** 121 unit + integration tests, all green.
-> **Corpus size:** 61 Phase-0 lex+parse snapshots + 200 Phase-1 run-tests.
-> **Phase 1 exit gate met.** Corpus has hit the 200-program target.
+> **Workspace test count:** 147 unit + integration tests, all green.
+> **Corpus size:** 61 Phase-0 lex+parse snapshots + 226 Phase-1 run-tests.
+> **Phase 1 exit gate met** (200-program target hit at 12h; the post-exit
+> follow-up A.1–A.4 added 26 more, for 226 total).
 
 ---
 
@@ -33,12 +34,20 @@ arithmetic and comparison, recursive algorithms at `i32` / `i64` / `u64`
 widths, and bidirectional integer / float literal narrowing all work and
 are covered by the corpus.
 
+The post-200 follow-up bundle (A.1–A.4) adds **`as` casts across the
+full numeric matrix** (int↔int, int↔float, float↔float, with saturating
++ NaN→0 for float→int) and **class- and slice-typed values flowing
+through fn signatures** via a hidden-out-pointer ABI. Helpers like
+`fn doubled(c: Counter) -> Counter` and `fn print_slice(s: []u8) -> u0`
+that previously had to be inlined at every call site now factor cleanly.
+
 **Phase 0 is complete. Phase 1 is functionally complete** — the
 architecture's exit criterion ("200 small `.gw` programs that compile and
-run") has been met. The remaining items are a follow-up — LLVM port (13) —
-which was explicitly deferred when Cranelift replaced LLVM as the
-Phase-1 backend, plus the gaps listed under [What doesn't work
-yet](#what-doesnt-work-yet-phase-1-deferred-or-incomplete).
+run") has been met, and the most-felt corpus-author walls (no class
+params, no width bridging) have been removed. The remaining items are
+the LLVM port (13), which was explicitly deferred when Cranelift
+replaced LLVM as the Phase-1 backend, plus the gaps listed under
+[What doesn't work yet](#what-doesnt-work-yet-phase-1-deferred-or-incomplete).
 
 ---
 
@@ -68,7 +77,7 @@ gw/
 │   └── HANDOFF.md               (this file)
 ├── tests/snake_eater/
 │   ├── pass/lexparse/           (61 .gw + insta snapshots — Phase 0)
-│   ├── pass/phase1/             (200 .gw + .expected_exit / .expected_stdout)
+│   ├── pass/phase1/             (226 .gw + .expected_exit / .expected_stdout)
 │   └── fail/lexparse/           (5 .gw + .expected_diagnostics)
 ├── compiler/arsenal-boot/       (Cargo workspace — host = Rust 1.95+)
 │   └── crates/
@@ -92,17 +101,17 @@ gw/
 └── .github/workflows/ci.yml      (Linux/macOS/Windows matrix)
 ```
 
-### Active crate roles (≈5 100 LoC of compiler logic)
+### Active crate roles (≈5 500 LoC of compiler logic)
 
 | Crate | Phase | Role |
 |---|---|---|
 | `arsenal_lex` | 0 | UTF-8 lexer state machine. 108-variant `TokenKind`, phf keyword table, `Span`/`SourceMap`/`Diagnostic`/`DiagBag` types. |
-| `arsenal_ast` | 0 | Hand-rolled rowan-style CST + typed AST. Single unified `SyntaxKind` enum (188 variants). Typed views for ~32 Phase-1 node kinds; `Stub` variants for the rest. `Module::stmts()` exposes top-level stmts (11a). Bumpalo arena per file. Pretty-printer for `arsenal dump`. |
-| `arsenal_parse` | 0 | Recursive-descent + Pratt expression precedence. Error-recovering. Produces both CST and AST. No parser generator. `parse_module` forks on `peek_item_keyword` between item and stmt (11a). `parse_type` handles `*T` / `[]T` / `&T` / `?T` / `[N]T`. |
+| `arsenal_ast` | 0 | Hand-rolled rowan-style CST + typed AST. Single unified `SyntaxKind` enum (188 variants). Typed views for ~33 Phase-1 node kinds; `Stub` variants for the rest. `Module::stmts()` exposes top-level stmts (11a). `CastExpr` typed view added in A.1. Bumpalo arena per file. Pretty-printer for `arsenal dump`. |
+| `arsenal_parse` | 0 | Recursive-descent + Pratt expression precedence. Error-recovering. Produces both CST and AST. No parser generator. `parse_module` forks on `peek_item_keyword` between item and stmt (11a). `parse_type` handles `*T` / `[]T` / `&T` / `?T` / `[N]T`. **Postfix `as Type` (A.1)** at left binding power 22 — between `*`/`/`/`%` (19/20) and prefix unary (23), matching Rust precedence so `-1 as u32` parses as `(-1) as u32`. |
 | `arsenal_resolve` | 1 | Walks the AST, registers top-level fn + class defs, exports `primitive_type_name()`. `DefKind::SyntheticMain` is registered when top-level stmts coexist without explicit `fn main` (11a). |
-| `arsenal_typeck` | 1 | Bidirectional checker. `Ty` enum: `U0`/`Bool`/`Int(IntTy)`/`Float(FloatTy)`/`Rune`/`Class(DefId)`/`Slice(IntTy)`/`Ptr(IntTy)`/`Error`. Emits a `TypedModule` with per-CST-node `expr_types`, `path_bindings`, `pat_bindings`, `call_targets`, `sigs`, `classes`. Slice + raw-pointer surface (11b/11c) are FFI-restricted. **Bidirectional literal narrowing (12d/12h)**: `check_expr` calls `try_narrow_literal` first — bare `IntLit`/`FloatLit`, `Unary(Minus, Literal)`, and `Paren(...)` shapes adopt the expected width when the value fits; out-of-range diagnoses against the literal span. `synth_binop_operands` extends the same rule across binary operators so `n < 2` (with `n: i64`) types cleanly. |
-| `arsenal_mir` | 1 | CFG of basic blocks; primitive locals + aggregate stack-slot locals (class + slice); `Assign`/`AssignField` statements; `Use`/`BinOp`/`UnOp`/`Field` rvalues; `Goto`/`Branch`/`Return`/`Call`/`Unreachable` terminators. Loop-target stack for break/continue. `lower_for` desugar. `Const::DataAddr` + program-level `string_literals` table for `.rodata` payloads (11b). Implicit Print at stmt-position string lits desugars to `write(1, slice.data, slice.len)`; auto-injects `extern fn write` if user didn't declare one (11c). **Short-circuit `&&` / `\|\|` (12b)**: `lower_short_circuit` emits a 3-block control-flow shape (rhs-eval / short-circuit / join) and bypasses `lower_binary` so the RHS is only evaluated when the LHS doesn't determine the result. `BinOp::LogAnd`/`LogOr` are no longer produced by lowering; the codegen arms remain as dead code for enum symmetry. |
-| `arsenal_codegen_fast` | 1 | Cranelift-backed (placeholder until Phase 7 TPDE port). Aggregate (class + slice) layouts → stack slots; field reads/writes → stack_load/stack_store; aggregate-aggregate assigns → field-by-field copy. String literals materialised via `module.declare_data` + `define_data_object` under `__gw_str_<i>` symbols (11b). `*T` raw pointers lower as pointer-sized scalars (11c). **Float comparisons (12a)**: `lower_binop` branches on `ty.is_float()` for `Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge` — floats use `fcmp` with the matching `FloatCC`, ints keep `icmp`. |
+| `arsenal_typeck` | 1 | Bidirectional checker. `Ty` enum: `U0`/`Bool`/`Int(IntTy)`/`Float(FloatTy)`/`Rune`/`Class(DefId)`/`Slice(IntTy)`/`Ptr(IntTy)`/`Error`. Emits a `TypedModule` with per-CST-node `expr_types`, `path_bindings`, `pat_bindings`, `call_targets`, `sigs`, `classes`. Slice + raw-pointer surface (11b/11c) are FFI-restricted. **Bidirectional literal narrowing (12d/12h)**: `check_expr` calls `try_narrow_literal` first — bare `IntLit`/`FloatLit`, `Unary(Minus, Literal)`, and `Paren(...)` shapes adopt the expected width when the value fits; out-of-range diagnoses against the literal span. `synth_binop_operands` extends the same rule across binary operators so `n < 2` (with `n: i64`) types cleanly. **`synth_cast` (A.1/A.2)** accepts the full numeric matrix `(Int\|Float, Int\|Float)`; non-numeric pairs reject with `UNSUPPORTED_CONSTRUCT`. **Class-/slice-typed fn params and returns (A.3/A.4)** are accepted via the by-pointer ABI; the `UNSUPPORTED_CONSTRUCT` rejections in `check_fn_signature` were dropped. |
+| `arsenal_mir` | 1 | CFG of basic blocks; primitive locals + aggregate stack-slot locals (class + slice); `Assign`/`AssignField` statements; `Use`/`BinOp`/`UnOp`/`Field`/`Cast` rvalues; `Goto`/`Branch`/`Return`/`Call`/`Unreachable` terminators. Loop-target stack for break/continue. `lower_for` desugar. `Const::DataAddr` + program-level `string_literals` table for `.rodata` payloads (11b). Implicit Print at stmt-position string lits desugars to `write(1, slice.data, slice.len)`; auto-injects `extern fn write` if user didn't declare one (11c). **Short-circuit `&&` / `\|\|` (12b)**: `lower_short_circuit` emits a 3-block control-flow shape (rhs-eval / short-circuit / join) and bypasses `lower_binary` so the RHS is only evaluated when the LHS doesn't determine the result. **`Rvalue::Cast` (A.1/A.2)** carries `kind: CastKind`, `operand`, `src_ty`, `dst_ty`; the closed `CastKind` enum has 7 variants, each maps to one Cranelift op. `select_cast_kind` factors the kind selection out of `lower_cast`. **`def_to_fn` fix (A.3)**: pre-A.3 the map stored each def's position in `resolved.defs` (including class defs); A.3 only counts `Fn`/`SyntheticMain` defs when assigning indices, matching the order `functions` is populated. |
+| `arsenal_codegen_fast` | 1 | Cranelift-backed (placeholder until Phase 7 TPDE port). Aggregate (class + slice) layouts → stack slots; field reads/writes → stack_load/stack_store; aggregate-aggregate assigns → field-by-field copy. String literals materialised via `module.declare_data` + `define_data_object` under `__gw_str_<i>` symbols (11b). `*T` raw pointers lower as pointer-sized scalars (11c). **Float comparisons (12a)**: `lower_binop` branches on `ty.is_float()` for `Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge` — floats use `fcmp` with the matching `FloatCC`, ints keep `icmp`. **Cast lowering (A.1/A.2)**: `Rvalue::Cast` arm reads operand at `clif_ty(src_ty)` and applies one Cranelift op per `CastKind` — `sextend`/`uextend`/`ireduce` for ints, `fcvt_from_sint`/`fcvt_from_uint` and saturating `fcvt_to_*_sat` for int↔float, `fpromote`/`fdemote` for floats. Same-width `*Bitcast` variants need no instruction. **Aggregate-by-pointer ABI (A.3/A.4)**: `make_signature` prepends a hidden out-pointer for aggregate returns and substitutes pointer-typed `AbiParam` for aggregate params. `define_fn` defers the entry-block switch until the lower-block loop's first iteration to keep Cranelift's "fill before switching" rule satisfied; aggregate params copy in via `copy_aggregate_from_ptr`, and `Terminator::Return` for an aggregate-returning fn copies out through `copy_aggregate_to_ptr`. `Terminator::Call` prepends `stack_addr(dst_slot)` for aggregate returns and substitutes `stack_addr` for aggregate args. |
 | `arsenal_driver` | 0/1 | Subcommands: `arsenal new <name>`, `arsenal build <file.gw>`, `arsenal dump <path>`, `arsenal --version`. Build pipeline: lex → parse → resolve → typeck → MIR → Cranelift → object → `cc` link → executable. |
 
 ---
@@ -133,6 +142,10 @@ Each increment shipped one or more corpus programs and a single commit.
 | 12f | slice + Print formatting | `3d91072` | +12 | (none) | 0 (but caught two corpus design rules: explicit return type required on every fn; `putchar`/implicit-Print don't share a buffer under piped stdout) |
 | 12g | mixed extern fns | `42e17cc` | +10 | (none — adds `abs`/`getpid` corpus uses) | 0 |
 | 12h | fill to 200 + negated literal narrowing | `8bc26a4` | +24 | typeck `try_narrow_literal` extended to recognise `Unary(Minus, Literal)` and `Paren(...)` shapes; +2 typeck unit tests | **1** — `if x == -100` (with `x: i64`) rejected because negated literals didn't narrow |
+| A.1 | `as` cast int↔int | `c1b091e` | +8 | parser postfix `as Type` at BP 22; AST `CastExpr` view; typeck `synth_cast`; MIR `Rvalue::Cast` + `CastKind::{IntWiden,IntTrunc,IntBitcast}`; codegen `sextend`/`uextend`/`ireduce`/no-op; +6 typeck and +4 MIR unit tests | 0 |
+| A.2 | `as` cast float bridge | `258cc70` | +6 | extends `synth_cast` to numeric ↔ numeric; `CastKind` adds `IntToFloat`/`FloatToInt`/`FloatExt`/`FloatTrunc`/`FloatBitcast`; codegen wires `fcvt_*`/`fpromote`/`fdemote` (saturating + NaN→0 for float→int); +3 net typeck and +7 MIR unit tests | 0 |
+| A.3 | class-by-pointer ABI | `a6dc722` | +8 | typeck drops `UNSUPPORTED_CONSTRUCT` on class params/returns; codegen `make_signature` prepends hidden out-ptr for aggregate returns and substitutes ptr params for aggregate args; `copy_aggregate_from_ptr` at fn entry, `copy_aggregate_to_ptr` at return, `stack_addr` substitution at call sites; param prelude moved into the lower-block loop's iter-0 to satisfy Cranelift's "fill before switching" rule; +4 typeck and +1 MIR unit tests | **1** — latent `def_to_fn` off-by-N (counted class defs when assigning FnIdx); never triggered pre-A.3 because no class+fn-call combination existed |
+| A.4 | slice-by-pointer ABI | `5d71372` | +4 | typeck drops `UNSUPPORTED_CONSTRUCT` on slice params/returns; **zero codegen changes** — `is_aggregate_ty` already covered `Ty::Slice`; +3 net typeck unit tests | 0 |
 
 **Key pattern**: each "0 bugs" increment was almost pure corpus growth (the
 plumbing was already in place). Each "≥1 bug" increment caught real
@@ -145,10 +158,13 @@ In increment 12 the same rule held: 12a/12b/12d/12h each opened a new
 boolean → control-flow lowering; literal default int → bidirectional
 narrowing; bare-vs-negated literal narrowing) and each produced exactly
 one bug. 12c/12e/12f/12g were recombinations of already-stressed
-primitives and produced zero. The pattern is reliable enough to use as a
-risk heuristic when planning future bundles.
+primitives and produced zero. The A.1–A.4 follow-up extended the same
+ratio: A.3 was the only "new pipeline shape" sub-bundle (the by-pointer
+calling convention) and yielded exactly one bug; A.1, A.2, A.4 were
+recombinations and yielded zero. The heuristic is reliable enough to
+use as a risk weighting when planning future bundles.
 
-### What 200 corpus programs cover
+### What 226 corpus programs cover
 
 - Phase-0 syntax: every TokenKind variant, every operator precedence
   level, every supported statement form.
@@ -189,6 +205,19 @@ risk heuristic when planning future bundles.
   chains); mixed extern functions (`abs`, `getpid`) chained into
   arithmetic, into class fields, under short-circuit conditions, and
   in loop bounds.
+- Phase 1 follow-up A.1–A.4 surface: postfix `as Type` at Rust-style
+  precedence; the full numeric cast matrix (int↔int with widen / trunc /
+  signedness reinterpret; int↔float with signedness-aware fcvt;
+  float↔float with promote/demote/identity); float→int saturation +
+  NaN→0 (out-of-range positive clamps to dst::MAX, out-of-range
+  negative clamps to dst::MIN, negative-to-unsigned clamps to 0);
+  class-typed fn params and returns flowing through a hidden-out-pointer
+  ABI (single class arg, multiple class args, multi-field classes,
+  classes with `f64` fields, class-typed recursive calls); pass-by-value
+  semantics for class params (callee mutations don't touch the caller's
+  slot); slice-typed fn params and returns (factor `print_slice(s: []u8)`
+  out of repeated `write(1, s.data, s.len)` chains); slice round-trip
+  through both arg and return positions in the same call.
 
 ---
 
@@ -266,12 +295,10 @@ arsenal 0.0.1
 
 | Limitation | Surface | Path forward |
 |---|---|---|
-| Class-typed fn params and return values | Typeck rejects with `UNSUPPORTED_CONSTRUCT` | Phase 1 follow-up: by-pointer ABI in codegen + `Rvalue::Use(class_local)` in non-let contexts |
-| Slice-typed fn params and return values | Typeck rejects with `UNSUPPORTED_CONSTRUCT` | Same by-pointer ABI work as classes; once it lands, slices flow naturally as 2-field aggregates |
 | Raw pointers outside `extern fn` signatures | Typeck rejects `*T` in non-extern fn params/returns | Memory-model + borrow-checker work (Phase 3); also blocks meaningful pointer arithmetic |
 | Nested class fields | Typeck rejects | Generalise size/offset computation in `resolve_class_layout`; recurse on `Ty::Class` field types |
 | Slice-typed class fields | Typeck rejects | Class layout would need to embed the slice's `(data, len)` pair |
-| `as` casts between numeric types | No syntax / typing rules yet | Phase 1 follow-up: trivial widening (`i32 as i64`) and same-bit-width unsigned↔signed reinterpretation. Currently absent — `let n: i64 = some_i32;` has no escape hatch |
+| Non-`u8` slice element types | Typeck rejects `[]i32` etc. (only `[]u8` accepted today) | Generalise the slice arm in `resolve_type`; aggregate_layout already handles arbitrary 8-byte fields, so codegen mostly follows |
 | `match`, error unions (`!T`), generics, `cipher`, async, comptime | Parser produces `ErrorNode`s | Phases 2–4 |
 | Multi-segment paths in expressions (`std::mem::Foo`) | Typeck `UNSUPPORTED_CONSTRUCT` | Phase 2 (frequencies / module imports) |
 | `c"..."` C-string literals (`[*:0]u8`) | Typeck records `Ty::Error` | Phase 2 — sentinel-pointer machinery |
@@ -283,7 +310,7 @@ arsenal 0.0.1
 | LLVM backend | `arsenal_codegen_llvm` stub only | **Increment 13** — not session-blocking |
 | `arsenal new` template parses cleanly | Templates use `#virtuous {}` syntax that Phase 1 parser rejects | Swap templates to Phase-1 syntax (the bare-string-literal half now works after 11c, but the `#virtuous` directive is still rejected) |
 
-### Corpus design notes (rules learned during increment 12)
+### Corpus design notes (rules learned during increment 12 / A.x)
 
 These don't reflect compiler bugs — they're properties of the current
 Phase-1 surface that any future corpus author needs to know.
@@ -300,20 +327,24 @@ Phase-1 surface that any future corpus author needs to know.
 2. **Every `fn` declaration needs an explicit `-> T`.** There's no
    implicit `-> u0` arm in the parser. Helpers that do I/O without a
    meaningful return value should be written as `fn print_x(…) -> u0`.
-3. **Class-typed fn parameters are still rejected** (typeck `E0306`).
-   When designing a corpus program around a class state-machine helper,
-   inline the per-step logic at every call site instead of factoring a
-   `record(s: Stat, v: i32)` helper. The capstone (200) does this.
-4. **No `as` cast between numeric widths.** A `let n: i64 = …;` value
-   has no escape hatch back to `i32` for use in a function that expects
-   `i32`, and vice versa. Workaround: parallel typed locals (one i32,
-   one i64) advanced together inside a loop. Or commit to a single
-   width across the program.
-5. **Exit codes are 8-bit (POSIX).** Programs that compute a sum > 255
+3. **Exit codes are 8-bit (POSIX).** Programs that compute a sum > 255
    and return it observe `result % 256` as the exit code. Either keep
    sums small or check the value via `if r == EXPECTED { return
    SOME_SMALL_I32; }` (the standard pattern across most of the
    wide-int and float corpus).
+4. **`as` is a *value* cast, not a *bounds* check.** Narrowing int casts
+   silently truncate (low bits) and narrowing float→int casts saturate
+   to dst min/max (NaN → 0). Both match Rust ≥ 1.45. If the corpus
+   program needs a check, write it explicitly (`if x > MAX { … }`)
+   before the cast.
+5. **Aggregate fn-signature ABI is by-pointer** (A.3/A.4). Class- and
+   slice-typed params lower to a hidden pointer; aggregate returns
+   prepend a hidden out-pointer to the arg list. Pass-by-value
+   semantics still hold from the source's perspective — `copy_aggregate
+   _from_ptr` at fn entry materialises a fresh copy in the callee's
+   local slot. The cost is the entry copy plus the field-by-field
+   return store; cheap for Phase-1-sized aggregates, irrelevant once
+   the TPDE backend lands.
 
 ---
 
@@ -392,55 +423,76 @@ session start before changing them.
 17. **Phase-1 corpus target met** (12h) — 200 `.gw` programs, all
     compile and run, all match expected exit code and stdout. Any
     further corpus growth should be motivated by a specific bug
-    suspicion, not by program count.
+    suspicion or a newly-supported construct (A.1–A.4 added 26 such
+    programs against the new `as` and aggregate-ABI surfaces).
+18. **`as` precedence: Rust-style** (A.1) — postfix `as Type` at left
+    binding power 22, between `*`/`/`/`%` (19/20) and prefix unary
+    (23). So `a * b as T` parses as `a * (b as T)`, `-1 as u32` as
+    `(-1) as u32`, `2 ** 3 as i64` as `2 ** (3 as i64)`. Same as Rust.
+19. **`as` cast semantics** (A.1/A.2) — int↔int narrowing **silently
+    truncates** the low bits (Rust / Zig `@truncate` style; the user
+    opted in by writing `as`). Same-width signedness reinterpret is a
+    no-op since Cranelift integer types don't carry signedness. Float
+    →int conversions are **saturating + NaN→0** (matches Rust ≥ 1.45):
+    out-of-range positive clamps to `dst::MAX`, out-of-range negative
+    to `dst::MIN`, NaN to `0`. Cranelift's `fcvt_to_*_sat` ops do this
+    natively — no NaN-detection branch in our generated code.
+20. **`CastKind` is a closed enum** (A.1/A.2) — `IntWiden { signed }`,
+    `IntTrunc`, `IntBitcast`, `IntToFloat { signed }`, `FloatToInt
+    { signed }`, `FloatExt`, `FloatTrunc`, `FloatBitcast`. Each maps
+    to exactly one Cranelift op (or no op for the `*Bitcast` arms).
+    `signed` tracks the **operand**'s signedness for `IntWiden` and
+    `IntToFloat`, the **destination**'s signedness for `FloatToInt`.
+    `select_cast_kind(src_ty, dst_ty)` factors the dispatch out of the
+    builder so it's testable in isolation.
+21. **Aggregate ABI: hidden out-pointer + by-pointer args** (A.3/A.4)
+    — System V's "memory class" rule applied uniformly: every aggregate
+    return (class or slice) prepends an extra `*ptr` parameter; every
+    aggregate user param substitutes a `*ptr` for the value. The
+    "split into two registers" optimisation for ≤ 16-byte aggregates
+    is **deliberately deferred**; the by-pointer-always rule keeps
+    codegen flat and is invisible at the GW source level. Caller
+    obtains addresses via `stack_addr(slot, 0)`. The `fn` returns
+    `void` at the Cranelift level when the GW-level return is
+    aggregate.
+22. **Aggregate param prelude lives inside `lower_block` iter 0**
+    (A.3) — Cranelift's frontend rejects `switch_to_block` on an
+    unfilled block, even when switching to the same block. Pre-A.3
+    the upfront `switch_to_block(entry)` worked because only block-
+    params + `def_var` were emitted (no instructions). A.3's aggregate
+    copy-in emits load+store, which would trip the rule. Resolution:
+    don't pre-switch; let the lower-block loop do the single switch
+    per block, with iteration 0 emitting the param prelude inline
+    after the switch. The hidden out-pointer (when present) is
+    captured into `LoweringCx::ret_out_ptr` for `Terminator::Return`
+    to copy through.
+23. **`def_to_fn` only counts fn-shaped defs** (A.3) — pre-A.3 the
+    map stored each def's position in `resolved.defs` directly. Class
+    defs share the same vector but never appear in
+    `MirProgram::functions`, so a class declared before a fn shifted
+    every subsequent fn's FnIdx by one. The bug was latent because
+    pre-A.3 typeck rejected class-typed params/returns, so no Call
+    terminator ever dispatched to a fn defined after a class. A.3
+    surfaces it; the fix only increments the FnIdx counter for `Fn` /
+    `SyntheticMain` defs.
 
 ---
 
 <a name="after-phase-1"></a>
 ## After Phase 1 — what's next
 
-The architecture's Phase-1 exit gate (200-program corpus) is met.
-Three independent next steps are all reasonable; pick based on
-session goal, not order. They are roughly listed in order of
-"unlocks the most subsequent work" first.
+The architecture's Phase-1 exit gate (200-program corpus) is met
+**and** the Phase-1 follow-up "Option A" (class/slice ABI + `as` casts)
+landed across A.1–A.4. The two remaining direction calls (B / C) and
+a tactical-cleanup list are below; pick based on session goal.
 
-### Option A — Phase-1 follow-up: class/slice ABI + `as` casts
+### Option A — DONE
 
-Corpus authoring during 12 ran into the same wall repeatedly: helpers
-that take or return class / slice values can't be written, and there's
-no `as` cast to bridge int widths. Both would extend Phase 1's
-expressiveness without crossing into Phase 2's scope.
-
-**ABI work** (typeck + MIR + codegen):
-- Allow `Ty::Class(_)` and `Ty::Slice(_)` in fn parameter and return
-  positions.
-- Codegen: pass aggregates by hidden pointer (System V ABI's "memory
-  class" rule for any struct > 16 bytes; for ≤ 16 bytes, the proper
-  ABI is "split into two registers" but Phase 1 can punt to
-  by-pointer-always to keep the code simple).
-- MIR: `Rvalue::Use(class_local)` outside `let` initialisers (e.g. as
-  a function argument or return expression).
-- Typeck: drop the `UNSUPPORTED_CONSTRUCT` rejection in
-  `check_fn_signature` for class / slice param/return types.
-
-**`as` casts** (lex + parse + typeck + MIR + codegen):
-- Lex: `as` is already a keyword (it's in the keyword phf table —
-  verify).
-- Parse: post-fix `expr as Type` at a Pratt precedence below `*`/`/`
-  but above comparison.
-- Typeck: define the legal cast matrix — int↔int (any width, signed
-  ↔ unsigned reinterpret as bit cast), int↔float (sitofp / fptosi /
-  uitofp / fptoui), float↔float (fpext / fptrunc), nothing else for
-  Phase 1.
-- MIR: new `Rvalue::Cast { kind, operand, ty }` with a finite `kind`
-  enum (`IntWiden`, `IntTrunc`, `IntSign`, `FloatExt`, `FloatTrunc`,
-  `IntToFloat`, `FloatToInt`).
-- Codegen: each kind maps to one Cranelift op (`uextend`, `sextend`,
-  `ireduce`, `fpromote`, `fdemote`, `fcvt_to_sint`, `fcvt_to_uint`,
-  `sitofp`, `uitofp`).
-
-Estimated cost: 6-12 hours. Bug yield: medium — sign-handling and
-narrowing-vs-truncation are easy to get backwards.
+A.1–A.4 shipped in this order: `as` int↔int (c1b091e), `as` float
+bridge (258cc70), class-by-pointer ABI (a6dc722), slice-by-pointer
+ABI (5d71372). One bug yielded across the four sub-bundles (the
+latent `def_to_fn` off-by-N surfaced by A.3). Corpus 200 → 226;
+unit tests 121 → 147.
 
 ### Option B — Phase 13: LLVM backend port
 
@@ -451,12 +503,26 @@ which then becomes the default for release builds.
 
 Workspace deps already pin `inkwell 0.5` / `llvm-sys 180`. The MIR is
 backend-agnostic; both Cranelift and LLVM consume the same
-`MirProgram`. Port the existing 200-program corpus through a
+`MirProgram`. Port the existing 226-program corpus through a
 `--backend=llvm` driver flag and ensure exit codes / stdout match.
 
-Estimated cost: 15-30 hours. Bug yield: high — every backend
+Estimated cost: 15–30 hours. Bug yield: high — every backend
 divergence (NaN handling, sign extension, calling convention quirks)
-shows up as a divergence between the two backends.
+shows up as a divergence between the two backends. The 226-program
+corpus now exercises a much wider surface than the 200 it would
+have at the start of session: `as` casts (saturating fcvt is a
+classic Cranelift/LLVM divergence point), aggregate calling
+convention (LLVM has its own `byval`/`sret` attributes), float
+literal narrowing. **Higher expected bug yield than at 12h.**
+
+A natural sub-bundling, mirroring the 12 / A.x rhythm:
+- **B.1** — tracer bullet: `--backend=llvm` flag, `return 0` only.
+- **B.2** — int arithmetic, control flow, all primitive ops.
+- **B.3** — float ops + `as` casts (saturating semantics divergence
+  is the most likely yielder here).
+- **B.4** — aggregate ABI (sret / byval — LLVM has explicit
+  attributes for this, unlike Cranelift's manual stack_addr dance).
+- **B.5** — extern fns + Print desugar + final corpus parity.
 
 ### Option C — Phase 2: comptime + module system
 
@@ -487,6 +553,10 @@ runs short on time for the bigger items:
 4. **Float `Mod` and `Pow`** codegen arms (currently fall through to
    integer ops; harmless because typeck doesn't produce them, but
    not future-proof).
+5. **Non-`u8` slice elements.** `resolve_type` for `Ty::Slice` only
+   accepts `[]u8` today; A.4 didn't widen this. `aggregate_layout`
+   already handles 8-byte fields generically, so the typeck-only
+   change is small. Worth ~30 min if a corpus program wants `[]i32`.
 
 ---
 
@@ -532,19 +602,20 @@ state this doc describes:
 ```bash
 cd /Users/silmaril/Documents/GitHub/gw
 git log --oneline | head -10
-# expect tip: 12h (8bc26a4), then 12g (42e17cc), 12f (3d91072), 12e (3543601),
-#             12d (aa1536d), 12c (6fb3d45), 12b (add7fe0), 12a (e45723d),
-#             11c (0bf40f9), 11b (2545bb7) at the bottom of the head -10.
+# expect tip: A.4 (5d71372), A.3 (a6dc722), A.2 (258cc70), A.1 (c1b091e),
+#             then 635b6d3 (HANDOFF for 12), 8bc26a4 (12h), 42e17cc (12g),
+#             3d91072 (12f), 3543601 (12e), aa1536d (12d) at the bottom
+#             of the head -10.
 
 git status
 # expect: clean working tree (no .DS_Store, no .probe leftovers)
 
 . "$HOME/.cargo/env"
 cargo test --manifest-path compiler/arsenal-boot/Cargo.toml --workspace 2>&1 | grep "test result" | awk '{p+=$4;f+=$6}END{print p,f}'
-# expect: "121 0"
+# expect: "147 0"
 
 ls tests/snake_eater/pass/phase1/*.gw | wc -l
-# expect: 200
+# expect: 226
 
 ls compiler/arsenal-boot/crates/ | wc -l
 # expect: 17
@@ -606,5 +677,10 @@ Increment 12 didn't change the arrow topology either, but it forced four
 small but real fixes that lived inside the existing arrows: `fcmp` dispatch
 in codegen (12a), short-circuit control-flow lowering in MIR (12b),
 bidirectional literal narrowing in typeck (12d/12h), and the regression
-test suites that pin those fixes in place. The 200-program corpus is the
-direct test surface for every one of those arrows.
+test suites that pin those fixes in place. The A.1–A.4 follow-up
+extended every arrow except `lex` and `resolve`: parser added postfix
+`as`, AST added `CastExpr`, typeck added `synth_cast` plus the dropped
+class/slice rejections, MIR added `Rvalue::Cast` and the `def_to_fn`
+fix, codegen added the seven `CastKind` arms and the aggregate-by-
+pointer ABI. The 226-program corpus is the direct test surface for
+every one of those arrows.
