@@ -1,0 +1,9 @@
+extern fn abs(x: i32) -> i32;
+
+class Sample { value: i32, magnitude: i32 }
+
+fn main() -> i32 {
+    let s = Sample { .value = -17, .magnitude = 0 };
+    s.magnitude = abs(s.value);
+    return s.magnitude;
+}

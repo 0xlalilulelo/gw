@@ -1,0 +1,9 @@
+extern fn abs(x: i32) -> i32;
+extern fn getpid() -> i32;
+
+fn main() -> i32 {
+    if getpid() > 0 && abs(-100) == 100 {
+        return 42;
+    }
+    return 0;
+}

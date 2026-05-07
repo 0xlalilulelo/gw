@@ -1,0 +1,11 @@
+extern fn abs(x: i32) -> i32;
+
+fn manhattan(x: i32, y: i32) -> i32 {
+    return abs(x) + abs(y);
+}
+
+fn main() -> i32 {
+    let d: i32 = manhattan(-3, 4);
+    let e: i32 = manhattan(7, -2);
+    return d + e;
+}

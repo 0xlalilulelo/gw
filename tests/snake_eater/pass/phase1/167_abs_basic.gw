@@ -1,0 +1,10 @@
+extern fn abs(x: i32) -> i32;
+
+fn main() -> i32 {
+    if abs(-42) == 42 {
+        if abs(7) == 7 {
+            if abs(0) == 0 { return 42; }
+        }
+    }
+    return 0;
+}

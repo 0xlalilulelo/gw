@@ -1,0 +1,8 @@
+extern fn getpid() -> i32;
+
+fn main() -> i32 {
+    let a: i32 = getpid();
+    let b: i32 = getpid();
+    if a == b { return 42; }
+    return 0;
+}

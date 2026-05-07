@@ -1,0 +1,8 @@
+extern fn putchar(c: i32) -> i32;
+extern fn abs(x: i32) -> i32;
+
+fn main() -> i32 {
+    putchar(65 + abs(-3));
+    putchar(10);
+    return 0;
+}
