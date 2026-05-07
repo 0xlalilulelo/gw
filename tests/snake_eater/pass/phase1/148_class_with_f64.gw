@@ -1,0 +1,8 @@
+class Vec3 { x: f64, y: f64, z: f64 }
+
+fn main() -> i32 {
+    let v = Vec3 { .x = 1.0, .y = 2.0, .z = 2.0 };
+    let dot: f64 = v.x * v.x + v.y * v.y + v.z * v.z;
+    if dot == 9.0 { return 42; }
+    return 0;
+}

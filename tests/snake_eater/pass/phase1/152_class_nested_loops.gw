@@ -1,0 +1,17 @@
+class Grid { sum: i32, max_cell: i32 }
+
+fn main() -> i32 {
+    let g = Grid { .sum = 0, .max_cell = 0 };
+    let i: i32 = 0;
+    while i < 4 {
+        let j: i32 = 0;
+        while j < 4 {
+            let cell: i32 = i * j;
+            g.sum = g.sum + cell;
+            if cell > g.max_cell { g.max_cell = cell; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return g.sum + g.max_cell;
+}

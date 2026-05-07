@@ -1,0 +1,13 @@
+class Range { min: i32, max: i32 }
+
+fn main() -> i32 {
+    let r = Range { .min = 1000, .max = -1000 };
+    let i: i32 = 1;
+    while i <= 7 {
+        let v: i32 = (i * 31) % 17;
+        if v < r.min { r.min = v; }
+        if v > r.max { r.max = v; }
+        i = i + 1;
+    }
+    return r.max - r.min;
+}

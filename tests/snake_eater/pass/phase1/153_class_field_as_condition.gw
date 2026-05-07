@@ -1,0 +1,15 @@
+class Worker { remaining: i32, done: bool }
+
+fn main() -> i32 {
+    let w = Worker { .remaining = 10, .done = false };
+    let processed: i32 = 0;
+    while !w.done {
+        w.remaining = w.remaining - 1;
+        processed = processed + 1;
+        if w.remaining == 0 { w.done = true; }
+    }
+    if w.done {
+        if w.remaining == 0 { return processed; }
+    }
+    return 0;
+}

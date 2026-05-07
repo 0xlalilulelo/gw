@@ -1,0 +1,8 @@
+class Point { x: i32, y: i32 }
+class Color { r: i32, g: i32, b: i32 }
+
+fn main() -> i32 {
+    let p = Point { .x = 3, .y = 4 };
+    let c = Color { .r = 10, .g = 20, .b = 12 };
+    return p.x + p.y + c.r + c.g + c.b;
+}

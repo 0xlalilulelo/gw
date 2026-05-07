@@ -1,0 +1,15 @@
+class BigCounter { lo: i64, hi: i64 }
+
+fn main() -> i32 {
+    let c = BigCounter { .lo = 0, .hi = 0 };
+    let i: i32 = 0;
+    while i < 5 {
+        c.lo = c.lo + 1000000;
+        c.hi = c.hi + 1;
+        i = i + 1;
+    }
+    if c.lo == 5000000 {
+        if c.hi == 5 { return 42; }
+    }
+    return 0;
+}

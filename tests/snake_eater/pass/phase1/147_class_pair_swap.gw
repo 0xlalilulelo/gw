@@ -1,0 +1,13 @@
+class Point { x: i32, y: i32 }
+
+fn main() -> i32 {
+    let a = Point { .x = 1, .y = 2 };
+    let b = Point { .x = 30, .y = 40 };
+    let tx: i32 = a.x;
+    let ty: i32 = a.y;
+    a.x = b.x;
+    a.y = b.y;
+    b.x = tx;
+    b.y = ty;
+    return a.x + a.y + b.x * 100 + b.y * 100;
+}

@@ -1,0 +1,8 @@
+class Point2D { x: i32, y: i32 }
+class Point3D { x: i32, y: i32, z: i32 }
+
+fn main() -> i32 {
+    let flat = Point2D { .x = 5, .y = 7 };
+    let lifted = Point3D { .x = flat.x, .y = flat.y, .z = flat.x + flat.y };
+    return lifted.x + lifted.y + lifted.z;
+}

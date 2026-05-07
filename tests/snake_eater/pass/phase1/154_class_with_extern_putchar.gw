@@ -1,0 +1,13 @@
+extern fn putchar(c: i32) -> i32;
+
+class Cursor { col: i32, row: i32 }
+
+fn main() -> i32 {
+    let c = Cursor { .col = 65, .row = 0 };
+    while c.row < 3 {
+        putchar(c.col + c.row);
+        c.row = c.row + 1;
+    }
+    putchar(10);
+    return c.row + c.col;
+}
