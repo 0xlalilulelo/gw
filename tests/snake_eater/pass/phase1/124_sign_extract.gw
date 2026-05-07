@@ -1,0 +1,15 @@
+fn sign(x: i32) -> i32 {
+    return (x >> 31) & 1;
+}
+
+fn main() -> i32 {
+    let neg: i32 = sign(-7);
+    let pos: i32 = sign(42);
+    let zero: i32 = sign(0);
+    if neg == 1 {
+        if pos == 0 {
+            if zero == 0 { return 42; }
+        }
+    }
+    return 0;
+}

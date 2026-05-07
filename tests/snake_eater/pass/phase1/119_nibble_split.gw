@@ -1,0 +1,16 @@
+fn high_nibble(b: i32) -> i32 {
+    return (b >> 4) & 0xF;
+}
+
+fn low_nibble(b: i32) -> i32 {
+    return b & 0xF;
+}
+
+fn main() -> i32 {
+    let h: i32 = high_nibble(0xAB);
+    let l: i32 = low_nibble(0xAB);
+    if h == 0xA {
+        if l == 0xB { return (h << 4) | l; }
+    }
+    return 0;
+}

@@ -1,0 +1,16 @@
+fn popcount(x: i32) -> i32 {
+    let n: i32 = x;
+    let count: i32 = 0;
+    while n != 0 {
+        count = count + (n & 1);
+        n = n >> 1;
+    }
+    return count;
+}
+
+fn main() -> i32 {
+    let a: i32 = popcount(0xFF);
+    let b: i32 = popcount(0x55);
+    let c: i32 = popcount(0);
+    return a + b + c;
+}

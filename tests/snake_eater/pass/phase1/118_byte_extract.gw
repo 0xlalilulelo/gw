@@ -1,0 +1,12 @@
+fn byte_at(p: i32, idx: i32) -> i32 {
+    return (p >> (idx * 8)) & 0xFF;
+}
+
+fn main() -> i32 {
+    let p: i32 = 0x12345678;
+    let b0: i32 = byte_at(p, 0);
+    let b1: i32 = byte_at(p, 1);
+    let b2: i32 = byte_at(p, 2);
+    let b3: i32 = byte_at(p, 3);
+    return b0 + b1 + b2 + b3;
+}

@@ -1,0 +1,23 @@
+fn set_bit(x: i32, n: i32) -> i32 {
+    return x | (1 << n);
+}
+
+fn clear_bit(x: i32, n: i32) -> i32 {
+    return x & ~(1 << n);
+}
+
+fn toggle_bit(x: i32, n: i32) -> i32 {
+    return x ^ (1 << n);
+}
+
+fn main() -> i32 {
+    let a: i32 = set_bit(0x10, 0);
+    let b: i32 = clear_bit(0xFF, 4);
+    let c: i32 = toggle_bit(0x05, 1);
+    if a == 0x11 {
+        if b == 0xEF {
+            if c == 0x07 { return 42; }
+        }
+    }
+    return 0;
+}

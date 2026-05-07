@@ -1,0 +1,9 @@
+fn pack(a: i32, b: i32, c: i32, d: i32) -> i32 {
+    return (a << 24) | (b << 16) | (c << 8) | d;
+}
+
+fn main() -> i32 {
+    let p: i32 = pack(0x12, 0x34, 0x56, 0x78);
+    if p == 0x12345678 { return 42; }
+    return 0;
+}

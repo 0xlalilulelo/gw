@@ -1,0 +1,16 @@
+fn is_pow2(x: i32) -> bool {
+    return x > 0 && (x & (x - 1)) == 0;
+}
+
+fn main() -> i32 {
+    let count: i32 = 0;
+    if is_pow2(1)  { count = count + 1; }
+    if is_pow2(2)  { count = count + 1; }
+    if is_pow2(4)  { count = count + 1; }
+    if is_pow2(8)  { count = count + 1; }
+    if is_pow2(16) { count = count + 1; }
+    if is_pow2(0)  { count = count + 100; }
+    if is_pow2(3)  { count = count + 100; }
+    if is_pow2(7)  { count = count + 100; }
+    return count;
+}

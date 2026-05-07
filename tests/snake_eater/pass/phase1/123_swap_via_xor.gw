@@ -1,0 +1,12 @@
+class Pair { a: i32, b: i32 }
+
+fn main() -> i32 {
+    let p = Pair { .a = 7, .b = 19 };
+    p.a = p.a ^ p.b;
+    p.b = p.a ^ p.b;
+    p.a = p.a ^ p.b;
+    if p.a == 19 {
+        if p.b == 7 { return 42; }
+    }
+    return 0;
+}

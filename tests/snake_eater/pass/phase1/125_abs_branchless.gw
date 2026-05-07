@@ -1,0 +1,11 @@
+fn abs_bl(x: i32) -> i32 {
+    let mask: i32 = x >> 31;
+    return (x ^ mask) - mask;
+}
+
+fn main() -> i32 {
+    let a: i32 = abs_bl(-5);
+    let b: i32 = abs_bl(7);
+    let c: i32 = abs_bl(0);
+    return a + b + c;
+}
