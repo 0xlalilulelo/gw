@@ -4,7 +4,13 @@ version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
-description            = "GW LLVM backend via inkwell (Phase 1+ stub). See docs/architecture.md Part F.2."
+description            = "GW LLVM backend via inkwell (Phase 13). See docs/architecture.md Part F.2."
+
+[dependencies]
+arsenal_mir    = { workspace = true }
+arsenal_typeck = { workspace = true }
+inkwell        = { workspace = true }
+target-lexicon = { workspace = true }
 
 [lints.rust]
 missing_docs = "deny"

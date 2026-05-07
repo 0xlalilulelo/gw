@@ -6,7 +6,6 @@
 //! land once we have a frequency-graph builder.
 
 use arsenal_ast::FileArena;
-use arsenal_codegen_fast::compile_program;
 use arsenal_lex::{render_simple, SourceMap};
 use arsenal_mir::lower;
 use arsenal_parse::parse;
@@ -18,20 +17,47 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-/// Run `arsenal build <file.gw>`.
+/// Which codegen backend to use for `arsenal build`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Backend {
+    /// Cranelift today; TPDE template encoder lands in Phase 7. Default.
+    Fast,
+    /// LLVM via inkwell. Phase 13.
+    Llvm,
+}
+
+/// Run `arsenal build [--backend=fast|llvm] <file.gw>`.
 pub fn run(args: &[OsString]) -> ExitCode {
-    let path = match args.first() {
-        Some(p) => PathBuf::from(p),
-        None => {
-            eprintln!("arsenal build: missing source path");
-            eprintln!("usage: arsenal build <file.gw>");
+    let mut path: Option<PathBuf> = None;
+    let mut backend = Backend::Fast;
+    for arg in args {
+        let s = arg.to_string_lossy();
+        if let Some(value) = s.strip_prefix("--backend=") {
+            backend = match value {
+                "fast" => Backend::Fast,
+                "llvm" => Backend::Llvm,
+                other => {
+                    eprintln!(
+                        "arsenal build: unknown --backend value `{other}` (expected `fast` or `llvm`)"
+                    );
+                    return ExitCode::from(2);
+                }
+            };
+        } else if s.starts_with("--") {
+            eprintln!("arsenal build: unknown flag `{s}`");
+            return ExitCode::from(2);
+        } else if path.is_none() {
+            path = Some(PathBuf::from(arg));
+        } else {
+            eprintln!("arsenal build: unexpected extra argument `{s}`");
             return ExitCode::from(2);
         }
-    };
-    if args.len() > 1 {
-        eprintln!("arsenal build: unexpected extra arguments");
-        return ExitCode::from(2);
     }
+    let Some(path) = path else {
+        eprintln!("arsenal build: missing source path");
+        eprintln!("usage: arsenal build [--backend=fast|llvm] <file.gw>");
+        return ExitCode::from(2);
+    };
 
     if !path.is_file() {
         eprintln!(
@@ -48,7 +74,7 @@ pub fn run(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    match build_one(&path) {
+    match build_one(&path, backend) {
         Ok(out) => {
             println!("built `{}`", out.display());
             ExitCode::SUCCESS
@@ -60,7 +86,7 @@ pub fn run(args: &[OsString]) -> ExitCode {
     }
 }
 
-fn build_one(src_path: &Path) -> Result<PathBuf, String> {
+fn build_one(src_path: &Path, backend: Backend) -> Result<PathBuf, String> {
     let contents = fs::read_to_string(src_path)
         .map_err(|e| format!("failed to read `{}`: {e}", src_path.display()))?;
     let mut sm = SourceMap::new();
@@ -96,8 +122,12 @@ fn build_one(src_path: &Path) -> Result<PathBuf, String> {
     let exe_path = out_dir.join(executable_name(stem));
 
     let triple = target_lexicon::Triple::host();
-    let object_bytes =
-        compile_program(&mir, triple, stem).map_err(|e| format!("codegen failed: {e}"))?;
+    let object_bytes = match backend {
+        Backend::Fast => arsenal_codegen_fast::compile_program(&mir, triple, stem)
+            .map_err(|e| format!("codegen failed: {e}"))?,
+        Backend::Llvm => arsenal_codegen_llvm::compile_program(&mir, triple, stem)
+            .map_err(|e| format!("codegen failed: {e}"))?,
+    };
     fs::write(&object_path, &object_bytes)
         .map_err(|e| format!("failed to write `{}`: {e}", object_path.display()))?;
 

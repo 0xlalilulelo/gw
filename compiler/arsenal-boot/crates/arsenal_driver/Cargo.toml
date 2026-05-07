@@ -22,6 +22,7 @@ arsenal_resolve      = { workspace = true }
 arsenal_typeck       = { workspace = true }
 arsenal_mir          = { workspace = true }
 arsenal_codegen_fast = { workspace = true }
+arsenal_codegen_llvm = { workspace = true }
 bumpalo              = { workspace = true }
 target-lexicon       = { workspace = true }
 
