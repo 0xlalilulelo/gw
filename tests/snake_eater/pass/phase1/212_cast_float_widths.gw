@@ -1,0 +1,11 @@
+// Phase 1 increment A.2: f32 → f64 → f32 round-trip. Values
+// representable exactly in f32 (powers of two and their finite-precision
+// sums) survive the promote/demote round-trip without precision loss.
+// 1.5 = 1 + 0.5 is exactly representable.
+fn main() -> i32 {
+    let a: f32 = 1.5;
+    let big: f64 = a as f64;
+    let back: f32 = big as f32;
+    if back == 1.5 { return 0; }
+    return 1;
+}

@@ -1,0 +1,22 @@
+// Phase 1 increment A.2: float → int saturating semantics. Out-of-range
+// floats clamp to the destination type's min/max instead of trapping.
+// Three observable shapes:
+//   * 1e12 → i32::MAX                 (positive overflow on signed)
+//   * -1e12 → i32::MIN                (negative overflow on signed)
+//   * -42.5 → 0 (u32::MIN)            (negative source on unsigned)
+fn main() -> i32 {
+    let huge_pos: f64 = 1000000000000.0;
+    let huge_neg: f64 = -1000000000000.0;
+    let neg: f64 = -42.5;
+    let p: i32 = huge_pos as i32;
+    let n: i32 = huge_neg as i32;
+    let u: u32 = neg as u32;
+    if p == 2147483647 {
+        if n == -2147483648 {
+            if u == 0 { return 0; }
+            return 3;
+        }
+        return 2;
+    }
+    return 1;
+}

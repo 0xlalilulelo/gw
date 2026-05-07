@@ -1,0 +1,15 @@
+// Phase 1 increment A.2: float → int truncates toward zero (matches
+// IEEE-754 round-to-zero). 3.7 → 3, -3.7 → -3 (not -4). Uses
+// fcvt_to_sint_sat under the hood; the saturating path leaves
+// representable values unchanged.
+fn main() -> i32 {
+    let pos: f64 = 3.7;
+    let neg: f64 = -3.7;
+    let p: i32 = pos as i32;
+    let n: i32 = neg as i32;
+    if p == 3 {
+        if n == -3 { return 0; }
+        return 2;
+    }
+    return 1;
+}

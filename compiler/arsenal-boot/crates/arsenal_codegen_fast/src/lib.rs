@@ -619,11 +619,12 @@ fn lower_rvalue(
             src_ty,
             dst_ty,
         } => {
-            // Read the operand at the *source* clif type so
-            // sextend/uextend/ireduce see the original width. `clif_ty`
-            // returns I32 as the safe default for non-primitives, but
-            // typeck restricts A.1 cast operands to integers, so the
-            // unwrap_or branch is unreachable on legal input.
+            // Read the operand at the *source* clif type so each
+            // Cranelift cast op sees its required input width.
+            // `clif_ty` returns I32 as the safe default for
+            // non-primitives, but typeck restricts cast operands to
+            // numerics, so the unwrap_or branch is unreachable on
+            // legal input.
             let src_clif = clif_ty(*src_ty, module).unwrap_or(ir::types::I32);
             let dst_clif = clif_ty(*dst_ty, module).unwrap_or(want_ty);
             let v = read_operand(fb, f, operand, cx, src_clif);
@@ -635,6 +636,16 @@ fn lower_rvalue(
                 // types are unsigned-by-bit-pattern, so the operand
                 // value is already correct.
                 CastKind::IntBitcast => v,
+                CastKind::IntToFloat { signed: true } => fb.ins().fcvt_from_sint(dst_clif, v),
+                CastKind::IntToFloat { signed: false } => fb.ins().fcvt_from_uint(dst_clif, v),
+                // Saturating + NaN→0 semantics (matches Rust ≥ 1.45 `as`).
+                CastKind::FloatToInt { signed: true } => fb.ins().fcvt_to_sint_sat(dst_clif, v),
+                CastKind::FloatToInt { signed: false } => fb.ins().fcvt_to_uint_sat(dst_clif, v),
+                CastKind::FloatExt => fb.ins().fpromote(dst_clif, v),
+                CastKind::FloatTrunc => fb.ins().fdemote(dst_clif, v),
+                // Same float width: nothing to do; the operand is
+                // already at the requested Cranelift type.
+                CastKind::FloatBitcast => v,
             }
         }
     }

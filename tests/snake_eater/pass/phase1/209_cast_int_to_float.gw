@@ -1,0 +1,9 @@
+// Phase 1 increment A.2: signed int → float → signed int round-trips
+// the value. Verifies fcvt_from_sint dispatch on i32 → f64.
+fn main() -> i32 {
+    let n: i32 = -7;
+    let f: f64 = n as f64;
+    let back: i32 = f as i32;
+    if back == -7 { return 0; }
+    return 1;
+}

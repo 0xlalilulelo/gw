@@ -1498,11 +1498,13 @@ fn synth_field<'a>(fe: FieldExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     }
 }
 
-/// Type-check `expr as Type`. Phase 1 increment A.1 supports integer-to-
-/// integer casts only; floats land in A.2. Same-width signed↔unsigned
-/// casts are accepted as bit reinterpretations; narrowing casts truncate
-/// silently (no compile-time bounds check, matching Rust / Zig
-/// `@truncate` semantics — the user opted in by writing `as`).
+/// Type-check `expr as Type`. Phase 1 increments A.1 / A.2 cover
+/// numeric casts: any int↔int, any int↔float, and any float↔float
+/// pair. Other operands (bool, class, slice, pointer) reject with
+/// `UNSUPPORTED_CONSTRUCT`. Narrowing int casts truncate silently
+/// (no compile-time bounds check); float→int casts saturate to the
+/// destination's range and map NaN to 0 (matches Rust ≥ 1.45 / Zig
+/// `@intFromFloat` semantics — the user opted in by writing `as`).
 fn synth_cast<'a>(c: CastExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     let src_ty = match c.expr() {
         Some(e) => synth_expr(e, cx),
@@ -1516,17 +1518,18 @@ fn synth_cast<'a>(c: CastExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
         return Ty::Error;
     }
     match (src_ty, dst_ty) {
-        // Int → Int: every combination is legal in A.1. Codegen picks
-        // sextend / uextend / ireduce / no-op based on widths and
-        // operand signedness.
-        (Ty::Int(_), Ty::Int(_)) => dst_ty,
+        // Numeric ↔ numeric: the cross-product of `Int` and `Float`.
+        // Codegen picks the exact Cranelift op from operand widths
+        // and signedness (see `arsenal_mir::CastKind`).
+        (Ty::Int(_) | Ty::Float(_), Ty::Int(_) | Ty::Float(_)) => dst_ty,
         _ => {
             cx.diags.push(Diagnostic::error(
                 ec::UNSUPPORTED_CONSTRUCT,
                 Label::new(c.syntax().span, ""),
                 format!(
-                    "Phase 1 only supports integer-to-integer `as` casts; \
-                     `{src_ty}` to `{dst_ty}` is not yet supported"
+                    "Phase 1 only supports numeric `as` casts (int ↔ int, \
+                     int ↔ float, float ↔ float); `{src_ty}` to `{dst_ty}` \
+                     is not yet supported"
                 ),
             ));
             Ty::Error
@@ -2036,13 +2039,32 @@ mod tests {
         assert!(check("fn f() -> i32 { return true as i32; }") >= 1);
     }
 
-    /// Float casts are deferred to A.2; they currently diagnose with
-    /// the same UNSUPPORTED_CONSTRUCT path as bool casts. This test
-    /// pins that boundary so when A.2 lands, removing the rejection
-    /// becomes the only change.
+    // ─── Phase 1 increment A.2: `as` cast float bridge ────────────────────
+
     #[test]
-    fn cast_float_pair_diagnoses_until_a2() {
-        assert!(check("fn f(x: f32) -> i32 { return x as i32; }") >= 1);
-        assert!(check("fn f(x: i32) -> f64 { return x as f64; }") >= 1);
+    fn cast_int_to_float_typechecks_clean() {
+        assert_eq!(check("fn f(x: i32) -> f64 { return x as f64; }"), 0);
+        assert_eq!(check("fn f(x: u8) -> f32 { return x as f32; }"), 0);
+    }
+
+    #[test]
+    fn cast_float_to_int_typechecks_clean() {
+        assert_eq!(check("fn f(x: f64) -> i32 { return x as i32; }"), 0);
+        assert_eq!(check("fn f(x: f32) -> u64 { return x as u64; }"), 0);
+    }
+
+    #[test]
+    fn cast_float_to_float_typechecks_clean() {
+        assert_eq!(check("fn f(x: f32) -> f64 { return x as f64; }"), 0);
+        assert_eq!(check("fn f(x: f64) -> f32 { return x as f32; }"), 0);
+        // Same-width identity is also legal.
+        assert_eq!(check("fn f(x: f32) -> f32 { return x as f32; }"), 0);
+    }
+
+    /// Non-numeric operands are still rejected — A.2 only opens up
+    /// the float arms of the numeric matrix.
+    #[test]
+    fn cast_bool_to_float_still_diagnoses() {
+        assert!(check("fn f() -> f64 { return true as f64; }") >= 1);
     }
 }

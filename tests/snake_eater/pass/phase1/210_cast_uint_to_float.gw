@@ -1,0 +1,13 @@
+// Phase 1 increment A.2: unsigned int → float must use fcvt_from_uint,
+// not fcvt_from_sint. With sint dispatch, 4 000 000 000 (above i32::MAX)
+// would convert to a negative double. The sandwich check pins the
+// correct unsigned interpretation.
+fn main() -> i32 {
+    let n: u32 = 4000000000;
+    let f: f64 = n as f64;
+    if f > 3999999999.0 {
+        if f < 4000000001.0 { return 0; }
+        return 2;
+    }
+    return 1;
+}

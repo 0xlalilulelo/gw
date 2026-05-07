@@ -145,23 +145,39 @@ pub enum Rvalue {
 
 /// Kind of a [`Rvalue::Cast`].
 ///
-/// Phase 1 increment A.1 covers integer-to-integer only; A.2 will add
-/// `IntToFloat`, `FloatToInt`, `FloatExt`, `FloatTrunc` variants.
+/// Each variant maps to exactly one Cranelift op (or no op for the
+/// `*Bitcast` cases), so codegen is a flat match. The dispatching
+/// information — operand signedness, source-vs-destination widths —
+/// lives here; codegen does not re-read [`Ty`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub enum CastKind {
-    /// Source narrower than destination. `signed` tracks the
+    /// Source int narrower than destination int. `signed` tracks the
     /// **operand**'s signedness, which determines the correct
     /// extension: `true` → `sextend`, `false` → `uextend`.
     IntWiden { signed: bool },
-    /// Source wider than destination — codegen lowers to `ireduce`,
-    /// which keeps the low bits and discards the high ones. Lossy by
-    /// construction; the user opted in by writing `as`.
+    /// Source int wider than destination int — codegen lowers to
+    /// `ireduce`, which keeps the low bits and discards the high
+    /// ones. Lossy by construction.
     IntTrunc,
     /// Same bit width, signedness reinterpretation only (`i32 as u32`,
     /// `u8 as i8`). No codegen op needed — Cranelift integer types
     /// don't carry signedness, so the operand value is reused as-is.
     IntBitcast,
+    /// Int → float. `signed` tracks the **operand**'s signedness:
+    /// `true` → `fcvt_from_sint`, `false` → `fcvt_from_uint`.
+    IntToFloat { signed: bool },
+    /// Float → int with saturation + NaN-to-zero (matches Rust ≥ 1.45
+    /// `as`). `signed` tracks the **destination**'s signedness:
+    /// `true` → `fcvt_to_sint_sat`, `false` → `fcvt_to_uint_sat`.
+    FloatToInt { signed: bool },
+    /// f32 → f64 via `fpromote`.
+    FloatExt,
+    /// f64 → f32 via `fdemote`.
+    FloatTrunc,
+    /// Same float width on both sides (`f32 as f32`, `f64 as f64`).
+    /// No codegen op needed; included for symmetry with `IntBitcast`.
+    FloatBitcast,
 }
 
 /// Reference to a value: either a constant or a local.
@@ -1339,11 +1355,12 @@ fn lower_unary<'a>(
 
 /// Lower `expr as Type` to a [`Rvalue::Cast`].
 ///
-/// The [`CastKind`] is selected from operand and target widths; this is
-/// the one MIR-side decision (codegen then maps `kind` to a single
-/// Cranelift op). Phase 1 increment A.1 only covers integer-to-integer
-/// casts; floats are deferred to A.2 and produce `Const::Error` here
-/// (typeck has already diagnosed the unsupported combination).
+/// The [`CastKind`] is selected here from operand and target types;
+/// codegen then maps `kind` to a single Cranelift op. Phase 1
+/// increments A.1 / A.2 cover the full numeric matrix (int↔int,
+/// int↔float, float↔float). Non-numeric source or destination is
+/// already diagnosed by typeck; we fall through to `Const::Error` so
+/// codegen has a defused operand.
 fn lower_cast<'a>(
     b: &mut Builder,
     c: CastExpr<'a>,
@@ -1363,18 +1380,9 @@ fn lower_cast<'a>(
         .get(&NodePtr(c.syntax()))
         .copied()
         .unwrap_or(Ty::Error);
-    // Pointer width is 64 on every Phase-1 target; matches the bound
-    // used in `try_narrow_literal`'s `value_fits_int`.
-    const PTR_BITS: u32 = 64;
-    let kind = match (src_ty.int_bits(PTR_BITS), dst_ty.int_bits(PTR_BITS)) {
-        (Some(s), Some(d)) if s < d => CastKind::IntWiden {
-            signed: src_ty.is_signed_int(),
-        },
-        (Some(s), Some(d)) if s > d => CastKind::IntTrunc,
-        (Some(_), Some(_)) => CastKind::IntBitcast,
-        // Typeck has diagnosed; emit a placeholder that codegen will
-        // defuse to a zero constant.
-        _ => return Operand::Const(Const::Error),
+    let Some(kind) = select_cast_kind(src_ty, dst_ty) else {
+        // Typeck diagnosed already; defuse so codegen stays sound.
+        return Operand::Const(Const::Error);
     };
     let local = b.alloc_local(LocalDecl {
         ty: dst_ty,
@@ -1390,6 +1398,40 @@ fn lower_cast<'a>(
         },
     });
     Operand::Local(local)
+}
+
+/// Pick the [`CastKind`] for a numeric `src` → `dst` pair.
+///
+/// Returns `None` for non-numeric pairs (typeck has already diagnosed
+/// these). Pointer width is fixed at 64 on every Phase-1 target,
+/// matching `value_fits_int`'s bound.
+fn select_cast_kind(src: Ty, dst: Ty) -> Option<CastKind> {
+    const PTR_BITS: u32 = 64;
+    Some(match (src, dst) {
+        (Ty::Int(_), Ty::Int(_)) => {
+            let s = src.int_bits(PTR_BITS)?;
+            let d = dst.int_bits(PTR_BITS)?;
+            match s.cmp(&d) {
+                std::cmp::Ordering::Less => CastKind::IntWiden {
+                    signed: src.is_signed_int(),
+                },
+                std::cmp::Ordering::Greater => CastKind::IntTrunc,
+                std::cmp::Ordering::Equal => CastKind::IntBitcast,
+            }
+        }
+        (Ty::Int(_), Ty::Float(_)) => CastKind::IntToFloat {
+            signed: src.is_signed_int(),
+        },
+        (Ty::Float(_), Ty::Int(_)) => CastKind::FloatToInt {
+            signed: dst.is_signed_int(),
+        },
+        (Ty::Float(s), Ty::Float(d)) => match (s, d) {
+            (FloatTy::F32, FloatTy::F64) => CastKind::FloatExt,
+            (FloatTy::F64, FloatTy::F32) => CastKind::FloatTrunc,
+            (FloatTy::F32, FloatTy::F32) | (FloatTy::F64, FloatTy::F64) => CastKind::FloatBitcast,
+        },
+        _ => return None,
+    })
 }
 
 fn lower_if<'a>(b: &mut Builder, i: IfExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>) -> Operand {
@@ -2188,5 +2230,88 @@ mod tests {
              fn main() -> i32 { return 0; }",
         );
         assert_eq!(cast_kind_in(&prog, "rein"), CastKind::IntBitcast);
+    }
+
+    // ─── Phase 1 increment A.2: float bridge ───────────────────────────
+
+    /// Signed int → float uses the operand's signedness.
+    #[test]
+    fn cast_signed_int_to_float_picks_signed_kind() {
+        let prog = lower_src(
+            "fn cv(x: i32) -> f64 { return x as f64; }
+             fn main() -> i32 { return 0; }",
+        );
+        assert_eq!(
+            cast_kind_in(&prog, "cv"),
+            CastKind::IntToFloat { signed: true }
+        );
+    }
+
+    /// Unsigned int → float uses the operand's signedness (false).
+    #[test]
+    fn cast_unsigned_int_to_float_picks_unsigned_kind() {
+        let prog = lower_src(
+            "fn cv(x: u32) -> f64 { return x as f64; }
+             fn main() -> i32 { return 0; }",
+        );
+        assert_eq!(
+            cast_kind_in(&prog, "cv"),
+            CastKind::IntToFloat { signed: false }
+        );
+    }
+
+    /// Float → signed int uses the destination's signedness.
+    #[test]
+    fn cast_float_to_signed_int_picks_signed_kind() {
+        let prog = lower_src(
+            "fn cv(x: f64) -> i32 { return x as i32; }
+             fn main() -> i32 { return 0; }",
+        );
+        assert_eq!(
+            cast_kind_in(&prog, "cv"),
+            CastKind::FloatToInt { signed: true }
+        );
+    }
+
+    /// Float → unsigned int uses the destination's signedness (false).
+    #[test]
+    fn cast_float_to_unsigned_int_picks_unsigned_kind() {
+        let prog = lower_src(
+            "fn cv(x: f64) -> u32 { return x as u32; }
+             fn main() -> i32 { return 0; }",
+        );
+        assert_eq!(
+            cast_kind_in(&prog, "cv"),
+            CastKind::FloatToInt { signed: false }
+        );
+    }
+
+    #[test]
+    fn cast_f32_to_f64_picks_promote_kind() {
+        let prog = lower_src(
+            "fn cv(x: f32) -> f64 { return x as f64; }
+             fn main() -> i32 { return 0; }",
+        );
+        assert_eq!(cast_kind_in(&prog, "cv"), CastKind::FloatExt);
+    }
+
+    #[test]
+    fn cast_f64_to_f32_picks_demote_kind() {
+        let prog = lower_src(
+            "fn cv(x: f64) -> f32 { return x as f32; }
+             fn main() -> i32 { return 0; }",
+        );
+        assert_eq!(cast_kind_in(&prog, "cv"), CastKind::FloatTrunc);
+    }
+
+    #[test]
+    fn cast_same_float_width_picks_bitcast_kind() {
+        let prog = lower_src(
+            "fn id32(x: f32) -> f32 { return x as f32; }
+             fn id64(x: f64) -> f64 { return x as f64; }
+             fn main() -> i32 { return 0; }",
+        );
+        assert_eq!(cast_kind_in(&prog, "id32"), CastKind::FloatBitcast);
+        assert_eq!(cast_kind_in(&prog, "id64"), CastKind::FloatBitcast);
     }
 }

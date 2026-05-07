@@ -1,0 +1,9 @@
+// Phase 1 increment A.2: int↔float casts inside larger expressions.
+// Compute (n as f64) / 4.0 for n: i32, then convert back. Tests that
+// IntToFloat and FloatToInt CastKinds compose with float arithmetic.
+fn main() -> i32 {
+    let n: i32 = 84;
+    let half: f64 = (n as f64) / 2.0;
+    let result: i32 = half as i32;
+    return result;
+}
