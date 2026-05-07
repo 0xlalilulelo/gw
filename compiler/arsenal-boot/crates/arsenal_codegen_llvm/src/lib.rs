@@ -4,24 +4,36 @@
 //! `MirProgram → object bytes`. The driver picks between the two backends
 //! at `arsenal build --backend=fast|llvm`.
 //!
-//! B.1 (this commit) is the tracer bullet: only enough surface to compile
-//! `fn main() -> i32 { return 0; }`. Every other construct returns
-//! [`CodegenError::Unsupported`]. B.2–B.5 widen the supported subset
-//! incrementally; the structure here is intentionally shaped so each
-//! later increment fills in `match` arms rather than reshaping the
-//! pipeline.
+//! Supported MIR subset (B.1 → B.2):
+//! - integer + bool params and returns; `u0` returns
+//! - integer + bool locals (alloca-backed; mem2reg promotion is left to
+//!   LLVM's later opt-level when we add one)
+//! - `Rvalue::Use` / `BinOp` / `UnOp` over integers and bools
+//! - `Operand::Const(Int|Bool|Unit)`, `Operand::Local`
+//! - `Terminator::{Goto, Branch, Return, Call, Unreachable}`
+//!
+//! Deferred (B.3+): floats, `as` casts, classes, slices, `*T` raw
+//! pointers, string literals + Print desugar, `Rvalue::Field` /
+//! `MirStmt::AssignField`. Anything outside the supported set returns
+//! [`CodegenError::Unsupported`] with a descriptive message.
 
-use arsenal_mir::{Const, MirFn, MirProgram, Operand, Terminator};
+use arsenal_mir::{
+    BinOp, BlockId, Const, FnIdx, Local, MirFn, MirProgram, MirStmt, Operand, Rvalue, Terminator,
+    UnOp,
+};
 use arsenal_typeck::{IntTy, Ty};
 use inkwell::basic_block::BasicBlock;
 use inkwell::context::Context;
-use inkwell::module::{Linkage, Module};
+use inkwell::module::Linkage;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetTriple,
 };
-use inkwell::types::{BasicMetadataTypeEnum, FunctionType};
-use inkwell::values::FunctionValue;
-use inkwell::OptimizationLevel;
+use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType, IntType};
+use inkwell::values::{
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue,
+};
+use inkwell::{IntPredicate, OptimizationLevel};
+use rustc_hash::FxHashMap;
 use target_lexicon::Triple;
 
 /// Codegen error.
@@ -88,36 +100,27 @@ pub fn compile_program(
     module.set_data_layout(&machine.get_target_data().get_data_layout());
 
     // Pass 1: declare every function so calls can resolve forward.
-    // (B.1 has no calls, but the structure stays — B.2 needs this.)
+    // External linkage is correct for both directions in LLVM — the
+    // import/export distinction is implicit from whether the function
+    // has a body.
     let mut fn_values: Vec<FunctionValue<'_>> = Vec::with_capacity(prog.functions.len());
     for f in &prog.functions {
         let fn_ty = make_fn_type(&context, f)?;
-        let linkage = if f.is_extern {
-            Some(Linkage::External)
-        } else {
-            // `Linkage::External` here means "exported, defined in this
-            // module" — matches Cranelift's `Linkage::Export`. LLVM
-            // overloads the same name for both directions; the
-            // import/export distinction is implicit from whether the
-            // function has a body.
-            Some(Linkage::External)
-        };
-        let function = module.add_function(&f.name, fn_ty, linkage);
+        let function = module.add_function(&f.name, fn_ty, Some(Linkage::External));
         fn_values.push(function);
     }
 
     // Pass 2: define non-extern bodies.
-    for (f, function) in prog.functions.iter().zip(fn_values.iter().copied()) {
+    for (i, f) in prog.functions.iter().enumerate() {
         if f.is_extern {
             continue;
         }
-        define_fn(&context, &module, f, function)?;
+        define_fn(&context, f, fn_values[i], &fn_values, prog)?;
     }
 
     // Verify the module before emitting. Catches malformed IR with a
     // useful error rather than letting `write_to_memory_buffer` produce
-    // mystery output. Disabled in release builds is tempting, but
-    // bootstrap-stage verification cost is negligible.
+    // mystery output. Bootstrap-stage verification cost is negligible.
     module
         .verify()
         .map_err(|e| CodegenError::Builder(e.to_string()))?;
@@ -128,93 +131,516 @@ pub fn compile_program(
     Ok(buffer.as_slice().to_vec())
 }
 
-fn define_fn(
-    context: &Context,
-    _module: &Module<'_>,
-    f: &MirFn,
-    function: FunctionValue<'_>,
-) -> Result<(), CodegenError> {
-    if !f.params.is_empty() {
-        return Err(CodegenError::Unsupported(format!(
-            "fn `{}` has parameters; B.1 tracer-bullet supports zero-arg fns only",
-            f.name
-        )));
-    }
+// ─── per-function definition ──────────────────────────────────────────
 
-    // Pre-create one LLVM basic block per MIR block so terminators can
-    // reference forward (Goto / Branch land in B.2; pre-creation keeps
-    // that change to an arm rather than a restructure).
-    let bbs: Vec<BasicBlock<'_>> = (0..f.blocks.len())
+/// State threaded through statement / rvalue / operand lowering.
+struct LoweringCx<'ctx, 'a> {
+    context: &'ctx Context,
+    f: &'a MirFn,
+    /// Stack-slot pointer per non-`u0` local. `u0` locals have no
+    /// storage — they're never read or written.
+    allocas: FxHashMap<Local, PointerValue<'ctx>>,
+    /// Pre-created LLVM basic blocks, parallel to `f.blocks`.
+    bbs: Vec<BasicBlock<'ctx>>,
+    /// Function values declared in pass 1, indexed by [`FnIdx`].
+    fn_values: &'a [FunctionValue<'ctx>],
+    prog: &'a MirProgram,
+}
+
+fn define_fn<'ctx>(
+    context: &'ctx Context,
+    f: &MirFn,
+    function: FunctionValue<'ctx>,
+    fn_values: &[FunctionValue<'ctx>],
+    prog: &MirProgram,
+) -> Result<(), CodegenError> {
+    let bbs: Vec<BasicBlock<'ctx>> = (0..f.blocks.len())
         .map(|i| context.append_basic_block(function, &format!("bb{i}")))
         .collect();
 
     let builder = context.create_builder();
+    builder.position_at_end(bbs[0]);
+
+    // Alloca every non-`u0` local. LLVM convention: allocas in the entry
+    // block so mem2reg (when we add an opt pass later) can promote them
+    // to SSA values.
+    let mut allocas: FxHashMap<Local, PointerValue<'ctx>> = FxHashMap::default();
+    for (i, decl) in f.locals.iter().enumerate() {
+        if decl.ty == Ty::U0 {
+            continue;
+        }
+        let lty = llvm_basic_type(context, decl.ty).ok_or_else(|| {
+            CodegenError::Unsupported(format!(
+                "fn `{}` local {} has type {:?}; B.2 supports integers and bool only",
+                f.name, i, decl.ty
+            ))
+        })?;
+        let ptr = builder
+            .build_alloca(lty, &format!("local{i}"))
+            .map_err(|e| CodegenError::Builder(e.to_string()))?;
+        allocas.insert(Local(i as u32), ptr);
+    }
+
+    // Store each fn parameter into its corresponding local's alloca, so
+    // body reads load from the slot uniformly.
+    for (i, &param_local) in f.params.iter().enumerate() {
+        let ty = f.locals[param_local.0 as usize].ty;
+        if ty == Ty::U0 {
+            continue;
+        }
+        let val = function
+            .get_nth_param(i as u32)
+            .ok_or_else(|| CodegenError::Builder(format!("fn `{}` missing param {i}", f.name)))?;
+        let ptr = allocas[&param_local];
+        builder
+            .build_store(ptr, val)
+            .map_err(|e| CodegenError::Builder(e.to_string()))?;
+    }
+
+    let cx = LoweringCx {
+        context,
+        f,
+        allocas,
+        bbs,
+        fn_values,
+        prog,
+    };
+
+    // Lower each MIR block. The first iteration continues from the
+    // entry block (where the allocas + param stores already live);
+    // subsequent iterations switch to their own pre-created bb.
     for (i, mir_block) in f.blocks.iter().enumerate() {
-        builder.position_at_end(bbs[i]);
-
-        if !mir_block.statements.is_empty() {
-            return Err(CodegenError::Unsupported(format!(
-                "fn `{}` block {} has {} MIR statement(s); B.1 supports empty bodies only",
-                f.name,
-                i,
-                mir_block.statements.len()
-            )));
+        builder.position_at_end(cx.bbs[i]);
+        for stmt in &mir_block.statements {
+            lower_stmt(&builder, &cx, stmt)?;
         }
-
-        match &mir_block.terminator {
-            Terminator::Return(Operand::Const(Const::Int { value, ty })) => {
-                let int_ty = llvm_int_type(context, *ty);
-                // `as u64` truncates the i128 const to 64 bits; for the
-                // I8..I64 widths the value is exact. `sign_extend` is
-                // false because inkwell's `const_int` interprets the
-                // bits literally — the i128 already carries the signed
-                // value.
-                let value_const = int_ty.const_int(*value as u64, false);
-                builder
-                    .build_return(Some(&value_const))
-                    .map_err(|e| CodegenError::Builder(e.to_string()))?;
-            }
-            Terminator::Unreachable => {
-                builder
-                    .build_unreachable()
-                    .map_err(|e| CodegenError::Builder(e.to_string()))?;
-            }
-            other => {
-                return Err(CodegenError::Unsupported(format!(
-                    "fn `{}` block {} terminator {:?}; B.1 supports \
-                     `Return(Const::Int)` and `Unreachable` only",
-                    f.name, i, other
-                )));
-            }
-        }
+        lower_terminator(&builder, &cx, &mir_block.terminator, i)?;
     }
     Ok(())
 }
+
+// ─── statements ───────────────────────────────────────────────────────
+
+fn lower_stmt<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    cx: &LoweringCx<'ctx, '_>,
+    stmt: &MirStmt,
+) -> Result<(), CodegenError> {
+    match stmt {
+        MirStmt::Assign { dst, value } => {
+            let dst_ty = cx.f.locals[dst.0 as usize].ty;
+            if dst_ty == Ty::U0 {
+                // The MIR builder synthesises some `let _: u0 = expr;`
+                // shapes whose Assign has no observable effect; skip.
+                return Ok(());
+            }
+            let val = lower_rvalue(builder, cx, value, dst_ty)?;
+            let ptr = cx.allocas[dst];
+            builder
+                .build_store(ptr, val)
+                .map_err(|e| CodegenError::Builder(e.to_string()))?;
+            Ok(())
+        }
+        MirStmt::AssignField { .. } => Err(CodegenError::Unsupported(
+            "AssignField (class field write) — deferred to B.4".into(),
+        )),
+    }
+}
+
+// ─── rvalues ──────────────────────────────────────────────────────────
+
+fn lower_rvalue<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    cx: &LoweringCx<'ctx, '_>,
+    rv: &Rvalue,
+    dst_ty: Ty,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    match rv {
+        Rvalue::Use(op) => read_operand(builder, cx, op, dst_ty),
+        Rvalue::BinOp { op, lhs, rhs, ty } => {
+            let l = read_operand(builder, cx, lhs, *ty)?;
+            let r = read_operand(builder, cx, rhs, *ty)?;
+            lower_binop(builder, *op, *ty, l, r)
+        }
+        Rvalue::UnOp { op, operand, ty } => {
+            let v = read_operand(builder, cx, operand, *ty)?;
+            lower_unop(builder, *op, *ty, v)
+        }
+        Rvalue::Field { .. } => Err(CodegenError::Unsupported(
+            "Rvalue::Field (class field read) — deferred to B.4".into(),
+        )),
+        Rvalue::Cast { .. } => Err(CodegenError::Unsupported(
+            "Rvalue::Cast (`as` casts) — deferred to B.3".into(),
+        )),
+    }
+}
+
+fn lower_binop<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    op: BinOp,
+    ty: Ty,
+    l: BasicValueEnum<'ctx>,
+    r: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    if ty.is_float() {
+        return Err(CodegenError::Unsupported(format!(
+            "BinOp::{op:?} on float operands — deferred to B.3"
+        )));
+    }
+    let l_int = l.into_int_value();
+    let r_int = r.into_int_value();
+    let signed = ty.is_signed_int();
+    let v: IntValue<'ctx> = match op {
+        BinOp::Add => builder.build_int_add(l_int, r_int, "add").map_err(be)?,
+        BinOp::Sub => builder.build_int_sub(l_int, r_int, "sub").map_err(be)?,
+        BinOp::Mul => builder.build_int_mul(l_int, r_int, "mul").map_err(be)?,
+        BinOp::Div => {
+            if signed {
+                builder
+                    .build_int_signed_div(l_int, r_int, "sdiv")
+                    .map_err(be)?
+            } else {
+                builder
+                    .build_int_unsigned_div(l_int, r_int, "udiv")
+                    .map_err(be)?
+            }
+        }
+        BinOp::Mod => {
+            if signed {
+                builder
+                    .build_int_signed_rem(l_int, r_int, "srem")
+                    .map_err(be)?
+            } else {
+                builder
+                    .build_int_unsigned_rem(l_int, r_int, "urem")
+                    .map_err(be)?
+            }
+        }
+        BinOp::Pow => {
+            return Err(CodegenError::Unsupported(
+                "integer `**` (Pow) — typeck doesn't currently emit this; \
+                 add a corpus program first if needed"
+                    .into(),
+            ));
+        }
+        BinOp::BitAnd => builder.build_and(l_int, r_int, "and").map_err(be)?,
+        BinOp::BitOr => builder.build_or(l_int, r_int, "or").map_err(be)?,
+        BinOp::BitXor => builder.build_xor(l_int, r_int, "xor").map_err(be)?,
+        BinOp::Shl => builder.build_left_shift(l_int, r_int, "shl").map_err(be)?,
+        BinOp::Shr => builder
+            .build_right_shift(l_int, r_int, signed, "shr")
+            .map_err(be)?,
+        // `LogAnd` / `LogOr` shouldn't reach codegen — MIR lowers `&&`
+        // and `||` to short-circuit control flow (HANDOFF decision #15).
+        // Keep the eager path as a safety net so legal MIR doesn't crash;
+        // observable-effect skipping is already guaranteed by lowering.
+        BinOp::LogAnd => builder.build_and(l_int, r_int, "logand").map_err(be)?,
+        BinOp::LogOr => builder.build_or(l_int, r_int, "logor").map_err(be)?,
+        BinOp::Eq => builder
+            .build_int_compare(IntPredicate::EQ, l_int, r_int, "eq")
+            .map_err(be)?,
+        BinOp::Ne => builder
+            .build_int_compare(IntPredicate::NE, l_int, r_int, "ne")
+            .map_err(be)?,
+        BinOp::Lt => builder
+            .build_int_compare(
+                if signed {
+                    IntPredicate::SLT
+                } else {
+                    IntPredicate::ULT
+                },
+                l_int,
+                r_int,
+                "lt",
+            )
+            .map_err(be)?,
+        BinOp::Le => builder
+            .build_int_compare(
+                if signed {
+                    IntPredicate::SLE
+                } else {
+                    IntPredicate::ULE
+                },
+                l_int,
+                r_int,
+                "le",
+            )
+            .map_err(be)?,
+        BinOp::Gt => builder
+            .build_int_compare(
+                if signed {
+                    IntPredicate::SGT
+                } else {
+                    IntPredicate::UGT
+                },
+                l_int,
+                r_int,
+                "gt",
+            )
+            .map_err(be)?,
+        BinOp::Ge => builder
+            .build_int_compare(
+                if signed {
+                    IntPredicate::SGE
+                } else {
+                    IntPredicate::UGE
+                },
+                l_int,
+                r_int,
+                "ge",
+            )
+            .map_err(be)?,
+    };
+    Ok(v.into())
+}
+
+fn lower_unop<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    op: UnOp,
+    ty: Ty,
+    v: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    if ty.is_float() {
+        return Err(CodegenError::Unsupported(format!(
+            "UnOp::{op:?} on float operand — deferred to B.3"
+        )));
+    }
+    let v_int = v.into_int_value();
+    let result: IntValue<'ctx> = match op {
+        UnOp::Neg => builder.build_int_neg(v_int, "neg").map_err(be)?,
+        // Logical not on bool: XOR with 1. `build_not` is bitwise — for
+        // an i1 it agrees with logical-not, but for any wider integer
+        // (which Rust spells as `!u8` etc.) typeck routes through
+        // `BitNot` instead. So `Not` is bool-only by construction.
+        UnOp::Not => {
+            let one = cx_for_int(builder, v_int).const_int(1, false);
+            builder.build_xor(v_int, one, "not").map_err(be)?
+        }
+        UnOp::BitNot => builder.build_not(v_int, "bnot").map_err(be)?,
+    };
+    Ok(result.into())
+}
+
+/// inkwell helper — fetch the int type of a value (so unop can build a
+/// matching constant without re-deriving the type from `Ty`).
+fn cx_for_int<'ctx>(
+    _builder: &inkwell::builder::Builder<'ctx>,
+    v: IntValue<'ctx>,
+) -> IntType<'ctx> {
+    v.get_type()
+}
+
+fn be(e: inkwell::builder::BuilderError) -> CodegenError {
+    CodegenError::Builder(e.to_string())
+}
+
+// ─── operands ─────────────────────────────────────────────────────────
+
+fn read_operand<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    cx: &LoweringCx<'ctx, '_>,
+    op: &Operand,
+    ty: Ty,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    match op {
+        Operand::Const(c) => emit_const(cx.context, c, ty),
+        Operand::Local(l) => {
+            let ptr = *cx.allocas.get(l).ok_or_else(|| {
+                CodegenError::Builder(format!(
+                    "fn `{}` reads local {l:?} that has no alloca (likely u0)",
+                    cx.f.name
+                ))
+            })?;
+            let lty = llvm_basic_type(cx.context, ty).ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "fn `{}` reads local {l:?} with type {:?}; B.2 supports integers and bool only",
+                    cx.f.name, ty
+                ))
+            })?;
+            builder.build_load(lty, ptr, "load").map_err(be)
+        }
+    }
+}
+
+fn emit_const<'ctx>(
+    context: &'ctx Context,
+    c: &Const,
+    ty: Ty,
+) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    match c {
+        Const::Int { value, ty: int_ty } => {
+            let lty = llvm_int_type(context, *int_ty);
+            // `as u64` reinterprets the i128's low 64 bits. For all
+            // I8..I64 widths (including ISize/USize on 64-bit hosts)
+            // the truncation is exact: typeck already bounded the
+            // literal to fit `int_ty`. `sign_extend = false` because
+            // inkwell takes the bits literally.
+            Ok(lty.const_int(*value as u64, false).into())
+        }
+        Const::Bool(b) => Ok(context
+            .bool_type()
+            .const_int(if *b { 1 } else { 0 }, false)
+            .into()),
+        Const::Unit => {
+            // `u0` has no LLVM value. Callers that hit this in B.2 are
+            // either bugs in MIR lowering or the rare `Return(Unit)`
+            // for `u0`-returning fns; that path takes a separate code
+            // path in `lower_terminator`. Surface as Unsupported to
+            // avoid silent miscodegen.
+            Err(CodegenError::Unsupported(format!(
+                "`Const::Unit` used as a value in non-void context (expected ty {ty:?})"
+            )))
+        }
+        Const::Float { .. } => Err(CodegenError::Unsupported(
+            "`Const::Float` — deferred to B.3".into(),
+        )),
+        Const::DataAddr(_) => Err(CodegenError::Unsupported(
+            "`Const::DataAddr` (string literal) — deferred to B.5".into(),
+        )),
+        Const::Error => Err(CodegenError::Unsupported(
+            "`Const::Error` reached codegen; typeck should have errored".into(),
+        )),
+    }
+}
+
+// ─── terminators ──────────────────────────────────────────────────────
+
+fn lower_terminator<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    cx: &LoweringCx<'ctx, '_>,
+    term: &Terminator,
+    block_idx: usize,
+) -> Result<(), CodegenError> {
+    match term {
+        Terminator::Goto(target) => {
+            let dest = cx.bbs[target.0 as usize];
+            builder.build_unconditional_branch(dest).map_err(be)?;
+        }
+        Terminator::Branch {
+            cond,
+            then_bb,
+            else_bb,
+        } => {
+            let v = read_operand(builder, cx, cond, Ty::Bool)?.into_int_value();
+            // The MIR holds bool conditions at i1 already (typeck
+            // normalises `Branch`'s cond to `Ty::Bool`). LLVM's
+            // `br i1` requires exactly i1, so no zext/trunc needed.
+            let then_bb = cx.bbs[then_bb.0 as usize];
+            let else_bb = cx.bbs[else_bb.0 as usize];
+            builder
+                .build_conditional_branch(v, then_bb, else_bb)
+                .map_err(be)?;
+        }
+        Terminator::Return(op) => {
+            if matches!(cx.f.return_ty, Ty::U0 | Ty::Error) {
+                builder.build_return(None).map_err(be)?;
+            } else {
+                let v = read_operand(builder, cx, op, cx.f.return_ty)?;
+                builder.build_return(Some(&v)).map_err(be)?;
+            }
+        }
+        Terminator::Call {
+            callee,
+            args,
+            dst,
+            target_bb,
+        } => {
+            lower_call(builder, cx, *callee, args, *dst, *target_bb)?;
+        }
+        Terminator::Unreachable => {
+            builder.build_unreachable().map_err(be)?;
+        }
+    }
+    let _ = block_idx;
+    Ok(())
+}
+
+fn lower_call<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    cx: &LoweringCx<'ctx, '_>,
+    callee: FnIdx,
+    args: &[Operand],
+    dst: Local,
+    target_bb: BlockId,
+) -> Result<(), CodegenError> {
+    let callee_fn = &cx.prog.functions[callee.0 as usize];
+    let callee_value = cx.fn_values[callee.0 as usize];
+
+    let mut arg_vals: Vec<BasicMetadataValueEnum<'ctx>> = Vec::with_capacity(args.len());
+    for (i, op) in args.iter().enumerate() {
+        let param_local = callee_fn.params[i];
+        let param_ty = callee_fn.locals[param_local.0 as usize].ty;
+        let v = read_operand(builder, cx, op, param_ty)?;
+        arg_vals.push(v.into());
+    }
+
+    let call_site = builder
+        .build_call(callee_value, &arg_vals, "call")
+        .map_err(be)?;
+
+    let dst_ty = cx.f.locals[dst.0 as usize].ty;
+    if !matches!(dst_ty, Ty::U0 | Ty::Error) {
+        // Scalar return: store into the dst local's alloca. (Aggregate
+        // returns land in B.4 via a hidden out-pointer.)
+        let ret = call_site
+            .try_as_basic_value()
+            .left()
+            .ok_or_else(|| CodegenError::Builder("call returned void to non-u0 dst".into()))?;
+        let ptr = cx.allocas[&dst];
+        builder.build_store(ptr, ret).map_err(be)?;
+    }
+    let target = cx.bbs[target_bb.0 as usize];
+    builder.build_unconditional_branch(target).map_err(be)?;
+    Ok(())
+}
+
+// ─── type mapping ─────────────────────────────────────────────────────
 
 fn make_fn_type<'ctx>(
     context: &'ctx Context,
     f: &MirFn,
 ) -> Result<FunctionType<'ctx>, CodegenError> {
-    if !f.params.is_empty() {
-        return Err(CodegenError::Unsupported(format!(
-            "fn `{}` has parameters; B.1 supports zero-arg fns only",
-            f.name
-        )));
+    let mut params: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::with_capacity(f.params.len());
+    for &param_local in &f.params {
+        let pty = f.locals[param_local.0 as usize].ty;
+        let lty = llvm_basic_type(context, pty).ok_or_else(|| {
+            CodegenError::Unsupported(format!(
+                "fn `{}` param {:?} type {:?}; B.2 supports integers and bool only",
+                f.name, param_local, pty
+            ))
+        })?;
+        params.push(lty.into());
     }
-    let params: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
     Ok(match f.return_ty {
         Ty::U0 => context.void_type().fn_type(&params, false),
         Ty::Int(int_ty) => llvm_int_type(context, int_ty).fn_type(&params, false),
+        Ty::Bool => context.bool_type().fn_type(&params, false),
         ref other => {
             return Err(CodegenError::Unsupported(format!(
-                "fn `{}` return type {:?}; B.1 supports `u0` and integer returns",
+                "fn `{}` return type {:?}; B.2 supports `u0`, integers, and bool",
                 f.name, other
             )));
         }
     })
 }
 
-fn llvm_int_type<'ctx>(context: &'ctx Context, ty: IntTy) -> inkwell::types::IntType<'ctx> {
+/// Map a [`Ty`] to its LLVM `BasicTypeEnum`, or `None` for `u0` and
+/// any type B.2 doesn't yet handle (caller turns `None` into an
+/// `Unsupported` error).
+fn llvm_basic_type<'ctx>(context: &'ctx Context, ty: Ty) -> Option<BasicTypeEnum<'ctx>> {
+    match ty {
+        Ty::U0 => None,
+        Ty::Bool => Some(context.bool_type().into()),
+        Ty::Int(int_ty) => Some(llvm_int_type(context, int_ty).into()),
+        // Floats land in B.3, aggregates / pointers in B.4+.
+        Ty::Float(_) | Ty::Class(_) | Ty::Slice(_) | Ty::Ptr(_) | Ty::Rune | Ty::Error => None,
+        // `Ty` is non-exhaustive (Phase 2 will add `?T`, `!T`, etc.);
+        // anything new lands here as Unsupported until handled.
+        _ => None,
+    }
+}
+
+fn llvm_int_type<'ctx>(context: &'ctx Context, ty: IntTy) -> IntType<'ctx> {
     match ty {
         IntTy::I8 | IntTy::U8 => context.i8_type(),
         IntTy::I16 | IntTy::U16 => context.i16_type(),

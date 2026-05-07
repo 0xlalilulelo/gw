@@ -10,6 +10,7 @@ description            = "GW LLVM backend via inkwell (Phase 13). See docs/archi
 arsenal_mir    = { workspace = true }
 arsenal_typeck = { workspace = true }
 inkwell        = { workspace = true }
+rustc-hash     = { workspace = true }
 target-lexicon = { workspace = true }
 
 [lints.rust]

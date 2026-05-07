@@ -69,6 +69,7 @@ dependencies = [
  "arsenal_mir",
  "arsenal_typeck",
  "inkwell",
+ "rustc-hash",
  "target-lexicon",
 ]
 
