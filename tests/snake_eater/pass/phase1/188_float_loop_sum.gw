@@ -1,0 +1,10 @@
+fn main() -> i32 {
+    let s: f64 = 0.0;
+    let i: i32 = 0;
+    while i < 8 {
+        s = s + 0.125;
+        i = i + 1;
+    }
+    if s == 1.0 { return 42; }
+    return 0;
+}

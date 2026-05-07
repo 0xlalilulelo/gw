@@ -1,0 +1,6 @@
+class Wrap { v: i32 }
+
+fn main() -> i32 {
+    let w = Wrap { .v = 42 };
+    return w.v;
+}

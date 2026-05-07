@@ -1,0 +1,26 @@
+extern fn putchar(c: i32) -> i32;
+extern fn abs(x: i32) -> i32;
+
+class Stat { tag: i64, count: i32, max_abs: i32 }
+
+fn main() -> i32 {
+    let s = Stat { .tag = 9999999999, .count = 0, .max_abs = 0 };
+    for i in 1..=5 {
+        s.count = s.count + 1;
+        let m1: i32 = abs(i);
+        if m1 > s.max_abs { s.max_abs = m1; }
+        s.count = s.count + 1;
+        let m2: i32 = abs(-i);
+        if m2 > s.max_abs { s.max_abs = m2; }
+    }
+    if s.tag == 9999999999 {
+        if s.count == 10 {
+            if s.max_abs == 5 {
+                putchar(33);
+                putchar(10);
+                return 42;
+            }
+        }
+    }
+    return 0;
+}

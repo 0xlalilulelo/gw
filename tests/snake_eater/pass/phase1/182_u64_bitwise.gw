@@ -1,0 +1,7 @@
+fn main() -> i32 {
+    let x: u64 = 0xFF00FF00;
+    let y: u64 = 0x00FF00FF;
+    let z: u64 = x | y;
+    if z == 0xFFFFFFFF { return 42; }
+    return 0;
+}

@@ -1,0 +1,6 @@
+fn main() -> i32 {
+    let x: i64 = 1;
+    let r: i64 = x << 40;
+    if r == 1099511627776 { return 42; }
+    return 0;
+}

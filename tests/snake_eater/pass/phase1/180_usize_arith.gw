@@ -1,0 +1,9 @@
+fn main() -> i32 {
+    let s: []u8 = "abcdef";
+    let half: usize = s.len / 2;
+    let twice: usize = s.len * 2;
+    if half == 3 {
+        if twice == 12 { return 42; }
+    }
+    return 0;
+}

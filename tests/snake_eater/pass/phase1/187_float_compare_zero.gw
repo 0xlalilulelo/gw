@@ -1,0 +1,7 @@
+fn main() -> i32 {
+    let x: f64 = 0.0001;
+    if x > 0.0 {
+        if x < 1.0 { return 42; }
+    }
+    return 0;
+}

@@ -1,0 +1,19 @@
+fn check(n: i32) -> i32 {
+    if n > 0 {
+        if n < 100 {
+            if n % 2 == 0 {
+                if n > 10 {
+                    return 42;
+                }
+                return 1;
+            }
+            return 2;
+        }
+        return 3;
+    }
+    return 4;
+}
+
+fn main() -> i32 {
+    return check(20);
+}

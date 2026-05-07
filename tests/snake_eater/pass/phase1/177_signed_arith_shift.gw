@@ -1,0 +1,6 @@
+fn main() -> i32 {
+    let neg: i32 = -16;
+    let r: i32 = neg >> 2;
+    if r == -4 { return 42; }
+    return 0;
+}

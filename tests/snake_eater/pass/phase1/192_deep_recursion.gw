@@ -1,0 +1,8 @@
+fn count_down(n: i32) -> i32 {
+    if n == 0 { return 42; }
+    return count_down(n - 1);
+}
+
+fn main() -> i32 {
+    return count_down(100);
+}

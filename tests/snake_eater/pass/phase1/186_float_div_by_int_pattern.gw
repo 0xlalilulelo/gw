@@ -1,0 +1,7 @@
+fn main() -> i32 {
+    let total: f64 = 100.0;
+    let parts: f64 = 4.0;
+    let avg: f64 = total / parts;
+    if avg == 25.0 { return 42; }
+    return 0;
+}

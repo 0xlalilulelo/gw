@@ -1,0 +1,6 @@
+fn main() -> i32 {
+    let z: f64 = 0.0;
+    let nz: f64 = -0.0;
+    if z == nz { return 42; }
+    return 0;
+}

@@ -859,34 +859,64 @@ fn check_expr<'a>(expr: Expr<'a>, expected: Ty, cx: &mut Cx<'a, '_, '_, '_>) -> 
 /// shape (compound expressions, mismatched kinds, error contexts) so
 /// the caller falls back to the default synthesise-then-check path.
 ///
-/// Negative literals are parsed as `Unary(Minus, IntLit)` and so do
-/// not enter this path; an explicitly-typed `let x: i8 = -1;` keeps
-/// using the standard check.
+/// Negative literals (`-7`) parse as `Unary(Minus, IntLit)`; this
+/// helper recognises that shape and parses the literal as a negative
+/// value, so `let n: i64 = -100;` and `if x == -100` both narrow.
+/// Float negation works the same way.
 fn try_narrow_literal<'a>(expr: Expr<'a>, expected: Ty, cx: &mut Cx<'a, '_, '_, '_>) -> Option<Ty> {
     if expected == Ty::Error {
         return None;
     }
-    let lit = match expr {
-        Expr::Literal(l) => l,
+    // Recognise both bare `Literal` and `Unary(Minus, Literal)` shapes.
+    // Paren wrappers also pass through so `(-7)` narrows like `-7`.
+    let (lit, negate, outer_span) = match expr {
+        Expr::Literal(l) => (l, false, l.syntax().span),
+        Expr::Unary(u) => match (u.op_kind(), u.operand()) {
+            (Some(SyntaxKind::Minus), Some(Expr::Literal(l))) => (l, true, u.syntax().span),
+            _ => return None,
+        },
+        Expr::Paren(p) => return try_narrow_literal(p.inner()?, expected, cx),
         _ => return None,
     };
     let (kind, span) = lit.token()?;
     match (kind, expected) {
         (SyntaxKind::IntLit, Ty::Int(target)) => {
             let raw = cx.sm.slice(span)?;
-            let value = parse_unsigned_int_literal(raw)?;
+            let mut value = parse_unsigned_int_literal(raw)?;
+            if negate {
+                value = -value;
+            }
             if value_fits_int(value, target) {
+                if negate {
+                    // Record the inner literal's type too, so MIR's
+                    // `lower_literal` produces the right `IntTy`.
+                    cx.tm
+                        .expr_types
+                        .insert(NodePtr(lit.syntax()), Ty::Int(target));
+                }
                 Some(Ty::Int(target))
             } else {
+                let display = if negate {
+                    format!("-{raw}")
+                } else {
+                    raw.to_string()
+                };
                 cx.diags.push(Diagnostic::error(
                     ec::TYPE_MISMATCH,
-                    Label::new(span, ""),
-                    format!("integer literal `{raw}` does not fit in `{expected}`"),
+                    Label::new(outer_span, ""),
+                    format!("integer literal `{display}` does not fit in `{expected}`"),
                 ));
                 Some(Ty::Error)
             }
         }
-        (SyntaxKind::FloatLit, Ty::Float(_)) => Some(expected),
+        (SyntaxKind::FloatLit, Ty::Float(target)) => {
+            if negate {
+                cx.tm
+                    .expr_types
+                    .insert(NodePtr(lit.syntax()), Ty::Float(target));
+            }
+            Some(Ty::Float(target))
+        }
         _ => None,
     }
 }
@@ -1101,10 +1131,11 @@ fn synth_binop_operands<'a>(b: BinaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> (
     }
 }
 
-/// Whether `e` is a bare integer or float literal, possibly wrapped in
-/// parentheses. Used by [`synth_binop_operands`] to recognise the
-/// narrowable side. Negated literals (`-7`) are `Unary(Minus, IntLit)`
-/// and don't count — that path keeps using the default synth logic.
+/// Whether `e` is a bare integer or float literal — possibly wrapped
+/// in parentheses, or prefixed with a unary minus. Used by
+/// [`synth_binop_operands`] to recognise the narrowable side; the
+/// minus arm covers shapes like `if x == -100` so the literal narrows
+/// against `x`'s type.
 fn is_free_numeric_literal(e: Expr<'_>) -> bool {
     match e {
         Expr::Literal(l) => matches!(
@@ -1112,6 +1143,19 @@ fn is_free_numeric_literal(e: Expr<'_>) -> bool {
             Some(SyntaxKind::IntLit | SyntaxKind::FloatLit)
         ),
         Expr::Paren(p) => p.inner().is_some_and(is_free_numeric_literal),
+        Expr::Unary(u) => {
+            matches!(u.op_kind(), Some(SyntaxKind::Minus))
+                && u.operand().is_some_and(|inner| {
+                    matches!(
+                        inner,
+                        Expr::Literal(l)
+                            if matches!(
+                                l.token_kind(),
+                                Some(SyntaxKind::IntLit | SyntaxKind::FloatLit)
+                            )
+                    )
+                })
+        }
         _ => false,
     }
 }
@@ -1891,5 +1935,33 @@ mod tests {
         let src = "fn g(n: i64) -> i64 { return n; }
                    fn f() -> i32 { let r: i64 = g(42); return 0; }";
         assert_eq!(check(src), 0);
+    }
+
+    /// Negated literals (`Unary(Minus, IntLit)`) narrow alongside bare
+    /// literals. Without this extension, shapes like `let n: i64 = -1;`
+    /// or `if x == -100` (with `x: i64`) reject because the unary
+    /// expression keeps its operand's `i32` synth type.
+    #[test]
+    fn negated_literal_narrows() {
+        assert_eq!(check("fn f() -> i32 { let n: i64 = -1; return 0; }"), 0);
+        assert_eq!(
+            check(
+                "fn f(x: i64) -> i32 {
+                    if x == -100 { return 1; }
+                    return 0;
+                }"
+            ),
+            0
+        );
+        // Out-of-range still diagnoses; the message uses the negated form.
+        assert!(check("fn f() -> i32 { let n: i8 = -200; return 0; }") >= 1);
+    }
+
+    /// Paren-wrapped literals narrow through the parens, so users can
+    /// write `(-7)` or `(42)` interchangeably with the bare form.
+    #[test]
+    fn paren_wrapped_literal_narrows() {
+        assert_eq!(check("fn f() -> i32 { let n: i64 = (42); return 0; }"), 0);
+        assert_eq!(check("fn f() -> i32 { let n: i64 = (-1); return 0; }"), 0);
     }
 }
