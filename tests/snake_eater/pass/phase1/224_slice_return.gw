@@ -1,0 +1,10 @@
+// Phase 1 increment A.4: slice-typed return via hidden out-pointer.
+// `make()` writes the slice's `(data, len)` pair into the caller's
+// stack slot through the hidden out-pointer; `s.len` then reads it.
+fn make() -> []u8 {
+    return "abc";
+}
+fn main() -> i32 {
+    let s: []u8 = make();
+    return s.len as i32;
+}

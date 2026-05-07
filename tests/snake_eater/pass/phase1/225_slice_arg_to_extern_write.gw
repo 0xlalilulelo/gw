@@ -1,0 +1,15 @@
+// Phase 1 increment A.4: factor the canonical Print pattern into
+// a helper that takes a `[]u8` parameter. Pre-A.4 this required
+// inlining the `write(1, s.data, s.len)` call at every print
+// site; A.4 lets the helper carry the slice through the ABI.
+extern fn write(fd: i32, buf: *u8, count: usize) -> isize;
+fn print_slice(s: []u8) -> u0 {
+    write(1, s.data, s.len);
+}
+fn main() -> i32 {
+    let hello: []u8 = "Hello, ";
+    let world: []u8 = "World!\n";
+    print_slice(hello);
+    print_slice(world);
+    return 0;
+}

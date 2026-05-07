@@ -464,15 +464,9 @@ fn check_fn_signature(
                     Ty::Error
                 }
             };
-            // Class-typed params are accepted via the by-pointer ABI
-            // landed in increment A.3. Slice-typed params follow in A.4.
-            if matches!(ty, Ty::Slice(_)) {
-                diags.push(Diagnostic::error(
-                    ec::UNSUPPORTED_CONSTRUCT,
-                    Label::new(p.span(), ""),
-                    "slice-typed parameters are not yet supported in Phase 1",
-                ));
-            }
+            // Class- and slice-typed params share the by-pointer ABI
+            // (classes landed in A.3, slices in A.4 — both flow as
+            // aggregates through `is_aggregate_ty` in codegen).
             // Raw pointers (`*T`) are only allowed at the FFI boundary —
             // i.e. `extern fn` declarations. Cross-fn pointer flow inside
             // user code is deferred to a later increment along with the
@@ -502,21 +496,14 @@ fn check_fn_signature(
             Ty::Error
         }
     };
-    // Class-typed returns are accepted via the by-pointer ABI from
-    // increment A.3 (hidden out-pointer). Slice-typed returns follow
-    // in A.4 — see the slice-return rejection below.
+    // Class- and slice-typed returns are accepted via the by-pointer
+    // ABI (hidden out-pointer; classes A.3, slices A.4). Pointers
+    // remain extern-only until the memory model lands.
     if matches!(ret, Ty::Ptr(_)) && !is_extern {
         diags.push(Diagnostic::error(
             ec::UNSUPPORTED_CONSTRUCT,
             Label::new(fn_decl.span(), ""),
             "raw pointer return types are only allowed in `extern fn` declarations in Phase 1",
-        ));
-    }
-    if matches!(ret, Ty::Slice(_)) {
-        diags.push(Diagnostic::error(
-            ec::UNSUPPORTED_CONSTRUCT,
-            Label::new(fn_decl.span(), ""),
-            "slice-typed return values are not yet supported in Phase 1",
         ));
     }
     FnSig { params, ret }
@@ -1861,9 +1848,12 @@ mod tests {
         assert!(check("fn f() -> i32 { let s: []i32; return 0; }") >= 1);
     }
 
+    /// Pre-A.4 a `[]u8` parameter rejected with UNSUPPORTED_CONSTRUCT.
+    /// A.4 enables it via the by-pointer ABI; this test now pins the
+    /// inverse — that the previously-rejected shape compiles cleanly.
     #[test]
-    fn slice_typed_param_diagnoses() {
-        assert!(check("fn g(s: []u8) -> i32 { return 0; }") >= 1);
+    fn slice_typed_param_now_typechecks() {
+        assert_eq!(check("fn g(s: []u8) -> i32 { return 0; }"), 0);
     }
 
     // ─── Phase 1 increment 11c: raw pointers + implicit Print ─────────────
@@ -2085,9 +2075,21 @@ mod tests {
         assert_eq!(check(src), 0);
     }
 
-    /// Slice-typed params and returns still reject — A.4 lifts those.
+    // ─── Phase 1 increment A.4: slice-by-pointer ABI ──────────────────────
+
     #[test]
-    fn slice_typed_param_still_diagnoses() {
-        assert!(check("fn f(s: []u8) -> i32 { return 0; } fn main() -> i32 { return 0; }") >= 1);
+    fn slice_typed_param_typechecks_clean() {
+        // Pre-A.4 this rejected with UNSUPPORTED_CONSTRUCT.
+        let src = "fn len_of(s: []u8) -> usize { return s.len; }\n\
+                   fn main() -> i32 { let s: []u8 = \"hi\"; let n: usize = len_of(s); return 0; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn slice_typed_return_typechecks_clean() {
+        // Pre-A.4 this rejected with UNSUPPORTED_CONSTRUCT.
+        let src = "fn make() -> []u8 { return \"abc\"; }\n\
+                   fn main() -> i32 { let s: []u8 = make(); return s.len as i32; }";
+        assert_eq!(check(src), 0);
     }
 }

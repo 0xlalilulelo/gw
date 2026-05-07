@@ -1,0 +1,12 @@
+// Phase 1 increment A.4: slice-typed parameter via the by-pointer
+// ABI. Slices already share the aggregate codegen path with classes
+// (see `is_aggregate_ty` in arsenal_codegen_fast); A.4 only opens
+// the typeck gate.
+fn slice_len(s: []u8) -> usize {
+    return s.len;
+}
+fn main() -> i32 {
+    let s: []u8 = "hello";
+    let n: usize = slice_len(s);
+    return n as i32;
+}

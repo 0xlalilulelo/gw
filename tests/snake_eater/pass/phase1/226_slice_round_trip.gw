@@ -1,0 +1,15 @@
+// Phase 1 increment A.4: slice flows through both the param and
+// return ABI in the same call chain. `pick_first` returns one of
+// its two slice params; the caller reads its len. Verifies that
+// `Operand::Local(slice_local)` works as both an aggregate arg
+// and an aggregate return.
+fn pick_first(a: []u8, b: []u8) -> []u8 {
+    let _unused: usize = b.len;
+    return a;
+}
+fn main() -> i32 {
+    let a: []u8 = "ab";
+    let b: []u8 = "cdefg";
+    let r: []u8 = pick_first(a, b);
+    return r.len as i32;
+}
