@@ -447,6 +447,8 @@ pub enum Expr<'a> {
     StructLit(StructLitExpr<'a>),
     /// `recv.field` — field access (read).
     Field(FieldExpr<'a>),
+    /// `expr as Type` — explicit value cast (spec §5.4.4).
+    Cast(CastExpr<'a>),
     /// Recognised expression kind without a typed view yet.
     Stub(&'a SyntaxNode<'a>),
     /// Parser-recovery node.
@@ -473,8 +475,9 @@ impl<'a> Expr<'a> {
             ForExpr => Self::For(self::ForExpr(n)),
             StructLitExpr => Self::StructLit(self::StructLitExpr(n)),
             FieldExpr => Self::Field(self::FieldExpr(n)),
+            CastExpr => Self::Cast(self::CastExpr(n)),
             // Hooks
-            MatchExpr | LoopExpr | IndexExpr | CastExpr | RefExpr | DerefExpr | RangeExpr
+            MatchExpr | LoopExpr | IndexExpr | RefExpr | DerefExpr | RangeExpr
             | OptionalChainExpr | NilCoalesceExpr | MustExpr | FoxdieExpr | CatchExpr | TryExpr
             | AwaitExpr | YieldExpr | ChannelSendExpr | ChannelRecvExpr | LockExpr | NakedExpr
             | RexBlock | ComptimeExpr | IntrinsicCallExpr | AnonAggregateExpr | ArrayLitExpr => {
@@ -503,6 +506,7 @@ impl<'a> Expr<'a> {
             Self::For(e) => e.syntax(),
             Self::StructLit(e) => e.syntax(),
             Self::Field(e) => e.syntax(),
+            Self::Cast(e) => e.syntax(),
             Self::Stub(n) | Self::Error(n) => n,
         }
     }
@@ -1064,6 +1068,35 @@ impl<'a> FieldExpr<'a> {
             }
         }
         None
+    }
+}
+
+/// `expr as Type` — explicit value cast (spec §5.4.4).
+///
+/// Children: an [`Expr`] (the operand), the `as` keyword token, and a
+/// [`Type`] (the target). The parser wraps a previously-parsed atom via
+/// the Pratt loop's postfix-cast arm, so the operand is always the
+/// first child node.
+#[derive(Copy, Clone)]
+pub struct CastExpr<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for CastExpr<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::CastExpr).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> CastExpr<'a> {
+    /// Operand expression (left of `as`).
+    pub fn expr(self) -> Option<Expr<'a>> {
+        self.0.child_nodes().find_map(Expr::cast)
+    }
+    /// Target type (right of `as`).
+    pub fn target_ty(self) -> Option<Type<'a>> {
+        self.0.child_nodes().find_map(Type::cast)
     }
 }
 

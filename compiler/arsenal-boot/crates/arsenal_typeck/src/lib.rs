@@ -26,10 +26,10 @@
 //! lowering can still produce best-effort output.
 
 use arsenal_ast::{
-    AstNode, BinaryExpr, Block, BreakExpr, CallExpr, ClassDecl, ContinueExpr, Expr, ExprStmt,
-    FieldExpr, FnDecl, ForExpr, IfExpr, LetStmt, LiteralExpr, Module, ParenExpr, PathExpr,
-    PathType, Pattern, ReturnExpr, Stmt, StructLitExpr, SyntaxKind, SyntaxNode, Type, UnaryExpr,
-    WhileExpr,
+    AstNode, BinaryExpr, Block, BreakExpr, CallExpr, CastExpr, ClassDecl, ContinueExpr, Expr,
+    ExprStmt, FieldExpr, FnDecl, ForExpr, IfExpr, LetStmt, LiteralExpr, Module, ParenExpr,
+    PathExpr, PathType, Pattern, ReturnExpr, Stmt, StructLitExpr, SyntaxKind, SyntaxNode, Type,
+    UnaryExpr, WhileExpr,
 };
 use arsenal_lex::{DiagBag, Diagnostic, Label, SourceMap, Span};
 use arsenal_resolve::{primitive_type_name, DefId, DefKind, ResolvedModule};
@@ -972,6 +972,7 @@ fn synth_expr<'a>(expr: Expr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
         Expr::For(fe) => synth_for(fe, cx),
         Expr::StructLit(s) => synth_struct_lit(s, cx),
         Expr::Field(f) => synth_field(f, cx),
+        Expr::Cast(c) => synth_cast(c, cx),
         Expr::Stub(n) | Expr::Error(n) => {
             cx.diags.push(Diagnostic::error(
                 ec::UNSUPPORTED_CONSTRUCT,
@@ -1497,6 +1498,42 @@ fn synth_field<'a>(fe: FieldExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     }
 }
 
+/// Type-check `expr as Type`. Phase 1 increment A.1 supports integer-to-
+/// integer casts only; floats land in A.2. Same-width signed↔unsigned
+/// casts are accepted as bit reinterpretations; narrowing casts truncate
+/// silently (no compile-time bounds check, matching Rust / Zig
+/// `@truncate` semantics — the user opted in by writing `as`).
+fn synth_cast<'a>(c: CastExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
+    let src_ty = match c.expr() {
+        Some(e) => synth_expr(e, cx),
+        None => Ty::Error,
+    };
+    let dst_ty = match c.target_ty() {
+        Some(t) => resolve_type(t, cx.tm.resolved, cx.sm, cx.diags),
+        None => Ty::Error,
+    };
+    if matches!(src_ty, Ty::Error) || matches!(dst_ty, Ty::Error) {
+        return Ty::Error;
+    }
+    match (src_ty, dst_ty) {
+        // Int → Int: every combination is legal in A.1. Codegen picks
+        // sextend / uextend / ireduce / no-op based on widths and
+        // operand signedness.
+        (Ty::Int(_), Ty::Int(_)) => dst_ty,
+        _ => {
+            cx.diags.push(Diagnostic::error(
+                ec::UNSUPPORTED_CONSTRUCT,
+                Label::new(c.syntax().span, ""),
+                format!(
+                    "Phase 1 only supports integer-to-integer `as` casts; \
+                     `{src_ty}` to `{dst_ty}` is not yet supported"
+                ),
+            ));
+            Ty::Error
+        }
+    }
+}
+
 fn synth_return<'a>(r: ReturnExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     let expected = cx.expected_ret;
     match r.value() {
@@ -1726,6 +1763,7 @@ fn expr_span(e: Expr<'_>) -> Span {
         Expr::For(x) => x.syntax().span,
         Expr::StructLit(x) => x.syntax().span,
         Expr::Field(x) => x.syntax().span,
+        Expr::Cast(x) => x.syntax().span,
         Expr::Stub(n) | Expr::Error(n) => n.span,
     }
 }
@@ -1963,5 +2001,48 @@ mod tests {
     fn paren_wrapped_literal_narrows() {
         assert_eq!(check("fn f() -> i32 { let n: i64 = (42); return 0; }"), 0);
         assert_eq!(check("fn f() -> i32 { let n: i64 = (-1); return 0; }"), 0);
+    }
+
+    // ─── Phase 1 increment A.1: `as` cast (int↔int) ──────────────────────
+
+    #[test]
+    fn cast_int_widen_typechecks_clean() {
+        assert_eq!(check("fn f(x: i32) -> i64 { return x as i64; }"), 0);
+        assert_eq!(check("fn f(x: u8) -> u32 { return x as u32; }"), 0);
+    }
+
+    #[test]
+    fn cast_int_narrow_typechecks_clean() {
+        // No bounds check; `as` always succeeds at typeck for int↔int.
+        assert_eq!(check("fn f(x: i64) -> i32 { return x as i32; }"), 0);
+    }
+
+    #[test]
+    fn cast_signedness_reinterpret_typechecks_clean() {
+        assert_eq!(check("fn f(x: i32) -> u32 { return x as u32; }"), 0);
+        assert_eq!(check("fn f(x: u8) -> i8 { return x as i8; }"), 0);
+    }
+
+    #[test]
+    fn cast_int_to_bool_diagnoses() {
+        // A.1 explicitly rejects non-int-to-int casts; the diagnostic
+        // text mentions the unsupported pair so users know `as bool` is
+        // not just absent but disallowed.
+        assert!(check("fn f(x: i32) -> bool { return x as bool; }") >= 1);
+    }
+
+    #[test]
+    fn cast_bool_to_int_diagnoses() {
+        assert!(check("fn f() -> i32 { return true as i32; }") >= 1);
+    }
+
+    /// Float casts are deferred to A.2; they currently diagnose with
+    /// the same UNSUPPORTED_CONSTRUCT path as bool casts. This test
+    /// pins that boundary so when A.2 lands, removing the rejection
+    /// becomes the only change.
+    #[test]
+    fn cast_float_pair_diagnoses_until_a2() {
+        assert!(check("fn f(x: f32) -> i32 { return x as i32; }") >= 1);
+        assert!(check("fn f(x: i32) -> f64 { return x as f64; }") >= 1);
     }
 }

@@ -1,0 +1,8 @@
+// Phase 1 increment A.1: unsigned widening zero-extends. `u8(200) as u32`
+// must yield 200, not -56 (which would happen if codegen picked sextend).
+fn main() -> i32 {
+    let small: u8 = 200;
+    let big: u64 = small as u64;
+    if big == 200 { return 0; }
+    return 1;
+}

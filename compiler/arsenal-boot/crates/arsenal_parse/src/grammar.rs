@@ -600,6 +600,14 @@ fn prefix_bp(op: TokenKind) -> Option<u8> {
     })
 }
 
+/// Left binding power of the postfix `as` cast.
+///
+/// Sits between multiplicative (`*`/`/`/`%` at 19/20, `**` at 22/21) and
+/// prefix unary (23): tighter than `*` so `a * b as T` parses as
+/// `a * (b as T)`, but looser than unary so `-1 as u32` parses as
+/// `(-1) as u32`. Same precedence as Rust.
+const AS_CAST_BP: u8 = 22;
+
 fn parse_expr(p: &mut Parser<'_, '_, '_>) {
     parse_expr_bp(p, 0);
 }
@@ -632,6 +640,22 @@ fn parse_expr_bp(p: &mut Parser<'_, '_, '_>, min_bp: u8) {
                 .start_node_at(cp, SyntaxKind::FieldExpr, lhs_start);
             p.bump_any(); // .
             p.expect(TokenKind::Ident);
+            let end = p.cur_byte_start();
+            p.builder.finish_node(end);
+            continue;
+        }
+
+        // Postfix: `as Type` value cast. Bound by `AS_CAST_BP` so it
+        // respects the surrounding precedence; the operand is
+        // whatever the lhs already parsed and the right side is a
+        // type, not an expression.
+        if p.at(TokenKind::KwAs) {
+            if AS_CAST_BP < min_bp {
+                break;
+            }
+            p.builder.start_node_at(cp, SyntaxKind::CastExpr, lhs_start);
+            p.bump_any(); // `as`
+            parse_type(p);
             let end = p.cur_byte_start();
             p.builder.finish_node(end);
             continue;

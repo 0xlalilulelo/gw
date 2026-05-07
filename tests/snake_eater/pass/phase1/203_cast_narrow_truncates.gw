@@ -1,0 +1,7 @@
+// Phase 1 increment A.1: narrowing truncates the low bits silently.
+// 0x_1_0000_0007 i64 → i32 must drop the high word and keep 7.
+fn main() -> i32 {
+    let big: i64 = 4294967303;
+    let small: i32 = big as i32;
+    return small;
+}

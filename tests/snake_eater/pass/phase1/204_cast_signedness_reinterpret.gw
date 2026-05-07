@@ -1,0 +1,13 @@
+// Phase 1 increment A.1: same-width signedness reinterpret is a bit
+// cast. u32(0xFFFFFFFF) viewed as i32 is -1; round-tripping back to
+// u32 yields the original value.
+fn main() -> i32 {
+    let u: u32 = 4294967295;
+    let s: i32 = u as i32;
+    let back: u32 = s as u32;
+    if s == -1 {
+        if back == 4294967295 { return 0; }
+        return 2;
+    }
+    return 1;
+}

@@ -1,0 +1,8 @@
+// Phase 1 increment A.1: signed widening preserves negative values.
+// `i8(-5) as i64` must sign-extend to i64(-5), not zero-extend to 251.
+fn main() -> i32 {
+    let small: i8 = -5;
+    let big: i64 = small as i64;
+    if big == -5 { return 0; }
+    return 1;
+}

@@ -10,7 +10,7 @@
 //! Public entry point: [`compile_program`].
 
 use arsenal_mir::{
-    BinOp, BlockId, Const, Local, MirBlock, MirFn, MirProgram, MirStmt, Operand, Rvalue,
+    BinOp, BlockId, CastKind, Const, Local, MirBlock, MirFn, MirProgram, MirStmt, Operand, Rvalue,
     Terminator, UnOp,
 };
 use arsenal_typeck::{ClassLayout, FloatTy, IntTy, Ty};
@@ -612,6 +612,30 @@ fn lower_rvalue(
             let slot = cx.local_slot[base];
             let load_ty = clif_ty(*field_ty, module).unwrap_or(want_ty);
             fb.ins().stack_load(load_ty, slot, offset)
+        }
+        Rvalue::Cast {
+            kind,
+            operand,
+            src_ty,
+            dst_ty,
+        } => {
+            // Read the operand at the *source* clif type so
+            // sextend/uextend/ireduce see the original width. `clif_ty`
+            // returns I32 as the safe default for non-primitives, but
+            // typeck restricts A.1 cast operands to integers, so the
+            // unwrap_or branch is unreachable on legal input.
+            let src_clif = clif_ty(*src_ty, module).unwrap_or(ir::types::I32);
+            let dst_clif = clif_ty(*dst_ty, module).unwrap_or(want_ty);
+            let v = read_operand(fb, f, operand, cx, src_clif);
+            match kind {
+                CastKind::IntWiden { signed: true } => fb.ins().sextend(dst_clif, v),
+                CastKind::IntWiden { signed: false } => fb.ins().uextend(dst_clif, v),
+                CastKind::IntTrunc => fb.ins().ireduce(dst_clif, v),
+                // Same width, signedness reinterpret: Cranelift integer
+                // types are unsigned-by-bit-pattern, so the operand
+                // value is already correct.
+                CastKind::IntBitcast => v,
+            }
         }
     }
 }

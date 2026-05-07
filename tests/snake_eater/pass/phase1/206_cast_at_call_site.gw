@@ -1,0 +1,12 @@
+// Phase 1 increment A.1: `as` bridges param-type mismatches at the
+// call site. Without `as`, the i32 sum couldn't be passed to a fn
+// expecting i64 (no implicit widening; class/slice ABI for params
+// lands in A.3).
+fn doubled(n: i64) -> i64 {
+    return n + n;
+}
+fn main() -> i32 {
+    let x: i32 = 21;
+    let r: i64 = doubled(x as i64);
+    return r as i32;
+}

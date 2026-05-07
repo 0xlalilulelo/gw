@@ -1,0 +1,9 @@
+// Phase 1 increment A.1: cast chains. i32(300) → i64 (sextend) →
+// i8 (truncate to 0x2C = 44). Verifies that the MIR allocates a
+// fresh local at each cast and that chained casts compose left-to-
+// right without parens.
+fn main() -> i32 {
+    let n: i32 = 300;
+    let small: i8 = n as i64 as i8;
+    return small as i32;
+}

@@ -1,0 +1,8 @@
+// Phase 1 increment A.1: `-1 as u32` parses as `(-1) as u32`, not
+// `-(1 as u32)`. The result is u32::MAX (0xFFFFFFFF). Sanity check on
+// the Pratt precedence between unary and `as`.
+fn main() -> i32 {
+    let m: u32 = -1 as u32;
+    if m == 4294967295 { return 0; }
+    return 1;
+}

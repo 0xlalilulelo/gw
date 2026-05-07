@@ -1,0 +1,11 @@
+// Phase 1 increment A.1: width bridging in arithmetic. Multiplying
+// two i32 values whose product overflows 32-bit must yield the correct
+// 64-bit result when both operands are widened first. Pratt
+// precedence: `a as i64 * b as i64` parses as `(a as i64) * (b as i64)`.
+fn main() -> i32 {
+    let a: i32 = 100000;
+    let b: i32 = 100000;
+    let big: i64 = a as i64 * b as i64;
+    if big == 10000000000 { return 0; }
+    return 1;
+}

@@ -13,9 +13,9 @@
 //! the IR is filled in to support increments 2–6 without churn.
 
 use arsenal_ast::{
-    AstNode, BinaryExpr, Block, CallExpr, Expr, ExprStmt, FieldExpr, FnDecl, ForExpr, IfExpr,
-    LetStmt, LiteralExpr, Module, ParenExpr, PathExpr, Pattern, ReturnExpr, Stmt, StructLitExpr,
-    SyntaxKind, UnaryExpr, WhileExpr,
+    AstNode, BinaryExpr, Block, CallExpr, CastExpr, Expr, ExprStmt, FieldExpr, FnDecl, ForExpr,
+    IfExpr, LetStmt, LiteralExpr, Module, ParenExpr, PathExpr, Pattern, ReturnExpr, Stmt,
+    StructLitExpr, SyntaxKind, UnaryExpr, WhileExpr,
 };
 use arsenal_lex::{SourceMap, Span};
 use arsenal_resolve::{DefId, DefKind, ResolvedModule};
@@ -132,6 +132,36 @@ pub enum Rvalue {
         field_idx: u32,
         field_ty: Ty,
     },
+    /// `expr as Type` value cast. `kind` selects the codegen op;
+    /// `src_ty` is the operand type (so codegen can read at the
+    /// correct Cranelift width) and `dst_ty` is the result type.
+    Cast {
+        kind: CastKind,
+        operand: Operand,
+        src_ty: Ty,
+        dst_ty: Ty,
+    },
+}
+
+/// Kind of a [`Rvalue::Cast`].
+///
+/// Phase 1 increment A.1 covers integer-to-integer only; A.2 will add
+/// `IntToFloat`, `FloatToInt`, `FloatExt`, `FloatTrunc` variants.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum CastKind {
+    /// Source narrower than destination. `signed` tracks the
+    /// **operand**'s signedness, which determines the correct
+    /// extension: `true` → `sextend`, `false` → `uextend`.
+    IntWiden { signed: bool },
+    /// Source wider than destination — codegen lowers to `ireduce`,
+    /// which keeps the low bits and discards the high ones. Lossy by
+    /// construction; the user opted in by writing `as`.
+    IntTrunc,
+    /// Same bit width, signedness reinterpretation only (`i32 as u32`,
+    /// `u8 as i8`). No codegen op needed — Cranelift integer types
+    /// don't carry signedness, so the operand value is reused as-is.
+    IntBitcast,
 }
 
 /// Reference to a value: either a constant or a local.
@@ -903,6 +933,7 @@ fn lower_expr<'a>(
         Expr::For(fe) => lower_for(b, fe, lcx),
         Expr::StructLit(s) => lower_struct_lit(b, s, lcx),
         Expr::Field(fe) => lower_field(b, fe, lcx),
+        Expr::Cast(c) => lower_cast(b, c, lcx),
         Expr::Stub(_) | Expr::Error(_) => Operand::Const(Const::Error),
     }
 }
@@ -1303,6 +1334,61 @@ fn lower_unary<'a>(
         span: u.syntax().span,
     });
     b.push_stmt(MirStmt::Assign { dst: local, value });
+    Operand::Local(local)
+}
+
+/// Lower `expr as Type` to a [`Rvalue::Cast`].
+///
+/// The [`CastKind`] is selected from operand and target widths; this is
+/// the one MIR-side decision (codegen then maps `kind` to a single
+/// Cranelift op). Phase 1 increment A.1 only covers integer-to-integer
+/// casts; floats are deferred to A.2 and produce `Const::Error` here
+/// (typeck has already diagnosed the unsupported combination).
+fn lower_cast<'a>(
+    b: &mut Builder,
+    c: CastExpr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
+) -> Operand {
+    let operand = c
+        .expr()
+        .map(|e| lower_expr(b, e, lcx))
+        .unwrap_or(Operand::Const(Const::Error));
+    let src_ty = c
+        .expr()
+        .and_then(|e| lcx.typed.expr_types.get(&NodePtr(e.syntax())).copied())
+        .unwrap_or(Ty::Error);
+    let dst_ty = lcx
+        .typed
+        .expr_types
+        .get(&NodePtr(c.syntax()))
+        .copied()
+        .unwrap_or(Ty::Error);
+    // Pointer width is 64 on every Phase-1 target; matches the bound
+    // used in `try_narrow_literal`'s `value_fits_int`.
+    const PTR_BITS: u32 = 64;
+    let kind = match (src_ty.int_bits(PTR_BITS), dst_ty.int_bits(PTR_BITS)) {
+        (Some(s), Some(d)) if s < d => CastKind::IntWiden {
+            signed: src_ty.is_signed_int(),
+        },
+        (Some(s), Some(d)) if s > d => CastKind::IntTrunc,
+        (Some(_), Some(_)) => CastKind::IntBitcast,
+        // Typeck has diagnosed; emit a placeholder that codegen will
+        // defuse to a zero constant.
+        _ => return Operand::Const(Const::Error),
+    };
+    let local = b.alloc_local(LocalDecl {
+        ty: dst_ty,
+        span: c.syntax().span,
+    });
+    b.push_stmt(MirStmt::Assign {
+        dst: local,
+        value: Rvalue::Cast {
+            kind,
+            operand,
+            src_ty,
+            dst_ty,
+        },
+    });
     Operand::Local(local)
 }
 
@@ -2033,5 +2119,74 @@ mod tests {
                 "{name}: short-circuit must not emit BinOp::LogAnd / LogOr"
             );
         }
+    }
+
+    // ─── Phase 1 increment A.1: `as` cast lowering ─────────────────────
+
+    fn cast_kind_in(prog: &MirProgram, fn_name: &str) -> CastKind {
+        let func = prog
+            .functions
+            .iter()
+            .find(|f| f.name == fn_name)
+            .expect("fn lowered");
+        for blk in &func.blocks {
+            for stmt in &blk.statements {
+                if let MirStmt::Assign {
+                    value: Rvalue::Cast { kind, .. },
+                    ..
+                } = stmt
+                {
+                    return *kind;
+                }
+            }
+        }
+        panic!("no Rvalue::Cast in {fn_name}");
+    }
+
+    /// Widening signed → wider chooses sign-extension based on the
+    /// **operand**'s signedness, not the destination's.
+    #[test]
+    fn cast_signed_widen_picks_sextend_kind() {
+        let prog = lower_src(
+            "fn ext(x: i8) -> i64 { return x as i64; }
+             fn main() -> i32 { return 0; }",
+        );
+        assert_eq!(
+            cast_kind_in(&prog, "ext"),
+            CastKind::IntWiden { signed: true }
+        );
+    }
+
+    /// Widening unsigned → wider chooses zero-extension.
+    #[test]
+    fn cast_unsigned_widen_picks_uextend_kind() {
+        let prog = lower_src(
+            "fn ext(x: u8) -> u32 { return x as u32; }
+             fn main() -> i32 { return 0; }",
+        );
+        assert_eq!(
+            cast_kind_in(&prog, "ext"),
+            CastKind::IntWiden { signed: false }
+        );
+    }
+
+    /// Narrowing always picks `IntTrunc` regardless of signedness.
+    #[test]
+    fn cast_narrow_picks_trunc_kind() {
+        let prog = lower_src(
+            "fn nar(x: i64) -> i32 { return x as i32; }
+             fn main() -> i32 { return 0; }",
+        );
+        assert_eq!(cast_kind_in(&prog, "nar"), CastKind::IntTrunc);
+    }
+
+    /// Same width different signedness → bit reinterpret, no codegen op.
+    #[test]
+    fn cast_same_width_signedness_picks_bitcast_kind() {
+        let prog = lower_src(
+            "fn rein(x: i32) -> u32 { return x as u32; }
+             fn main() -> i32 { return 0; }",
+        );
+        assert_eq!(cast_kind_in(&prog, "rein"), CastKind::IntBitcast);
     }
 }
