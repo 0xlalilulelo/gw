@@ -969,8 +969,11 @@ fn synth_literal(l: LiteralExpr<'_>, _cx: &mut Cx<'_, '_, '_, '_>) -> Ty {
         Some(SyntaxKind::ByteCharLit) => Ty::Int(IntTy::U8),
         Some(SyntaxKind::StringLit | SyntaxKind::RawStringLit) => Ty::Slice(IntTy::U8),
         Some(SyntaxKind::CStringLit) => {
-            // `c"..."` (null-terminated `[*:0]u8`) is a Phase 2 concern.
-            Ty::Error
+            // C.1: `c"..."` synthesises to `*u8` directly. The
+            // sentinel-aware `[*:0]u8` distinction lands in C.2; until
+            // then the literal's value flows wherever a `*u8` is
+            // accepted (extern fn arg slots first and foremost).
+            Ty::Ptr(IntTy::U8)
         }
         _ => Ty::Error,
     }
@@ -1856,6 +1859,25 @@ mod tests {
     #[test]
     fn non_u8_slice_element_diagnoses() {
         assert!(check("fn f() -> i32 { let s: []i32; return 0; }") >= 1);
+    }
+
+    // ─── Phase 2 increment C.1: c-string literals ─────────────────────────
+
+    #[test]
+    fn cstring_literal_passes_to_extern_ptr_param() {
+        // `c"hi"` synths to `*u8`; flows into an extern param of type
+        // `*u8` without diagnostic.
+        let src = "extern fn puts(s: *u8) -> i32; fn main() -> i32 { puts(c\"hi\"); return 0; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn cstring_literal_does_not_coerce_to_slice() {
+        // C.1 keeps `c"..."` strictly typed as `*u8`; assigning it to
+        // a `[]u8` binding must diagnose. (The reverse — slice-into-
+        // *u8 — already rejects since slices are aggregate-typed.)
+        let src = "fn main() -> i32 { let s: []u8 = c\"hi\"; return 0; }";
+        assert!(check(src) >= 1);
     }
 
     /// Pre-A.4 a `[]u8` parameter rejected with UNSUPPORTED_CONSTRUCT.

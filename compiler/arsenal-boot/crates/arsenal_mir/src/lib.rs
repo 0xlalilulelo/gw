@@ -36,11 +36,20 @@ pub struct MirProgram {
     /// Indices are [`StringLitId`]s. Codegen materialises one Cranelift
     /// data object per entry.
     pub string_literals: Vec<Vec<u8>>,
+    /// Bytes of each c-string literal referenced by [`Const::CStrAddr`].
+    /// Indices are [`CStrLitId`]s. The bytes here exclude the implicit
+    /// trailing NUL — codegen appends it at emission time so the kernel
+    /// /libc consumers see a well-formed `[*:0]u8`.
+    pub cstring_literals: Vec<Vec<u8>>,
 }
 
 /// Index into [`MirProgram::string_literals`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct StringLitId(pub u32);
+
+/// Index into [`MirProgram::cstring_literals`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct CStrLitId(pub u32);
 
 /// One lowered function.
 #[derive(Debug)]
@@ -212,6 +221,12 @@ pub enum Const {
     /// index into [`MirProgram::string_literals`]. Codegen lowers via
     /// `module.declare_data_in_func` + `ins.global_value`.
     DataAddr(StringLitId),
+    /// Pointer-sized address of a NUL-terminated `.rodata` payload (a
+    /// c-string literal). The id is an index into
+    /// [`MirProgram::cstring_literals`]. Codegen materialises a
+    /// separate `__gw_cstr_<i>` data object whose bytes are the
+    /// payload plus an appended `\0`.
+    CStrAddr(CStrLitId),
     /// Placeholder when lowering encountered an error.
     Error,
 }
@@ -339,6 +354,7 @@ pub fn lower<'a>(
 
     let mut functions = Vec::new();
     let mut string_literals: Vec<Vec<u8>> = Vec::new();
+    let mut cstring_literals: Vec<Vec<u8>> = Vec::new();
     for def in &resolved.defs {
         match def.kind {
             DefKind::Fn => {
@@ -355,6 +371,7 @@ pub fn lower<'a>(
                     sm,
                     &def_to_fn,
                     &mut string_literals,
+                    &mut cstring_literals,
                     print_write_fnidx,
                 );
                 functions.push(mir_fn);
@@ -368,6 +385,7 @@ pub fn lower<'a>(
                     sm,
                     &def_to_fn,
                     &mut string_literals,
+                    &mut cstring_literals,
                     print_write_fnidx,
                 );
                 functions.push(mir_fn);
@@ -384,6 +402,7 @@ pub fn lower<'a>(
         functions,
         class_layouts: typed.classes.clone(),
         string_literals,
+        cstring_literals,
     }
 }
 
@@ -530,6 +549,7 @@ fn lower_synthetic_main<'a>(
     sm: &SourceMap,
     def_to_fn: &FxHashMap<DefId, FnIdx>,
     string_literals: &mut Vec<Vec<u8>>,
+    cstring_literals: &mut Vec<Vec<u8>>,
     print_write_fnidx: Option<FnIdx>,
 ) -> MirFn {
     let mut b = Builder::new();
@@ -542,6 +562,7 @@ fn lower_synthetic_main<'a>(
         def_to_fn,
         binding_to_local: FxHashMap::default(),
         string_literals,
+        cstring_literals,
         print_write_fnidx,
     };
     for stmt in module.stmts() {
@@ -577,6 +598,7 @@ fn lower_fn<'a>(
     sm: &SourceMap,
     def_to_fn: &FxHashMap<DefId, FnIdx>,
     string_literals: &mut Vec<Vec<u8>>,
+    cstring_literals: &mut Vec<Vec<u8>>,
     print_write_fnidx: Option<FnIdx>,
 ) -> MirFn {
     let mut b = Builder::new();
@@ -625,6 +647,7 @@ fn lower_fn<'a>(
                 def_to_fn,
                 binding_to_local,
                 string_literals,
+                cstring_literals,
                 print_write_fnidx,
             };
             let _ = lower_block(&mut b, body, &mut lcx);
@@ -752,6 +775,11 @@ struct LowerCx<'a, 'tm, 'sm, 'm, 'sl> {
     /// when it sees a string literal expression and uses the resulting
     /// index as the [`StringLitId`].
     string_literals: &'sl mut Vec<Vec<u8>>,
+    /// Program-level c-string-literal bytes table (no NUL terminator
+    /// stored — codegen appends it). Parallel to `string_literals` so
+    /// the `[]u8` slice path and the `[*:0]u8` c-string path don't
+    /// share dedup keys or emitter state.
+    cstring_literals: &'sl mut Vec<Vec<u8>>,
     /// `FnIdx` of the `write` extern declaration to use for Phase 1
     /// implicit Print desugaring. `None` if the program contains no
     /// statement-position string literals (so `write` was not injected).
@@ -1009,6 +1037,7 @@ fn lower_literal<'a>(
         Some(SyntaxKind::StringLit | SyntaxKind::RawStringLit) => {
             lower_string_literal(b, l, raw, lcx)
         }
+        Some(SyntaxKind::CStringLit) => lower_cstring_literal(raw, lcx),
         // Runes, byte chars — Phase 1 doesn't yet handle.
         _ => Operand::Const(Const::Error),
     }
@@ -1049,6 +1078,29 @@ fn lower_string_literal<'a>(
         })),
     });
     Operand::Local(dst)
+}
+
+/// Lower a `c"..."` literal to a `*u8`-typed pointer at the head of a
+/// `.rodata` payload. The decoded bytes (no implicit NUL) are interned
+/// in `lcx.cstring_literals`; codegen materialises a `__gw_cstr_<i>`
+/// data object whose payload is `bytes ++ "\0"`. The MIR-level value
+/// is just the pointer — no slice / aggregate machinery, since
+/// c-strings are length-implicit.
+fn lower_cstring_literal<'a>(raw: &str, lcx: &mut LowerCx<'a, '_, '_, '_, '_>) -> Operand {
+    let bytes = decode_cstring_literal(raw);
+    let id = CStrLitId(lcx.cstring_literals.len() as u32);
+    lcx.cstring_literals.push(bytes);
+    Operand::Const(Const::CStrAddr(id))
+}
+
+/// Decode a `c"..."` literal token into its raw payload bytes (no
+/// trailing NUL). Strips the `c"` prefix and `"` suffix the lexer
+/// leaves on the token, then defers escape handling to
+/// [`decode_string_literal`] so `c"a\nb"` and `"a\nb"` agree on
+/// payload bytes.
+fn decode_cstring_literal(raw: &str) -> Vec<u8> {
+    let inner = raw.strip_prefix('c').unwrap_or(raw);
+    decode_string_literal(inner)
 }
 
 /// Decode a `"..."` string literal token into its raw bytes. Strips the
@@ -2362,5 +2414,63 @@ mod tests {
             }
         }
         panic!("expected main to contain a Call terminator");
+    }
+
+    // ─── Phase 2 increment C.1: c-string literals ─────────────────────────
+
+    /// `c"..."` literals lower to `Const::CStrAddr(id)` against an
+    /// entry in the program's `cstring_literals` table. The payload
+    /// stored in the table excludes the implicit NUL terminator;
+    /// codegen appends it. The slice path (`"..."` → `Const::DataAddr`
+    /// + `string_literals`) stays untouched.
+    #[test]
+    fn cstring_literal_interns_payload_without_nul() {
+        let prog = lower_src(
+            "extern fn puts(s: *u8) -> i32;\n\
+             fn main() -> i32 { puts(c\"hi\"); return 0; }",
+        );
+        assert_eq!(prog.cstring_literals.len(), 1);
+        assert_eq!(prog.cstring_literals[0], b"hi".to_vec());
+        // No slice literals were lowered; the slice table stays empty.
+        assert!(prog.string_literals.is_empty());
+
+        let main = prog
+            .functions
+            .iter()
+            .find(|f| f.name == "main")
+            .expect("main lowered");
+        let used_cstr = main.blocks.iter().any(|b| {
+            b.statements.iter().any(|s| {
+                matches!(
+                    s,
+                    MirStmt::Assign {
+                        value: Rvalue::Use(Operand::Const(Const::CStrAddr(_))),
+                        ..
+                    }
+                )
+            }) || matches!(
+                &b.terminator,
+                Terminator::Call { args, .. }
+                    if args.iter().any(|a| matches!(a, Operand::Const(Const::CStrAddr(_))))
+            )
+        });
+        assert!(
+            used_cstr,
+            "main should reference the c-string via Const::CStrAddr"
+        );
+    }
+
+    /// Slice and c-string literals live in disjoint tables — same
+    /// payload bytes, different `Const` variants, no shared dedup.
+    #[test]
+    fn slice_and_cstring_literals_are_disjoint_tables() {
+        let prog = lower_src(
+            "extern fn puts(s: *u8) -> i32;\n\
+             fn main() -> i32 { let s: []u8 = \"hi\"; puts(c\"hi\"); return 0; }",
+        );
+        assert_eq!(prog.string_literals.len(), 1);
+        assert_eq!(prog.cstring_literals.len(), 1);
+        assert_eq!(prog.string_literals[0], b"hi".to_vec());
+        assert_eq!(prog.cstring_literals[0], b"hi".to_vec());
     }
 }

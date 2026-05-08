@@ -164,6 +164,25 @@ pub fn compile_program(
         string_globals.push(global);
     }
 
+    // Pass 1c: parallel pass for c-string literals (Phase 2 increment
+    // C.1). Each global's payload is `bytes ++ "\0"` so the address
+    // emitted by `Const::CStrAddr` already points at a well-formed
+    // `[*:0]u8`. `__gw_cstr_<i>` symbol prefix mirrors the Cranelift
+    // backend.
+    let mut cstring_globals: Vec<GlobalValue<'_>> = Vec::with_capacity(prog.cstring_literals.len());
+    for (i, bytes) in prog.cstring_literals.iter().enumerate() {
+        let mut payload = Vec::with_capacity(bytes.len() + 1);
+        payload.extend_from_slice(bytes);
+        payload.push(0);
+        let const_str = context.const_string(&payload, false);
+        let global = module.add_global(const_str.get_type(), None, &format!("__gw_cstr_{i}"));
+        global.set_initializer(&const_str);
+        global.set_constant(true);
+        global.set_linkage(Linkage::Private);
+        global.set_unnamed_addr(true);
+        cstring_globals.push(global);
+    }
+
     // Pass 2: define non-extern bodies.
     for (i, f) in prog.functions.iter().enumerate() {
         if f.is_extern {
@@ -176,6 +195,7 @@ pub fn compile_program(
             fn_values[i],
             &fn_values,
             &string_globals,
+            &cstring_globals,
             prog,
         )?;
     }
@@ -214,6 +234,9 @@ struct LoweringCx<'ctx, 'a> {
     /// Global values for each string literal, indexed by `StringLitId`.
     /// `Const::DataAddr(id)` reads its address.
     string_globals: &'a [GlobalValue<'ctx>],
+    /// Global values for each c-string literal, indexed by `CStrLitId`.
+    /// `Const::CStrAddr(id)` reads its address.
+    cstring_globals: &'a [GlobalValue<'ctx>],
     prog: &'a MirProgram,
     /// Hidden out-pointer for aggregate-returning fns, captured at fn
     /// entry from the prepended LLVM param. Used by `Terminator::Return`
@@ -335,6 +358,7 @@ fn define_fn<'ctx>(
     function: FunctionValue<'ctx>,
     fn_values: &[FunctionValue<'ctx>],
     string_globals: &[GlobalValue<'ctx>],
+    cstring_globals: &[GlobalValue<'ctx>],
     prog: &MirProgram,
 ) -> Result<(), CodegenError> {
     // Pointer width — Phase-1 targets are all 64-bit (HANDOFF #16 /
@@ -452,6 +476,7 @@ fn define_fn<'ctx>(
         bbs,
         fn_values,
         string_globals,
+        cstring_globals,
         prog,
         ret_out_ptr,
         ptr_bytes,
@@ -1073,6 +1098,16 @@ fn emit_const<'ctx>(
                     "Const::DataAddr({}) but only {} string globals declared",
                     id.0,
                     cx.string_globals.len()
+                ))
+            })?;
+            Ok(global.as_pointer_value().into())
+        }
+        Const::CStrAddr(id) => {
+            let global = cx.cstring_globals.get(id.0 as usize).ok_or_else(|| {
+                CodegenError::Builder(format!(
+                    "Const::CStrAddr({}) but only {} c-string globals declared",
+                    id.0,
+                    cx.cstring_globals.len()
                 ))
             })?;
             Ok(global.as_pointer_value().into())

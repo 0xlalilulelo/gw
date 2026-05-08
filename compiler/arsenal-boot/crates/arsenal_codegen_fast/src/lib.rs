@@ -134,6 +134,33 @@ pub fn compile_program(
         data_ids.push(id);
     }
 
+    // Pass 1c: same shape, parallel table for c-string literals (Phase 2
+    // increment C.1). Each entry's payload is `bytes ++ "\0"` so the
+    // address handed out by `Const::CStrAddr` already points at a
+    // well-formed `[*:0]u8`. Symbol names use `__gw_cstr_<i>` to keep
+    // them visually distinct from `__gw_str_<i>` slice payloads.
+    let mut cstr_data_ids: Vec<DataId> = Vec::with_capacity(prog.cstring_literals.len());
+    for (i, bytes) in prog.cstring_literals.iter().enumerate() {
+        let name = format!("__gw_cstr_{i}");
+        let id = module
+            .declare_data(
+                &name,
+                Linkage::Local,
+                /* writable */ false,
+                /* tls */ false,
+            )
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        let mut desc = DataDescription::new();
+        let mut payload = Vec::with_capacity(bytes.len() + 1);
+        payload.extend_from_slice(bytes);
+        payload.push(0);
+        desc.define(payload.into_boxed_slice());
+        module
+            .define_data(id, &desc)
+            .map_err(|e| CodegenError::Module(e.to_string()))?;
+        cstr_data_ids.push(id);
+    }
+
     // Pass 2: define each non-extern function.
     let mut ctx = module.make_context();
     let mut fbctx = FunctionBuilderContext::new();
@@ -148,6 +175,7 @@ pub fn compile_program(
             &mut module,
             &fn_ids,
             &data_ids,
+            &cstr_data_ids,
             prog,
             f,
         )?;
@@ -341,12 +369,14 @@ fn clif_ty(ty: Ty, module: &ObjectModule) -> Option<ir::Type> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn define_fn(
     ctx: &mut Context,
     fbctx: &mut FunctionBuilderContext,
     module: &mut ObjectModule,
     fn_ids: &[cranelift_module::FuncId],
     data_ids: &[DataId],
+    cstr_data_ids: &[DataId],
     prog: &MirProgram,
     f: &MirFn,
 ) -> Result<(), CodegenError> {
@@ -398,6 +428,11 @@ fn define_fn(
         let gv = module.declare_data_in_func(did, builder.func);
         data_gvs.push(gv);
     }
+    let mut cstr_data_gvs: Vec<ir::GlobalValue> = Vec::with_capacity(cstr_data_ids.len());
+    for &did in cstr_data_ids {
+        let gv = module.declare_data_in_func(did, builder.func);
+        cstr_data_gvs.push(gv);
+    }
 
     // Allocate one Cranelift Block per MIR block.
     let mut clif_block: FxHashMap<BlockId, ir::Block> = FxHashMap::default();
@@ -445,6 +480,7 @@ fn define_fn(
         clif_block: &clif_block,
         fn_ids,
         data_gvs: &data_gvs,
+        cstr_data_gvs: &cstr_data_gvs,
         ret_out_ptr,
     };
     for (i, mir_block) in f.blocks.iter().enumerate() {
@@ -501,6 +537,9 @@ struct LoweringCx<'a> {
     /// One [`ir::GlobalValue`] per [`StringLitId`], pre-declared in this
     /// function's scope so `Const::DataAddr` lowers without `&mut module`.
     data_gvs: &'a [ir::GlobalValue],
+    /// One [`ir::GlobalValue`] per [`CStrLitId`], same shape and same
+    /// reason — `Const::CStrAddr` reads from this slice.
+    cstr_data_gvs: &'a [ir::GlobalValue],
     /// Hidden out-pointer block_param, if this function returns an
     /// aggregate (Phase 1 increment A.3 / A.4). At return time we
     /// field-by-field copy the result slot into `*out_ptr` and return
@@ -878,6 +917,10 @@ fn emit_const(
             // sized value via the pre-declared GlobalValue cached in
             // `cx.data_gvs`.
             let gv = cx.data_gvs[id.0 as usize];
+            fb.ins().global_value(cx.ptr_ty(), gv)
+        }
+        Const::CStrAddr(id) => {
+            let gv = cx.cstr_data_gvs[id.0 as usize];
             fb.ins().global_value(cx.ptr_ty(), gv)
         }
         Const::Unit | Const::Error => fb.ins().iconst(want, 0),
