@@ -1,0 +1,12 @@
+fn pick(b: bool) -> i32 {
+    return match b {
+        true => 11,
+        false => 22,
+    };
+}
+
+fn main() -> i32 {
+    let a: i32 = pick(true);
+    let b: i32 = pick(false);
+    return a + b;
+}

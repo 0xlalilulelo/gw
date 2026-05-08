@@ -1632,13 +1632,31 @@ fn synth_match<'a>(m: MatchExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     };
     let mut result_ty: Option<Ty> = None;
     let mut has_wildcard = false;
+    let mut has_true = false;
+    let mut has_false = false;
     let mut arm_count: u32 = 0;
     for arm in arms_node.arms() {
         arm_count += 1;
         if let Some(pat) = arm.pattern() {
             check_match_pattern(pat, scrutinee_ty, cx);
-            if matches!(pat, Pattern::Wildcard(_)) {
-                has_wildcard = true;
+            match pat {
+                Pattern::Wildcard(_) => has_wildcard = true,
+                // For Ty::Bool scrutinees, track whether `true` and
+                // `false` patterns are both present so the
+                // exhaustiveness rule below can accept the wildcard-
+                // free form. The `if scrutinee_ty == Ty::Bool` guard
+                // is the easy way to combine the type check with the
+                // pattern shape match without nesting `if let`s.
+                Pattern::Literal(lp) if scrutinee_ty == Ty::Bool => {
+                    if let Some(b) = lp.value().and_then(bool_literal_value) {
+                        if b {
+                            has_true = true;
+                        } else {
+                            has_false = true;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         if let Some(body) = arm.body() {
@@ -1658,16 +1676,33 @@ fn synth_match<'a>(m: MatchExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
             "`match` requires at least one arm",
         ));
     }
-    if !has_wildcard && scrutinee_ty != Ty::Error && arm_count > 0 {
+    let bool_exhaustive = scrutinee_ty == Ty::Bool && has_true && has_false;
+    if !has_wildcard && !bool_exhaustive && scrutinee_ty != Ty::Error && arm_count > 0 {
         cx.diags.push(Diagnostic::error(
             ec::UNSUPPORTED_CONSTRUCT,
             Label::new(m.syntax().span, ""),
             format!(
-                "match on `{scrutinee_ty}` is not exhaustive; Phase 2 requires a `_` arm to cover any uncovered values"
+                "match on `{scrutinee_ty}` is not exhaustive; Phase 2 requires either a `_` arm or (for `bool`) both `true` and `false` arms"
             ),
         ));
     }
     result_ty.unwrap_or(Ty::Error)
+}
+
+/// Recognise a `true`/`false` literal expression. Used by `synth_match`'s
+/// bool-exhaustiveness check. Returns `None` for anything else (other
+/// literal kinds, parens, paths, …).
+fn bool_literal_value(expr: Expr<'_>) -> Option<bool> {
+    let lit = match expr {
+        Expr::Literal(l) => l,
+        Expr::Paren(p) => return p.inner().and_then(bool_literal_value),
+        _ => return None,
+    };
+    match lit.token_kind()? {
+        SyntaxKind::KwTrue => Some(true),
+        SyntaxKind::KwFalse => Some(false),
+        _ => None,
+    }
 }
 
 /// Validate one match-arm pattern against the scrutinee type.
@@ -1694,12 +1729,18 @@ fn check_match_pattern<'a>(pat: Pattern<'a>, scrut_ty: Ty, cx: &mut Cx<'a, '_, '
                 // `Unary(Minus, IntLit)` shapes against the scrutinee
                 // width — same path used at `let n: i64 = -100;`.
                 check_expr(value, scrut_ty, cx);
+            } else if scrut_ty == Ty::Bool {
+                // Phase 2 M.2: `true` / `false` patterns against a
+                // bool scrutinee. `check_expr(value, Ty::Bool, ...)`
+                // synthesises the literal as bool and diagnoses any
+                // other shape.
+                check_expr(value, scrut_ty, cx);
             } else if scrut_ty != Ty::Error {
                 cx.diags.push(Diagnostic::error(
                     ec::TYPE_MISMATCH,
                     Label::new(lp.syntax().span, ""),
                     format!(
-                        "literal pattern can't match scrutinee of type `{scrut_ty}` in Phase 2 M.1"
+                        "literal pattern can't match scrutinee of type `{scrut_ty}` in Phase 2"
                     ),
                 ));
             }
@@ -2164,6 +2205,41 @@ mod tests {
         // should diagnose against the first arm's `i32` type.
         let src = "fn f(x: i32) -> i32 { return match x { 0 => 1, _ => true }; }";
         assert!(check(src) >= 1);
+    }
+
+    // ─── Phase 2 increment M.2: bool match + statement-position match ─────
+
+    #[test]
+    fn match_bool_with_both_arms_is_exhaustive_without_wildcard() {
+        // Bool scrutinee + true + false arms — no `_` required.
+        let src = "fn pick(b: bool) -> i32 { return match b { true => 1, false => 0 }; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn match_bool_missing_one_arm_diagnoses() {
+        // Only `true`, no `false`, no `_` — exhaustiveness fires.
+        let src = "fn pick(b: bool) -> i32 { return match b { true => 1 }; }";
+        assert!(check(src) >= 1);
+    }
+
+    #[test]
+    fn match_bool_with_wildcard_still_works() {
+        let src = "fn pick(b: bool) -> i32 { return match b { true => 1, _ => 0 }; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn match_at_statement_position_yields_unit() {
+        // Stmt-position match: arm bodies are unit-shaped (here, a
+        // discarded extern call result). The match expression itself
+        // is consumed by `ExprStmt` and produces no value.
+        let src = "extern fn putchar(c: i32) -> i32;\n\
+                   fn shout(n: i32) {\n\
+                       match n { 0 => putchar(65), _ => putchar(63) };\n\
+                   }\n\
+                   fn main() -> i32 { shout(0); return 0; }";
+        assert_eq!(check(src), 0);
     }
 
     /// Pre-A.4 a `[]u8` parameter rejected with UNSUPPORTED_CONSTRUCT.

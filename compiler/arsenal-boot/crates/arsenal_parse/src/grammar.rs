@@ -936,13 +936,13 @@ fn parse_match_pattern(p: &mut Parser<'_, '_, '_>) {
             let end = p.cur_byte_start();
             p.builder.finish_node(end);
         }
-        TokenKind::IntLit | TokenKind::Minus => {
+        TokenKind::IntLit | TokenKind::Minus | TokenKind::KwTrue | TokenKind::KwFalse => {
             // `LiteralPat` wraps the literal expression. `parse_expr`
-            // is overpowered for M.1's needs (which only accepts
-            // `IntLit` / `-IntLit`), but typeck rejects richer shapes
-            // with UNSUPPORTED_CONSTRUCT, and reusing the expression
-            // parser keeps the precedence story uniform if M.3 widens
-            // patterns later.
+            // is overpowered for the supported shapes (typeck only
+            // accepts `IntLit` / `-IntLit` / `true` / `false`), but
+            // richer shapes diagnose with UNSUPPORTED_CONSTRUCT and
+            // reusing the expression parser keeps the precedence
+            // story uniform if M.3 widens patterns later.
             p.builder.start_node(SyntaxKind::LiteralPat, start);
             parse_expr(p);
             let end = p.cur_byte_start();
@@ -953,7 +953,7 @@ fn parse_match_pattern(p: &mut Parser<'_, '_, '_>) {
             p.error(
                 ec::EXPECTED_PATTERN,
                 span,
-                "expected a pattern (`_`, identifier, or integer literal)",
+                "expected a pattern (`_`, identifier, integer literal, or `true`/`false`)",
             );
             p.builder.start_node(SyntaxKind::ErrorNode, start);
             let end = p.cur_byte_start();

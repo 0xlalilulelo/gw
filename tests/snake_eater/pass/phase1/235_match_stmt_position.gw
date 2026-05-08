@@ -1,0 +1,17 @@
+extern fn putchar(c: i32) -> i32;
+
+fn shout(n: i32) {
+    match n {
+        0 => putchar(65),
+        1 => putchar(66),
+        _ => putchar(63),
+    };
+}
+
+fn main() -> i32 {
+    shout(0);
+    shout(1);
+    shout(99);
+    putchar(10);
+    return 0;
+}
