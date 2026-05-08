@@ -1,0 +1,16 @@
+fn signed_classify(x: i32) -> i32 {
+    return match x {
+        -3 => 30,
+        -1 => 10,
+        0 => 0,
+        1 => 11,
+        _ => 99,
+    };
+}
+
+fn main() -> i32 {
+    let a: i32 = signed_classify(-3);
+    let b: i32 = signed_classify(-1);
+    let c: i32 = signed_classify(7);
+    return a + b + c;
+}

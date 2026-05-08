@@ -14,8 +14,8 @@
 
 use arsenal_ast::{
     AstNode, BinaryExpr, Block, CallExpr, CastExpr, Expr, ExprStmt, FieldExpr, FnDecl, ForExpr,
-    IfExpr, LetStmt, LiteralExpr, Module, ParenExpr, PathExpr, Pattern, ReturnExpr, Stmt,
-    StructLitExpr, SyntaxKind, UnaryExpr, WhileExpr,
+    IfExpr, LetStmt, LiteralExpr, MatchExpr, Module, ParenExpr, PathExpr, Pattern, ReturnExpr,
+    Stmt, StructLitExpr, SyntaxKind, UnaryExpr, WhileExpr,
 };
 use arsenal_lex::{SourceMap, Span};
 use arsenal_resolve::{DefId, DefKind, ResolvedModule};
@@ -989,6 +989,7 @@ fn lower_expr<'a>(
         Expr::StructLit(s) => lower_struct_lit(b, s, lcx),
         Expr::Field(fe) => lower_field(b, fe, lcx),
         Expr::Cast(c) => lower_cast(b, c, lcx),
+        Expr::Match(m) => lower_match(b, m, lcx),
         Expr::Stub(_) | Expr::Error(_) => Operand::Const(Const::Error),
     }
 }
@@ -1568,6 +1569,148 @@ fn lower_if<'a>(b: &mut Builder, i: IfExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_
     b.set_terminator(b.cur, Terminator::Goto(join_bb));
 
     // Continue lowering at the join block.
+    b.cur = join_bb;
+    match result_local {
+        Some(l) => Operand::Local(l),
+        None => Operand::Const(Const::Unit),
+    }
+}
+
+/// Phase 2 increment M.1: lower a `match` expression as a chain of
+/// equality compares. For arms with a literal pattern we emit
+/// `cmp = scrutinee == pattern; Branch(cmp, body, next)`. For the
+/// wildcard arm we `Goto(body)` directly. Each body block writes its
+/// value into the match's result local (when non-`u0`) and `Goto`s a
+/// shared join block. The chain-of-Branch shape is the same control
+/// flow already exercised by short-circuit `&&` / `||` (12b), so
+/// codegen needs no new arms.
+fn lower_match<'a>(
+    b: &mut Builder,
+    m: MatchExpr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
+) -> Operand {
+    let result_ty = lcx
+        .typed
+        .expr_types
+        .get(&NodePtr(m.syntax()))
+        .copied()
+        .unwrap_or(Ty::U0);
+    let Some(scrut) = m.scrutinee() else {
+        return Operand::Const(Const::Error);
+    };
+    let scrut_op = lower_expr(b, scrut, lcx);
+    let scrut_ty = lcx
+        .typed
+        .expr_types
+        .get(&NodePtr(scrut.syntax()))
+        .copied()
+        .unwrap_or(Ty::Error);
+    let Some(arm_list) = m.arms() else {
+        return Operand::Const(Const::Error);
+    };
+    let arms: Vec<_> = arm_list.arms().collect();
+
+    let join_bb = b.alloc_block();
+    let result_local = if !matches!(result_ty, Ty::U0 | Ty::Error) {
+        Some(b.alloc_local(LocalDecl {
+            ty: result_ty,
+            span: m.syntax().span,
+        }))
+    } else {
+        None
+    };
+
+    for arm in &arms {
+        let pat = arm.pattern();
+        let body = arm.body();
+        let body_bb = b.alloc_block();
+
+        let is_wildcard = matches!(pat, Some(Pattern::Wildcard(_)));
+        if is_wildcard {
+            b.set_terminator(b.cur, Terminator::Goto(body_bb));
+        } else if let Some(Pattern::Literal(lp)) = pat {
+            let pat_val_op = match lp.value() {
+                Some(e) => lower_expr(b, e, lcx),
+                None => Operand::Const(Const::Error),
+            };
+            let cmp_local = b.alloc_local(LocalDecl {
+                ty: Ty::Bool,
+                span: m.syntax().span,
+            });
+            b.push_stmt(MirStmt::Assign {
+                dst: cmp_local,
+                value: Rvalue::BinOp {
+                    op: BinOp::Eq,
+                    ty: scrut_ty,
+                    lhs: scrut_op.clone(),
+                    rhs: pat_val_op,
+                },
+            });
+            let next_bb = b.alloc_block();
+            b.set_terminator(
+                b.cur,
+                Terminator::Branch {
+                    cond: Operand::Local(cmp_local),
+                    then_bb: body_bb,
+                    else_bb: next_bb,
+                },
+            );
+            // Lower the body in body_bb, then continue test chain in next_bb.
+            b.cur = body_bb;
+            let body_val = match body {
+                Some(e) => lower_expr(b, e, lcx),
+                None => Operand::Const(Const::Unit),
+            };
+            if let Some(local) = result_local {
+                b.push_stmt(MirStmt::Assign {
+                    dst: local,
+                    value: Rvalue::Use(body_val),
+                });
+            }
+            b.set_terminator(b.cur, Terminator::Goto(join_bb));
+            b.cur = next_bb;
+            continue;
+        } else {
+            // Pattern shape rejected by typeck (Ident / Stub / Error /
+            // missing). Skip arm by going to the body anyway so we
+            // don't strand the test chain; codegen will see the dead
+            // path emerge in `Operand::Const(Const::Error)` form.
+            b.set_terminator(b.cur, Terminator::Goto(body_bb));
+        }
+
+        // Wildcard or rejected-shape body lowering.
+        b.cur = body_bb;
+        let body_val = match body {
+            Some(e) => lower_expr(b, e, lcx),
+            None => Operand::Const(Const::Unit),
+        };
+        if let Some(local) = result_local {
+            b.push_stmt(MirStmt::Assign {
+                dst: local,
+                value: Rvalue::Use(body_val),
+            });
+        }
+        b.set_terminator(b.cur, Terminator::Goto(join_bb));
+        // After a wildcard arm, any later arm is unreachable. We
+        // still need to terminate the current block before moving on
+        // to subsequent arms (typeck normally enforces wildcard-last,
+        // but parser recovery can leave dangling arms).
+        if is_wildcard {
+            // Switch to a fresh "unreachable" block so subsequent arm
+            // emit doesn't trip the "set_terminator on already-set
+            // block" guard.
+            let dead_bb = b.alloc_block();
+            b.cur = dead_bb;
+        }
+    }
+
+    // After processing all arms, b.cur is either the trailing
+    // unreachable block from a wildcard or the dangling next_bb of
+    // the last literal-arm test. Either way, terminate it with a
+    // Goto to join so the CFG is well-formed; typeck's exhaustiveness
+    // check should mean this block is unreachable in practice.
+    b.set_terminator(b.cur, Terminator::Goto(join_bb));
+
     b.cur = join_bb;
     match result_local {
         Some(l) => Operand::Local(l),
@@ -2472,5 +2615,55 @@ mod tests {
         assert_eq!(prog.cstring_literals.len(), 1);
         assert_eq!(prog.string_literals[0], b"hi".to_vec());
         assert_eq!(prog.cstring_literals[0], b"hi".to_vec());
+    }
+
+    // ─── Phase 2 increment M.1: match lowering ────────────────────────────
+
+    /// `match` lowers as a chain of equality compares: each
+    /// non-wildcard arm contributes one `BinOp::Eq` + `Branch`,
+    /// the wildcard arm contributes a final `Goto`. The arm
+    /// bodies all merge into one join block so the result reads
+    /// as a single value.
+    #[test]
+    fn match_int_literal_lowers_to_chain_of_eq_branches() {
+        let prog = lower_src(
+            "fn classify(x: i32) -> i32 {\n\
+                 return match x { 0 => 100, 1 => 200, _ => 7 };\n\
+             }\n\
+             fn main() -> i32 { return classify(1); }",
+        );
+        let classify = prog
+            .functions
+            .iter()
+            .find(|f| f.name == "classify")
+            .expect("classify lowered");
+
+        // Count `BinOp::Eq` rvalues — one per non-wildcard literal arm.
+        let eq_count: usize = classify
+            .blocks
+            .iter()
+            .flat_map(|b| b.statements.iter())
+            .filter(|s| {
+                matches!(
+                    s,
+                    MirStmt::Assign {
+                        value: Rvalue::BinOp { op: BinOp::Eq, .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            eq_count, 2,
+            "expected one Eq compare per non-wildcard arm (2 here)"
+        );
+
+        // Count `Branch` terminators — one per non-wildcard arm.
+        let branch_count: usize = classify
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Branch { .. }))
+            .count();
+        assert_eq!(branch_count, 2);
     }
 }

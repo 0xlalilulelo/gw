@@ -785,6 +785,7 @@ fn parse_atom(p: &mut Parser<'_, '_, '_>) {
         TokenKind::KwBreak => parse_break_expr(p),
         TokenKind::KwContinue => parse_continue_expr(p),
         TokenKind::KwFor => parse_for_expr(p),
+        TokenKind::KwMatch => parse_match_expr(p),
         _ => {
             let span = p.current_span();
             p.error(
@@ -863,6 +864,102 @@ fn parse_cond_expr(p: &mut Parser<'_, '_, '_>) {
     p.struct_literals_allowed = false;
     parse_expr(p);
     p.struct_literals_allowed = prev;
+}
+
+// ─── match (Phase 2 increment M.1) ─────────────────────────────────────
+
+fn parse_match_expr(p: &mut Parser<'_, '_, '_>) {
+    let start = p.cur_byte_start();
+    p.builder.start_node(SyntaxKind::MatchExpr, start);
+    p.expect(TokenKind::KwMatch);
+    // Same trick as parse_cond_expr: the scrutinee's trailing `{`
+    // belongs to the match-arm-list, not a struct literal.
+    let prev = p.struct_literals_allowed;
+    p.struct_literals_allowed = false;
+    parse_expr(p);
+    p.struct_literals_allowed = prev;
+    // Match arm list.
+    let arm_list_start = p.cur_byte_start();
+    p.builder
+        .start_node(SyntaxKind::MatchArmList, arm_list_start);
+    if p.expect(TokenKind::LBrace) {
+        while !p.at(TokenKind::RBrace) && !p.at(TokenKind::Eof) {
+            let before = p.pos;
+            parse_match_arm(p);
+            // Trailing comma is optional; arms without `,` end the list.
+            if !p.eat(TokenKind::Comma) {
+                break;
+            }
+            // Defensive: if `parse_match_arm` made no progress, bail out
+            // so the parser can't loop forever on a malformed arm.
+            if p.pos == before {
+                break;
+            }
+        }
+        p.expect(TokenKind::RBrace);
+    }
+    let arm_list_end = p.cur_byte_start();
+    p.builder.finish_node(arm_list_end);
+    let end = p.cur_byte_start();
+    p.builder.finish_node(end);
+}
+
+fn parse_match_arm(p: &mut Parser<'_, '_, '_>) {
+    let start = p.cur_byte_start();
+    p.builder.start_node(SyntaxKind::MatchArm, start);
+    parse_match_pattern(p);
+    p.expect(TokenKind::FatArrow);
+    parse_expr(p);
+    let end = p.cur_byte_start();
+    p.builder.finish_node(end);
+}
+
+/// Pattern parser for match arms only. Differs from `parse_pattern`
+/// (used by `let` and `for in`) by accepting `LiteralPat` shapes —
+/// bare integer literals and `Unary(Minus, IntLit)`. Letting `let 5
+/// = …` parse would silently widen the let surface, so the two
+/// parsers are kept separate.
+fn parse_match_pattern(p: &mut Parser<'_, '_, '_>) {
+    let start = p.cur_byte_start();
+    match p.current() {
+        TokenKind::Ident => {
+            // Same `_` vs identifier classification as parse_pattern.
+            let span = p.current_span();
+            let is_underscore = p.span_bytes(span) == b"_";
+            let kind = if is_underscore {
+                SyntaxKind::WildcardPat
+            } else {
+                SyntaxKind::IdentPat
+            };
+            p.builder.start_node(kind, start);
+            p.bump_any();
+            let end = p.cur_byte_start();
+            p.builder.finish_node(end);
+        }
+        TokenKind::IntLit | TokenKind::Minus => {
+            // `LiteralPat` wraps the literal expression. `parse_expr`
+            // is overpowered for M.1's needs (which only accepts
+            // `IntLit` / `-IntLit`), but typeck rejects richer shapes
+            // with UNSUPPORTED_CONSTRUCT, and reusing the expression
+            // parser keeps the precedence story uniform if M.3 widens
+            // patterns later.
+            p.builder.start_node(SyntaxKind::LiteralPat, start);
+            parse_expr(p);
+            let end = p.cur_byte_start();
+            p.builder.finish_node(end);
+        }
+        _ => {
+            let span = p.current_span();
+            p.error(
+                ec::EXPECTED_PATTERN,
+                span,
+                "expected a pattern (`_`, identifier, or integer literal)",
+            );
+            p.builder.start_node(SyntaxKind::ErrorNode, start);
+            let end = p.cur_byte_start();
+            p.builder.finish_node(end);
+        }
+    }
 }
 
 fn parse_return_expr(p: &mut Parser<'_, '_, '_>) {

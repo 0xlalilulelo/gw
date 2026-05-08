@@ -1,0 +1,11 @@
+fn classify(x: i32) -> i32 {
+    return match x {
+        0 => 100,
+        1 => 200,
+        _ => 7,
+    };
+}
+
+fn main() -> i32 {
+    return classify(99);
+}

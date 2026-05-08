@@ -17,9 +17,10 @@ pub use arena::FileArena;
 pub use ast::{
     ArgList, ArrayType, AstNode, BinaryExpr, Block, BreakExpr, CallExpr, CastExpr, ClassDecl,
     ContinueExpr, Expr, ExprStmt, FieldDecl, FieldDeclList, FieldExpr, FnDecl, ForExpr, IdentPat,
-    IfExpr, Item, LetStmt, LiteralExpr, Module, OptType, Param, ParamList, ParenExpr, PathExpr,
-    PathType, Pattern, RefType, RetType, ReturnExpr, SliceType, Stmt, StructLitExpr,
-    StructLitField, StructLitFieldList, Type, UnaryExpr, WhileExpr, WildcardPat,
+    IfExpr, Item, LetStmt, LiteralExpr, LiteralPat, MatchArm, MatchArmList, MatchExpr, Module,
+    OptType, Param, ParamList, ParenExpr, PathExpr, PathType, Pattern, RefType, RetType,
+    ReturnExpr, SliceType, Stmt, StructLitExpr, StructLitField, StructLitFieldList, Type,
+    UnaryExpr, WhileExpr, WildcardPat,
 };
 pub use cst::{Checkpoint, CstBuilder, SyntaxElement, SyntaxNode};
 pub use print::{dump, dump_with, DumpOpts};

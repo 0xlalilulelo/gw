@@ -449,6 +449,10 @@ pub enum Expr<'a> {
     Field(FieldExpr<'a>),
     /// `expr as Type` — explicit value cast (spec §5.4.4).
     Cast(CastExpr<'a>),
+    /// `match scrutinee { pattern => expr, ... }` (Phase 2 increment
+    /// M.1). Phase-2 minimum surface accepts int-literal patterns and
+    /// wildcards; richer pattern shapes ride additional sub-bundles.
+    Match(MatchExpr<'a>),
     /// Recognised expression kind without a typed view yet.
     Stub(&'a SyntaxNode<'a>),
     /// Parser-recovery node.
@@ -476,13 +480,12 @@ impl<'a> Expr<'a> {
             StructLitExpr => Self::StructLit(self::StructLitExpr(n)),
             FieldExpr => Self::Field(self::FieldExpr(n)),
             CastExpr => Self::Cast(self::CastExpr(n)),
+            MatchExpr => Self::Match(self::MatchExpr(n)),
             // Hooks
-            MatchExpr | LoopExpr | IndexExpr | RefExpr | DerefExpr | RangeExpr
-            | OptionalChainExpr | NilCoalesceExpr | MustExpr | FoxdieExpr | CatchExpr | TryExpr
-            | AwaitExpr | YieldExpr | ChannelSendExpr | ChannelRecvExpr | LockExpr | NakedExpr
-            | RexBlock | ComptimeExpr | IntrinsicCallExpr | AnonAggregateExpr | ArrayLitExpr => {
-                Self::Stub(n)
-            }
+            LoopExpr | IndexExpr | RefExpr | DerefExpr | RangeExpr | OptionalChainExpr
+            | NilCoalesceExpr | MustExpr | FoxdieExpr | CatchExpr | TryExpr | AwaitExpr
+            | YieldExpr | ChannelSendExpr | ChannelRecvExpr | LockExpr | NakedExpr | RexBlock
+            | ComptimeExpr | IntrinsicCallExpr | AnonAggregateExpr | ArrayLitExpr => Self::Stub(n),
             ErrorNode => Self::Error(n),
             _ => return None,
         })
@@ -507,6 +510,7 @@ impl<'a> Expr<'a> {
             Self::StructLit(e) => e.syntax(),
             Self::Field(e) => e.syntax(),
             Self::Cast(e) => e.syntax(),
+            Self::Match(e) => e.syntax(),
             Self::Stub(n) | Self::Error(n) => n,
         }
     }
@@ -719,6 +723,77 @@ impl<'a> Block<'a> {
             }
         }
         tail
+    }
+}
+
+/// `match scrutinee { pat => expr, ... }` (Phase 2 increment M.1).
+#[derive(Copy, Clone)]
+pub struct MatchExpr<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for MatchExpr<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::MatchExpr).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> MatchExpr<'a> {
+    /// Scrutinee — the expression being matched. First `Expr`-shaped
+    /// node child; the `MatchArmList` follows.
+    pub fn scrutinee(self) -> Option<Expr<'a>> {
+        self.0.child_nodes().find_map(Expr::cast)
+    }
+
+    /// Arm list (the `{ ... }` block).
+    pub fn arms(self) -> Option<MatchArmList<'a>> {
+        self.0.child_nodes().find_map(MatchArmList::cast)
+    }
+}
+
+/// `{ <arm>, <arm>, ... }` — the body of a match expression.
+#[derive(Copy, Clone)]
+pub struct MatchArmList<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for MatchArmList<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::MatchArmList).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> MatchArmList<'a> {
+    /// Arms in source order.
+    pub fn arms(self) -> impl Iterator<Item = MatchArm<'a>> + 'a {
+        self.0.child_nodes().filter_map(MatchArm::cast)
+    }
+}
+
+/// `<pattern> => <body>` — one arm of a match expression.
+#[derive(Copy, Clone)]
+pub struct MatchArm<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for MatchArm<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::MatchArm).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> MatchArm<'a> {
+    /// Pattern on the left of `=>`.
+    pub fn pattern(self) -> Option<Pattern<'a>> {
+        self.0.child_nodes().find_map(Pattern::cast)
+    }
+
+    /// Body expression on the right of `=>`.
+    pub fn body(self) -> Option<Expr<'a>> {
+        self.0.child_nodes().find_map(Expr::cast)
     }
 }
 
@@ -1322,7 +1397,10 @@ pub enum Pattern<'a> {
     Ident(IdentPat<'a>),
     /// Wildcard: `_`.
     Wildcard(WildcardPat<'a>),
-    /// Recognised but not yet typed (literal patterns, struct patterns, …).
+    /// Literal value pattern: `0`, `-1`, `'a'` (Phase 2 increment M.1
+    /// only realises int literals — bare or `Unary(Minus, IntLit)`).
+    Literal(LiteralPat<'a>),
+    /// Recognised but not yet typed (struct patterns, tuple patterns, …).
     Stub(&'a SyntaxNode<'a>),
     /// Parser-recovery node.
     Error(&'a SyntaxNode<'a>),
@@ -1335,7 +1413,8 @@ impl<'a> Pattern<'a> {
         Some(match n.kind {
             IdentPat => Self::Ident(self::IdentPat(n)),
             WildcardPat => Self::Wildcard(self::WildcardPat(n)),
-            LiteralPat | StructPat | TuplePat | OrPat | BindPat => Self::Stub(n),
+            LiteralPat => Self::Literal(self::LiteralPat(n)),
+            StructPat | TuplePat | OrPat | BindPat => Self::Stub(n),
             ErrorNode => Self::Error(n),
             _ => return None,
         })
@@ -1372,6 +1451,31 @@ impl<'a> AstNode<'a> for WildcardPat<'a> {
     }
     fn syntax(self) -> &'a SyntaxNode<'a> {
         self.0
+    }
+}
+
+/// Literal value pattern (Phase 2 increment M.1). Wraps a literal-shaped
+/// `Expr` child — bare `IntLit`, or `Unary(Minus, IntLit)` for negative
+/// numbers. Future shapes (`true`/`false` for bools in M.2,
+/// `RuneLit`/`ByteCharLit` later) extend the typeck rule, not the AST.
+#[derive(Copy, Clone)]
+pub struct LiteralPat<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for LiteralPat<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::LiteralPat).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> LiteralPat<'a> {
+    /// The wrapped literal expression. Phase 2 M.1 only types
+    /// `Expr::Literal(IntLit)` and `Expr::Unary(Minus, IntLit)` shapes;
+    /// anything else diagnoses with UNSUPPORTED_CONSTRUCT.
+    pub fn value(self) -> Option<Expr<'a>> {
+        self.0.child_nodes().find_map(Expr::cast)
     }
 }
 

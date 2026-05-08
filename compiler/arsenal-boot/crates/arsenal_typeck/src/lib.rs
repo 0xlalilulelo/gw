@@ -27,9 +27,9 @@
 
 use arsenal_ast::{
     AstNode, BinaryExpr, Block, BreakExpr, CallExpr, CastExpr, ClassDecl, ContinueExpr, Expr,
-    ExprStmt, FieldExpr, FnDecl, ForExpr, IfExpr, LetStmt, LiteralExpr, Module, ParenExpr,
-    PathExpr, PathType, Pattern, ReturnExpr, Stmt, StructLitExpr, SyntaxKind, SyntaxNode, Type,
-    UnaryExpr, WhileExpr,
+    ExprStmt, FieldExpr, FnDecl, ForExpr, IfExpr, LetStmt, LiteralExpr, MatchExpr, Module,
+    ParenExpr, PathExpr, PathType, Pattern, ReturnExpr, Stmt, StructLitExpr, SyntaxKind,
+    SyntaxNode, Type, UnaryExpr, WhileExpr,
 };
 use arsenal_lex::{DiagBag, Diagnostic, Label, SourceMap, Span};
 use arsenal_resolve::{primitive_type_name, DefId, DefKind, ResolvedModule};
@@ -1021,6 +1021,7 @@ fn synth_expr<'a>(expr: Expr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
         Expr::StructLit(s) => synth_struct_lit(s, cx),
         Expr::Field(f) => synth_field(f, cx),
         Expr::Cast(c) => synth_cast(c, cx),
+        Expr::Match(m) => synth_match(m, cx),
         Expr::Stub(n) | Expr::Error(n) => {
             cx.diags.push(Diagnostic::error(
                 ec::UNSUPPORTED_CONSTRUCT,
@@ -1613,6 +1614,106 @@ fn synth_return<'a>(r: ReturnExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     expected
 }
 
+/// Phase 2 increment M.1: type-check a `match` expression. Synth the
+/// scrutinee, validate each arm's pattern against the scrutinee type,
+/// unify the arm body types into a single result type. Exhaustiveness
+/// rule (Phase-2 minimum): a `_` arm is required for any non-bool
+/// scrutinee — the integer domain is too large to enumerate, and the
+/// bare `true`/`false` patterns are M.2's concern. Without a wildcard
+/// the match diagnoses with UNSUPPORTED_CONSTRUCT.
+fn synth_match<'a>(m: MatchExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
+    let scrutinee_ty = match m.scrutinee() {
+        Some(s) => synth_expr(s, cx),
+        None => return Ty::Error,
+    };
+    let arms_node = match m.arms() {
+        Some(a) => a,
+        None => return Ty::Error,
+    };
+    let mut result_ty: Option<Ty> = None;
+    let mut has_wildcard = false;
+    let mut arm_count: u32 = 0;
+    for arm in arms_node.arms() {
+        arm_count += 1;
+        if let Some(pat) = arm.pattern() {
+            check_match_pattern(pat, scrutinee_ty, cx);
+            if matches!(pat, Pattern::Wildcard(_)) {
+                has_wildcard = true;
+            }
+        }
+        if let Some(body) = arm.body() {
+            let body_ty = match result_ty {
+                None => synth_expr(body, cx),
+                Some(rt) => check_expr(body, rt, cx),
+            };
+            if result_ty.is_none() && body_ty != Ty::Error {
+                result_ty = Some(body_ty);
+            }
+        }
+    }
+    if arm_count == 0 && scrutinee_ty != Ty::Error {
+        cx.diags.push(Diagnostic::error(
+            ec::UNSUPPORTED_CONSTRUCT,
+            Label::new(m.syntax().span, ""),
+            "`match` requires at least one arm",
+        ));
+    }
+    if !has_wildcard && scrutinee_ty != Ty::Error && arm_count > 0 {
+        cx.diags.push(Diagnostic::error(
+            ec::UNSUPPORTED_CONSTRUCT,
+            Label::new(m.syntax().span, ""),
+            format!(
+                "match on `{scrutinee_ty}` is not exhaustive; Phase 2 requires a `_` arm to cover any uncovered values"
+            ),
+        ));
+    }
+    result_ty.unwrap_or(Ty::Error)
+}
+
+/// Validate one match-arm pattern against the scrutinee type.
+/// Phase 2 M.1 accepts wildcards everywhere and integer-typed literal
+/// patterns when the scrutinee is `Ty::Int(_)`. Identifier patterns
+/// (binding) and richer pattern shapes diagnose as
+/// UNSUPPORTED_CONSTRUCT.
+fn check_match_pattern<'a>(pat: Pattern<'a>, scrut_ty: Ty, cx: &mut Cx<'a, '_, '_, '_>) {
+    match pat {
+        Pattern::Wildcard(_) => {}
+        Pattern::Ident(ip) => {
+            cx.diags.push(Diagnostic::error(
+                ec::UNSUPPORTED_CONSTRUCT,
+                Label::new(ip.syntax().span, ""),
+                "identifier patterns in `match` arms aren't supported yet (Phase 2 M.1 accepts only `_` and integer literals)",
+            ));
+        }
+        Pattern::Literal(lp) => {
+            let Some(value) = lp.value() else {
+                return;
+            };
+            if matches!(scrut_ty, Ty::Int(_)) {
+                // Bidirectional narrowing handles bare `IntLit` and
+                // `Unary(Minus, IntLit)` shapes against the scrutinee
+                // width — same path used at `let n: i64 = -100;`.
+                check_expr(value, scrut_ty, cx);
+            } else if scrut_ty != Ty::Error {
+                cx.diags.push(Diagnostic::error(
+                    ec::TYPE_MISMATCH,
+                    Label::new(lp.syntax().span, ""),
+                    format!(
+                        "literal pattern can't match scrutinee of type `{scrut_ty}` in Phase 2 M.1"
+                    ),
+                ));
+            }
+        }
+        Pattern::Stub(n) | Pattern::Error(n) => {
+            cx.diags.push(Diagnostic::error(
+                ec::UNSUPPORTED_CONSTRUCT,
+                Label::new(n.span, ""),
+                "this pattern shape isn't supported yet",
+            ));
+        }
+    }
+}
+
 fn synth_call<'a>(c: CallExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     // Determine the callee. Phase 1 only supports calling a
     // top-level fn by name (PathExpr → DefId).
@@ -1835,6 +1936,7 @@ fn expr_span(e: Expr<'_>) -> Span {
         Expr::StructLit(x) => x.syntax().span,
         Expr::Field(x) => x.syntax().span,
         Expr::Cast(x) => x.syntax().span,
+        Expr::Match(x) => x.syntax().span,
         Expr::Stub(n) | Expr::Error(n) => n.span,
     }
 }
@@ -2018,6 +2120,50 @@ mod tests {
             sentinel: 0,
         };
         assert_eq!(format!("{}", ty), "[*:0]u8");
+    }
+
+    // ─── Phase 2 increment M.1: match (literal int + wildcard) ────────────
+
+    #[test]
+    fn match_int_literal_with_wildcard_typechecks() {
+        let src = "fn classify(x: i32) -> i32 {\n\
+                       return match x { 0 => 100, 1 => 200, _ => 7 };\n\
+                   }\n\
+                   fn main() -> i32 { return classify(1); }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn match_without_wildcard_diagnoses() {
+        // No `_` arm and integer scrutinee — Phase 2 M.1 requires
+        // wildcard for non-bool exhaustiveness.
+        let src = "fn classify(x: i32) -> i32 { return match x { 0 => 1, 1 => 2 }; }";
+        assert!(check(src) >= 1);
+    }
+
+    #[test]
+    fn match_negative_literal_pattern_narrows_to_scrutinee_width() {
+        // `-3` inside a match arm should narrow to `i32` (the
+        // scrutinee width) just like `let n: i32 = -3;` does.
+        let src = "fn signed(x: i32) -> i32 { return match x { -3 => 1, _ => 0 }; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn match_literal_pattern_must_match_scrutinee_kind() {
+        // Class-typed scrutinee + integer-literal pattern: rejects.
+        let src = "class C { x: i32 }\n\
+                   fn pick(c: C) -> i32 { return match c { 0 => 1, _ => 2 }; }\n\
+                   fn main() -> i32 { return 0; }";
+        assert!(check(src) >= 1);
+    }
+
+    #[test]
+    fn match_arm_bodies_must_unify() {
+        // Two arms with mismatched body types — second arm's body
+        // should diagnose against the first arm's `i32` type.
+        let src = "fn f(x: i32) -> i32 { return match x { 0 => 1, _ => true }; }";
+        assert!(check(src) >= 1);
     }
 
     /// Pre-A.4 a `[]u8` parameter rejected with UNSUPPORTED_CONSTRUCT.
