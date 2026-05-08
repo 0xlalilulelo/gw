@@ -4,10 +4,11 @@
 //! `MirProgram → object bytes`. The driver picks between the two backends
 //! at `arsenal build --backend=fast|llvm`.
 //!
-//! Supported MIR subset (B.1 → B.3):
-//! - integer + bool + float params and returns; `u0` returns
-//! - integer + bool + float locals (alloca-backed; mem2reg promotion is
-//!   left to LLVM's later opt-level when we add one)
+//! Supported MIR subset (B.1 → B.4):
+//! - integer + bool + float + class + slice params and returns; `u0`
+//!   returns
+//! - alloca-backed locals for every type (primitives use a typed alloca;
+//!   classes / slices use an `[N x i8]` alloca sized to the layout)
 //! - `Rvalue::Use` / `BinOp` / `UnOp` over integers, bools, and floats
 //!   (float comparison via `OEQ`/`ONE`/`OLT`/etc., matching the
 //!   Cranelift backend's "ordered, NaN→false" semantics)
@@ -16,19 +17,30 @@
 //!   fptosi / fptoui via `llvm.fpto{si,ui}.sat` intrinsics), float↔float
 //!   (fpext / fptrunc / no-op). Float→int matches Rust ≥ 1.45 / Cranelift
 //!   `fcvt_to_*_sat`: saturating with NaN→0, no extra branch needed.
+//! - `Rvalue::Field` / `MirStmt::AssignField` over class-typed locals via
+//!   `getelementptr` at byte offsets computed from the typeck `ClassLayout`
+//! - `Rvalue::Use(Operand::Local(src))` into an aggregate-typed dst
+//!   lowers to an `llvm.memcpy` between the slots
+//! - aggregate ABI: hidden out-pointer for class- / slice-returning fns,
+//!   by-pointer for class- / slice-typed user params (HANDOFF decision
+//!   #21). `sret`/`byval` attributes are intentionally omitted: corpus
+//!   aggregates flow only between GW fns, not through C ABI, and the
+//!   plain-`ptr` form agrees with Cranelift's manual `stack_addr`
+//!   convention end-to-end. If a future C-extern ever needs aggregate
+//!   ABI compliance, add the attrs then.
 //! - `Operand::Const(Int|Bool|Float|Unit)`, `Operand::Local`
 //! - `Terminator::{Goto, Branch, Return, Call, Unreachable}`
 //!
-//! Deferred to B.4+: classes, slices, `*T` raw pointers, string
-//! literals + Print desugar, `Rvalue::Field` / `MirStmt::AssignField`.
-//! Anything outside the supported set returns
-//! [`CodegenError::Unsupported`] with a descriptive message.
+//! Deferred to B.5: string literals (`Const::DataAddr`) + the implicit
+//! Print desugar; `*T` raw pointers in non-extern signatures (those
+//! stay rejected by typeck regardless). Anything outside the supported
+//! set returns [`CodegenError::Unsupported`] with a descriptive message.
 
 use arsenal_mir::{
     BinOp, BlockId, CastKind, Const, FnIdx, Local, MirFn, MirProgram, MirStmt, Operand, Rvalue,
     Terminator, UnOp,
 };
-use arsenal_typeck::{FloatTy, IntTy, Ty};
+use arsenal_typeck::{ClassLayout, FloatTy, IntTy, Ty};
 use inkwell::basic_block::BasicBlock;
 use inkwell::context::Context;
 use inkwell::intrinsics::Intrinsic;
@@ -40,7 +52,7 @@ use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FloatType, FunctionTy
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FloatValue, FunctionValue, IntValue, PointerValue,
 };
-use inkwell::{FloatPredicate, IntPredicate, OptimizationLevel};
+use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 use rustc_hash::FxHashMap;
 use target_lexicon::Triple;
 
@@ -145,17 +157,129 @@ pub fn compile_program(
 struct LoweringCx<'ctx, 'a> {
     context: &'ctx Context,
     /// Needed by `lower_cast` for intrinsic lookup
-    /// (`llvm.fptosi.sat` / `llvm.fptoui.sat`).
+    /// (`llvm.fptosi.sat` / `llvm.fptoui.sat`) and by aggregate-arg /
+    /// memcpy paths (intrinsic-based memcpy).
     module: &'a Module<'ctx>,
     f: &'a MirFn,
-    /// Stack-slot pointer per non-`u0` local. `u0` locals have no
-    /// storage — they're never read or written.
+    /// Stack-slot pointer per non-`u0` local. Aggregate locals share
+    /// the same map: their alloca is a sized `[N x i8]` whose address
+    /// is the slot's base pointer.
     allocas: FxHashMap<Local, PointerValue<'ctx>>,
     /// Pre-created LLVM basic blocks, parallel to `f.blocks`.
     bbs: Vec<BasicBlock<'ctx>>,
     /// Function values declared in pass 1, indexed by [`FnIdx`].
     fn_values: &'a [FunctionValue<'ctx>],
     prog: &'a MirProgram,
+    /// Hidden out-pointer for aggregate-returning fns, captured at fn
+    /// entry from the prepended LLVM param. Used by `Terminator::Return`
+    /// to memcpy the result slot through and emit a void return.
+    ret_out_ptr: Option<PointerValue<'ctx>>,
+    /// Native pointer width in bytes (8 for every Phase-1 target).
+    /// Slice layout uses this; aggregate alignments are derived here.
+    ptr_bytes: u32,
+}
+
+// ─── aggregate layout helpers ─────────────────────────────────────────
+
+/// Whether `ty` is passed and returned by hidden pointer in Phase 1.
+/// Mirrors `arsenal_codegen_fast::is_aggregate_ty` — same rule on both
+/// backends so the MIR-level ABI invariants stay aligned.
+fn is_aggregate_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::Class(_) | Ty::Slice(_))
+}
+
+/// Computed layout for a class or slice: total byte size, max-field
+/// alignment, and the byte offset of each field.
+struct ResolvedClassLayout {
+    size: u32,
+    align: u32,
+    offsets: Vec<u32>,
+}
+
+fn resolve_class_layout(layout: &ClassLayout, ptr_bytes: u32) -> ResolvedClassLayout {
+    let mut offsets = Vec::with_capacity(layout.fields.len());
+    let mut offset: u32 = 0;
+    let mut max_align: u32 = 1;
+    for f in &layout.fields {
+        let (sz, al) = primitive_size_align(f.ty, ptr_bytes);
+        offset = align_up(offset, al);
+        offsets.push(offset);
+        offset = offset.saturating_add(sz);
+        if al > max_align {
+            max_align = al;
+        }
+    }
+    let size = align_up(offset, max_align);
+    ResolvedClassLayout {
+        size,
+        align: max_align,
+        offsets,
+    }
+}
+
+fn primitive_size_align(ty: Ty, ptr_bytes: u32) -> (u32, u32) {
+    match ty {
+        Ty::U0 => (0, 1),
+        Ty::Bool => (1, 1),
+        Ty::Int(IntTy::I8) | Ty::Int(IntTy::U8) => (1, 1),
+        Ty::Int(IntTy::I16) | Ty::Int(IntTy::U16) => (2, 2),
+        Ty::Int(IntTy::I32) | Ty::Int(IntTy::U32) => (4, 4),
+        Ty::Int(IntTy::I64) | Ty::Int(IntTy::U64) => (8, 8),
+        Ty::Int(IntTy::ISize) | Ty::Int(IntTy::USize) => (ptr_bytes, ptr_bytes),
+        Ty::Float(FloatTy::F32) => (4, 4),
+        Ty::Float(FloatTy::F64) => (8, 8),
+        Ty::Rune => (4, 4),
+        Ty::Ptr(_) => (ptr_bytes, ptr_bytes),
+        // Phase 1 doesn't have nested-class fields. Fall back to
+        // pointer-sized for safety.
+        _ => (ptr_bytes, ptr_bytes),
+    }
+}
+
+const fn align_up(v: u32, align: u32) -> u32 {
+    if align <= 1 {
+        return v;
+    }
+    let mask = align - 1;
+    (v + mask) & !mask
+}
+
+/// Compute the layout of an aggregate (class or slice) local. Slices
+/// have a fixed two-field shape `(data: ptr@0, len: usize@ptr_bytes)`,
+/// matching the Cranelift backend exactly so by-pointer ABI agrees on
+/// both sides.
+fn aggregate_layout(ty: Ty, prog: &MirProgram, ptr_bytes: u32) -> Option<ResolvedClassLayout> {
+    match ty {
+        Ty::Class(def_id) => prog
+            .class_layouts
+            .get(&def_id)
+            .map(|cl| resolve_class_layout(cl, ptr_bytes)),
+        Ty::Slice(_) => Some(ResolvedClassLayout {
+            size: 2 * ptr_bytes,
+            align: ptr_bytes,
+            offsets: vec![0, ptr_bytes],
+        }),
+        _ => None,
+    }
+}
+
+/// The GW-level type of an aggregate's `field_idx`th field, used by
+/// codegen to pick the load/store width. Slice fields are reported as
+/// `Ty::Int(IntTy::USize)` for both `data` and `len`: the data pointer
+/// is pointer-sized, which yields the correct LLVM load/store width
+/// even though the source-level `Ty` would be `*u8`. Mirrors the
+/// Cranelift backend's `aggregate_field_ty`.
+fn aggregate_field_ty(ty: Ty, field_idx: u32, prog: &MirProgram) -> Ty {
+    match ty {
+        Ty::Class(def_id) => prog
+            .class_layouts
+            .get(&def_id)
+            .and_then(|cl| cl.fields.get(field_idx as usize))
+            .map(|f| f.ty)
+            .unwrap_or(Ty::Error),
+        Ty::Slice(_) => Ty::Int(IntTy::USize),
+        _ => Ty::Error,
+    }
 }
 
 fn define_fn<'ctx>(
@@ -166,6 +290,14 @@ fn define_fn<'ctx>(
     fn_values: &[FunctionValue<'ctx>],
     prog: &MirProgram,
 ) -> Result<(), CodegenError> {
+    // Pointer width — Phase-1 targets are all 64-bit (HANDOFF #16 /
+    // matches the typeck simplification for ISize/USize). Hardcoded
+    // here for the same reason the int_type path uses i64; revisit
+    // when a 32-bit target ships.
+    let ptr_bytes: u32 = 8;
+
+    let returns_aggregate = is_aggregate_ty(f.return_ty);
+
     let bbs: Vec<BasicBlock<'ctx>> = (0..f.blocks.len())
         .map(|i| context.append_basic_block(function, &format!("bb{i}")))
         .collect();
@@ -175,38 +307,94 @@ fn define_fn<'ctx>(
 
     // Alloca every non-`u0` local. LLVM convention: allocas in the entry
     // block so mem2reg (when we add an opt pass later) can promote them
-    // to SSA values.
+    // to SSA values. Aggregates use a sized `[N x i8]` alloca with the
+    // layout's natural alignment so f64-bearing classes stay aligned;
+    // primitives use a typed alloca matching their LLVM type.
     let mut allocas: FxHashMap<Local, PointerValue<'ctx>> = FxHashMap::default();
     for (i, decl) in f.locals.iter().enumerate() {
         if decl.ty == Ty::U0 {
             continue;
         }
-        let lty = llvm_basic_type(context, decl.ty).ok_or_else(|| {
-            CodegenError::Unsupported(format!(
-                "fn `{}` local {} has type {:?}; B.3 supports integers, bool, and floats",
-                f.name, i, decl.ty
-            ))
-        })?;
-        let ptr = builder
-            .build_alloca(lty, &format!("local{i}"))
-            .map_err(|e| CodegenError::Builder(e.to_string()))?;
-        allocas.insert(Local(i as u32), ptr);
+        let local = Local(i as u32);
+        let ptr = if is_aggregate_ty(decl.ty) {
+            let layout = aggregate_layout(decl.ty, prog, ptr_bytes).ok_or_else(|| {
+                CodegenError::Builder(format!(
+                    "fn `{}` aggregate local {i} has no layout (def_id missing from class_layouts?)",
+                    f.name
+                ))
+            })?;
+            let arr_ty = context.i8_type().array_type(layout.size.max(1));
+            let p = builder
+                .build_alloca(arr_ty, &format!("local{i}_agg"))
+                .map_err(be)?;
+            // Bump alignment to the layout's natural one so f64/i64
+            // class fields aren't unaligned. inkwell exposes
+            // `set_alignment` via the underlying instruction value.
+            if let Some(inst) = p.as_instruction() {
+                inst.set_alignment(layout.align.max(1)).map_err(|e| {
+                    CodegenError::Builder(format!("set_alignment on aggregate alloca failed: {e}"))
+                })?;
+            }
+            p
+        } else {
+            let lty = llvm_basic_type(context, decl.ty).ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "fn `{}` local {i} has type {:?}; B.4 supports integers, bool, floats, classes, and slices",
+                    f.name, decl.ty
+                ))
+            })?;
+            builder
+                .build_alloca(lty, &format!("local{i}"))
+                .map_err(be)?
+        };
+        allocas.insert(local, ptr);
     }
 
-    // Store each fn parameter into its corresponding local's alloca, so
-    // body reads load from the slot uniformly.
+    // Capture the hidden out-pointer (LLVM param 0) for aggregate-
+    // returning fns. The remaining LLVM params shift right by one.
+    let ret_out_ptr = if returns_aggregate {
+        let p = function
+            .get_nth_param(0)
+            .ok_or_else(|| CodegenError::Builder(format!("fn `{}` missing sret out-ptr", f.name)))?
+            .into_pointer_value();
+        Some(p)
+    } else {
+        None
+    };
+
+    // Store each fn parameter into its corresponding local's alloca:
+    // primitives `store` the SSA value, aggregates `memcpy` from the
+    // incoming pointer into the local's slot so body field accesses
+    // hit a fresh copy (pass-by-value at the source level — HANDOFF #21).
+    let llvm_param_offset = if returns_aggregate { 1 } else { 0 };
     for (i, &param_local) in f.params.iter().enumerate() {
         let ty = f.locals[param_local.0 as usize].ty;
         if ty == Ty::U0 {
             continue;
         }
+        let llvm_idx = (i + llvm_param_offset) as u32;
         let val = function
-            .get_nth_param(i as u32)
+            .get_nth_param(llvm_idx)
             .ok_or_else(|| CodegenError::Builder(format!("fn `{}` missing param {i}", f.name)))?;
-        let ptr = allocas[&param_local];
-        builder
-            .build_store(ptr, val)
-            .map_err(|e| CodegenError::Builder(e.to_string()))?;
+        let dst_ptr = allocas[&param_local];
+        if is_aggregate_ty(ty) {
+            let layout = aggregate_layout(ty, prog, ptr_bytes).ok_or_else(|| {
+                CodegenError::Builder(format!("fn `{}` aggregate param {i} has no layout", f.name))
+            })?;
+            let src_ptr = val.into_pointer_value();
+            let size = context.i64_type().const_int(layout.size as u64, false);
+            builder
+                .build_memcpy(
+                    dst_ptr,
+                    layout.align.max(1),
+                    src_ptr,
+                    layout.align.max(1),
+                    size,
+                )
+                .map_err(|e| CodegenError::Builder(format!("memcpy param: {e}")))?;
+        } else {
+            builder.build_store(dst_ptr, val).map_err(be)?;
+        }
     }
 
     let cx = LoweringCx {
@@ -217,6 +405,8 @@ fn define_fn<'ctx>(
         bbs,
         fn_values,
         prog,
+        ret_out_ptr,
+        ptr_bytes,
     };
 
     // Lower each MIR block. The first iteration continues from the
@@ -247,6 +437,37 @@ fn lower_stmt<'ctx>(
                 // shapes whose Assign has no observable effect; skip.
                 return Ok(());
             }
+            if is_aggregate_ty(dst_ty) {
+                // Aggregate-typed Assign: only `Use(Local(src))` is
+                // legal in Phase 1 (let-init shadowing of a struct/
+                // string literal temp). Lower as a slot-to-slot
+                // memcpy. Other rvalue shapes shouldn't be produced
+                // by lowering; surface as Unsupported defensively.
+                let src_local = match value {
+                    Rvalue::Use(Operand::Local(l)) => l,
+                    _ => {
+                        return Err(CodegenError::Unsupported(format!(
+                            "aggregate-typed Assign with non-Local rvalue (dst {:?}, ty {:?})",
+                            dst, dst_ty
+                        )));
+                    }
+                };
+                let layout = aggregate_layout(dst_ty, cx.prog, cx.ptr_bytes)
+                    .ok_or_else(|| CodegenError::Builder("aggregate Assign: no layout".into()))?;
+                let dst_ptr = cx.allocas[dst];
+                let src_ptr = cx.allocas[src_local];
+                let size = cx.context.i64_type().const_int(layout.size as u64, false);
+                builder
+                    .build_memcpy(
+                        dst_ptr,
+                        layout.align.max(1),
+                        src_ptr,
+                        layout.align.max(1),
+                        size,
+                    )
+                    .map_err(|e| CodegenError::Builder(format!("memcpy assign: {e}")))?;
+                return Ok(());
+            }
             let val = lower_rvalue(builder, cx, value, dst_ty)?;
             let ptr = cx.allocas[dst];
             builder
@@ -254,10 +475,45 @@ fn lower_stmt<'ctx>(
                 .map_err(|e| CodegenError::Builder(e.to_string()))?;
             Ok(())
         }
-        MirStmt::AssignField { .. } => Err(CodegenError::Unsupported(
-            "AssignField (class field write) — deferred to B.4".into(),
-        )),
+        MirStmt::AssignField {
+            dst,
+            field_idx,
+            value,
+        } => {
+            let base_ty = cx.f.locals[dst.0 as usize].ty;
+            let layout = aggregate_layout(base_ty, cx.prog, cx.ptr_bytes).ok_or_else(|| {
+                CodegenError::Builder(format!(
+                    "AssignField on non-aggregate dst {:?} ty {:?}",
+                    dst, base_ty
+                ))
+            })?;
+            let field_ty = aggregate_field_ty(base_ty, *field_idx, cx.prog);
+            let val = lower_rvalue(builder, cx, value, field_ty)?;
+            let base_ptr = cx.allocas[dst];
+            let field_ptr = field_addr(builder, cx, base_ptr, layout.offsets[*field_idx as usize])?;
+            builder.build_store(field_ptr, val).map_err(be)?;
+            Ok(())
+        }
     }
+}
+
+/// Compute the address of a field at a given byte `offset` from
+/// `base_ptr`. With opaque pointers, GEPing through `i8` lets us pick
+/// any byte boundary without first declaring the aggregate's struct
+/// type to LLVM.
+fn field_addr<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    cx: &LoweringCx<'ctx, '_>,
+    base_ptr: PointerValue<'ctx>,
+    offset: u32,
+) -> Result<PointerValue<'ctx>, CodegenError> {
+    let off = cx.context.i64_type().const_int(offset as u64, false);
+    let ptr = unsafe {
+        builder
+            .build_in_bounds_gep(cx.context.i8_type(), base_ptr, &[off], "field")
+            .map_err(be)?
+    };
+    Ok(ptr)
 }
 
 // ─── rvalues ──────────────────────────────────────────────────────────
@@ -279,9 +535,28 @@ fn lower_rvalue<'ctx>(
             let v = read_operand(builder, cx, operand, *ty)?;
             lower_unop(builder, *op, *ty, v)
         }
-        Rvalue::Field { .. } => Err(CodegenError::Unsupported(
-            "Rvalue::Field (class field read) — deferred to B.4".into(),
-        )),
+        Rvalue::Field {
+            base,
+            field_idx,
+            field_ty,
+        } => {
+            let base_ty = cx.f.locals[base.0 as usize].ty;
+            let layout = aggregate_layout(base_ty, cx.prog, cx.ptr_bytes).ok_or_else(|| {
+                CodegenError::Builder(format!(
+                    "Rvalue::Field on non-aggregate base {:?} ty {:?}",
+                    base, base_ty
+                ))
+            })?;
+            let base_ptr = cx.allocas[base];
+            let field_ptr = field_addr(builder, cx, base_ptr, layout.offsets[*field_idx as usize])?;
+            let lty = llvm_basic_type(cx.context, *field_ty).ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "Rvalue::Field with field_ty {:?} — no scalar LLVM type",
+                    field_ty
+                ))
+            })?;
+            builder.build_load(lty, field_ptr, "fieldload").map_err(be)
+        }
         Rvalue::Cast {
             kind,
             operand,
@@ -779,7 +1054,36 @@ fn lower_terminator<'ctx>(
                 .map_err(be)?;
         }
         Terminator::Return(op) => {
-            if matches!(cx.f.return_ty, Ty::U0 | Ty::Error) {
+            if is_aggregate_ty(cx.f.return_ty) {
+                // Aggregate return: memcpy the result slot into the
+                // hidden out-pointer the caller passed in, then return
+                // void. `op` is `Operand::Local(src)` for legal MIR.
+                let src_local = match op {
+                    Operand::Local(l) => l,
+                    _ => {
+                        return Err(CodegenError::Builder(
+                            "aggregate Return with non-Local operand".into(),
+                        ));
+                    }
+                };
+                let layout = aggregate_layout(cx.f.return_ty, cx.prog, cx.ptr_bytes)
+                    .ok_or_else(|| CodegenError::Builder("aggregate Return: no layout".into()))?;
+                let out_ptr = cx.ret_out_ptr.ok_or_else(|| {
+                    CodegenError::Builder("aggregate-returning fn has no ret_out_ptr".into())
+                })?;
+                let src_ptr = cx.allocas[src_local];
+                let size = cx.context.i64_type().const_int(layout.size as u64, false);
+                builder
+                    .build_memcpy(
+                        out_ptr,
+                        layout.align.max(1),
+                        src_ptr,
+                        layout.align.max(1),
+                        size,
+                    )
+                    .map_err(|e| CodegenError::Builder(format!("memcpy return: {e}")))?;
+                builder.build_return(None).map_err(be)?;
+            } else if matches!(cx.f.return_ty, Ty::U0 | Ty::Error) {
                 builder.build_return(None).map_err(be)?;
             } else {
                 let v = read_operand(builder, cx, op, cx.f.return_ty)?;
@@ -812,13 +1116,36 @@ fn lower_call<'ctx>(
 ) -> Result<(), CodegenError> {
     let callee_fn = &cx.prog.functions[callee.0 as usize];
     let callee_value = cx.fn_values[callee.0 as usize];
+    let callee_returns_aggregate = is_aggregate_ty(callee_fn.return_ty);
 
-    let mut arg_vals: Vec<BasicMetadataValueEnum<'ctx>> = Vec::with_capacity(args.len());
+    let mut arg_vals: Vec<BasicMetadataValueEnum<'ctx>> = Vec::with_capacity(args.len() + 1);
+    // Hidden out-pointer for aggregate return goes first; the dst local
+    // already has its alloca allocated.
+    if callee_returns_aggregate {
+        let dst_ptr = cx.allocas[&dst];
+        arg_vals.push(dst_ptr.into());
+    }
     for (i, op) in args.iter().enumerate() {
         let param_local = callee_fn.params[i];
         let param_ty = callee_fn.locals[param_local.0 as usize].ty;
-        let v = read_operand(builder, cx, op, param_ty)?;
-        arg_vals.push(v.into());
+        if is_aggregate_ty(param_ty) {
+            // Aggregate args pass the address of the source slot.
+            // Aggregates can't be const-folded; the operand is always
+            // `Operand::Local(src)` for legal MIR.
+            let src_local = match op {
+                Operand::Local(l) => l,
+                _ => {
+                    return Err(CodegenError::Builder(
+                        "aggregate-typed call arg with non-Local operand".into(),
+                    ));
+                }
+            };
+            let src_ptr = cx.allocas[src_local];
+            arg_vals.push(src_ptr.into());
+        } else {
+            let v = read_operand(builder, cx, op, param_ty)?;
+            arg_vals.push(v.into());
+        }
     }
 
     let call_site = builder
@@ -826,9 +1153,11 @@ fn lower_call<'ctx>(
         .map_err(be)?;
 
     let dst_ty = cx.f.locals[dst.0 as usize].ty;
-    if !matches!(dst_ty, Ty::U0 | Ty::Error) {
-        // Scalar return: store into the dst local's alloca. (Aggregate
-        // returns land in B.4 via a hidden out-pointer.)
+    if callee_returns_aggregate {
+        // The result already landed in `dst`'s alloca via the hidden
+        // out-pointer we passed in.
+    } else if !matches!(dst_ty, Ty::U0 | Ty::Error) {
+        // Scalar return: store into the dst local's alloca.
         let ret = call_site
             .try_as_basic_value()
             .left()
@@ -847,42 +1176,60 @@ fn make_fn_type<'ctx>(
     context: &'ctx Context,
     f: &MirFn,
 ) -> Result<FunctionType<'ctx>, CodegenError> {
-    let mut params: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::with_capacity(f.params.len());
+    let ptr_ty = context.ptr_type(AddressSpace::default());
+    let mut params: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::with_capacity(f.params.len() + 1);
+    // Hidden out-pointer prepended for aggregate returns (HANDOFF #21).
+    if is_aggregate_ty(f.return_ty) {
+        params.push(ptr_ty.into());
+    }
     for &param_local in &f.params {
         let pty = f.locals[param_local.0 as usize].ty;
+        if is_aggregate_ty(pty) {
+            params.push(ptr_ty.into());
+            continue;
+        }
         let lty = llvm_basic_type(context, pty).ok_or_else(|| {
             CodegenError::Unsupported(format!(
-                "fn `{}` param {:?} type {:?}; B.3 supports integers, bool, and floats",
+                "fn `{}` param {:?} type {:?}; B.4 supports integers, bool, floats, classes, and slices",
                 f.name, param_local, pty
             ))
         })?;
         params.push(lty.into());
     }
     Ok(match f.return_ty {
+        // Aggregate returns flow through the hidden out-pointer; the
+        // LLVM-level fn returns void.
+        Ty::Class(_) | Ty::Slice(_) => context.void_type().fn_type(&params, false),
         Ty::U0 => context.void_type().fn_type(&params, false),
         Ty::Int(int_ty) => llvm_int_type(context, int_ty).fn_type(&params, false),
         Ty::Bool => context.bool_type().fn_type(&params, false),
         Ty::Float(float_ty) => llvm_float_type(context, float_ty).fn_type(&params, false),
         ref other => {
             return Err(CodegenError::Unsupported(format!(
-                "fn `{}` return type {:?}; B.3 supports `u0`, integers, bool, and floats",
+                "fn `{}` return type {:?}; B.4 supports `u0`, integers, bool, floats, classes, and slices",
                 f.name, other
             )));
         }
     })
 }
 
-/// Map a [`Ty`] to its LLVM `BasicTypeEnum`, or `None` for `u0` and
-/// any type B.3 doesn't yet handle (caller turns `None` into an
-/// `Unsupported` error).
+/// Map a [`Ty`] to its LLVM `BasicTypeEnum` for primitive scalar use
+/// (alloca / load / store / fn signature). Returns `None` for `u0`
+/// (no value), aggregates (those use `[N x i8]` allocas + `ptr` in
+/// signatures, not a basic scalar type), and unsupported types.
 fn llvm_basic_type<'ctx>(context: &'ctx Context, ty: Ty) -> Option<BasicTypeEnum<'ctx>> {
     match ty {
         Ty::U0 => None,
         Ty::Bool => Some(context.bool_type().into()),
         Ty::Int(int_ty) => Some(llvm_int_type(context, int_ty).into()),
         Ty::Float(float_ty) => Some(llvm_float_type(context, float_ty).into()),
-        // Aggregates / pointers in B.4+.
-        Ty::Class(_) | Ty::Slice(_) | Ty::Ptr(_) | Ty::Rune | Ty::Error => None,
+        // Aggregates: routed through the by-pointer ABI / `[N x i8]`
+        // allocas; `llvm_basic_type` is for *scalar* type lookup only.
+        Ty::Class(_) | Ty::Slice(_) => None,
+        // `*T` raw pointers in non-extern signatures stay rejected by
+        // typeck (Phase 1 limit). `Rune` and `Error` are also non-scalar
+        // for codegen purposes.
+        Ty::Ptr(_) | Ty::Rune | Ty::Error => None,
         // `Ty` is non-exhaustive (Phase 2 will add `?T`, `!T`, etc.);
         // anything new lands here as Unsupported until handled.
         _ => None,
