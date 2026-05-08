@@ -406,7 +406,8 @@ fn parse_type(p: &mut Parser<'_, '_, '_>) {
             p.builder.finish_node(end);
         }
         TokenKind::LBracket => {
-            // `[]T` (slice) or `[N]T` (array). Decide by peeking past the
+            // `[]T` (slice), `[*:S]T` (sentinel many-pointer, Phase 2
+            // C.2), or `[N]T` (array). Decide by peeking past the
             // opening bracket's significant tokens.
             let inner = p.peek_at(1);
             if inner == TokenKind::RBracket {
@@ -414,6 +415,19 @@ fn parse_type(p: &mut Parser<'_, '_, '_>) {
                 p.builder.start_node(SyntaxKind::SliceType, start);
                 p.bump_any(); // [
                 p.bump_any(); // ]
+                parse_type(p);
+                let end = p.cur_byte_start();
+                p.builder.finish_node(end);
+            } else if inner == TokenKind::Star {
+                // SentinelPtrType: `[ * : <expr> ] T`. Parser accepts
+                // any sentinel expression here; typeck restricts it to
+                // a `0` literal in Phase 2 (only `[*:0]u8` is wired up).
+                p.builder.start_node(SyntaxKind::SentinelPtrType, start);
+                p.bump_any(); // [
+                p.bump_any(); // *
+                p.expect(TokenKind::Colon);
+                parse_expr(p);
+                p.expect(TokenKind::RBracket);
                 parse_type(p);
                 let end = p.cur_byte_start();
                 p.builder.finish_node(end);

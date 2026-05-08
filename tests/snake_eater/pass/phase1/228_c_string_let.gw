@@ -1,0 +1,7 @@
+extern fn puts(s: *u8) -> i32;
+
+fn main() -> i32 {
+    let s: [*:0]u8 = c"hello";
+    puts(s);
+    return 0;
+}

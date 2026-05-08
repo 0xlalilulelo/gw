@@ -298,6 +298,7 @@ fn primitive_size_align(ty: Ty, ptr_bytes: u32) -> (u32, u32) {
         Ty::Float(FloatTy::F64) => (8, 8),
         Ty::Rune => (4, 4),
         Ty::Ptr(_) => (ptr_bytes, ptr_bytes),
+        Ty::SentinelPtr { .. } => (ptr_bytes, ptr_bytes),
         // Phase 1 doesn't have nested-class fields. Fall back to
         // pointer-sized for safety.
         _ => (ptr_bytes, ptr_bytes),
@@ -1321,6 +1322,10 @@ fn llvm_basic_type<'ctx>(context: &'ctx Context, ty: Ty) -> Option<BasicTypeEnum
         // LLVM ≥ 15's opaque pointers the pointee type isn't part of
         // the value, so `*u8` and `*i8` etc. are all the same `ptr`.
         Ty::Ptr(_) => Some(context.ptr_type(AddressSpace::default()).into()),
+        // `[*:S]T` (Phase 2 C.2): same ABI as `*T` — opaque `ptr` —
+        // since the sentinel is a type-system invariant, not a runtime
+        // tag. Both backends treat the two interchangeably here.
+        Ty::SentinelPtr { .. } => Some(context.ptr_type(AddressSpace::default()).into()),
         // Aggregates: routed through the by-pointer ABI / `[N x i8]`
         // allocas; `llvm_basic_type` is for *scalar* type lookup only.
         Ty::Class(_) | Ty::Slice(_) => None,

@@ -241,6 +241,7 @@ fn primitive_size_align(ty: Ty, ptr_bytes: u32) -> (u32, u32) {
         Ty::Float(FloatTy::F64) => (8, 8),
         Ty::Rune => (4, 4),
         Ty::Ptr(_) => (ptr_bytes, ptr_bytes),
+        Ty::SentinelPtr { .. } => (ptr_bytes, ptr_bytes),
         // Phase 1 doesn't have nested-class fields. Fall back to
         // pointer-sized just so codegen doesn't divide by zero.
         _ => (ptr_bytes, ptr_bytes),
@@ -361,6 +362,7 @@ fn clif_ty(ty: Ty, module: &ObjectModule) -> Option<ir::Type> {
         Ty::Float(FloatTy::F64) => ir::types::F64,
         Ty::Rune => ir::types::I32,
         Ty::Ptr(_) => ptr_clt,
+        Ty::SentinelPtr { .. } => ptr_clt,
         Ty::Error => ir::types::I32,
         // Phase 1 doesn't model class- or slice-typed scalars (those are
         // stack-slotted by the time they reach a `read_operand` call);

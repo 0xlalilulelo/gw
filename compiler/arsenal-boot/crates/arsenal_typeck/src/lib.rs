@@ -98,6 +98,21 @@ pub enum Ty {
     /// `slice.data`. Cross-fn pointer passing in non-extern fns is
     /// deferred (memory model + borrow-checker work).
     Ptr(IntTy),
+    /// `[*:S]T` — sentinel-terminated many-pointer (Phase 2 increment
+    /// C.2). Distinct from `*T` at the type level, identical to it at
+    /// the value level. Phase 2 only realises `[*:0]u8` (the type of
+    /// `c"..."` literals); the typeck layer rejects other element types
+    /// or sentinels until the corpus motivates more. The
+    /// `[*:S]T → *T` direction is permitted by `ty_assignable` so
+    /// `c"..."` flows into existing `extern fn x(*u8)` slots without
+    /// the user writing an explicit cast.
+    SentinelPtr {
+        /// Element type. Phase 2 only realises `IntTy::U8`.
+        elem: IntTy,
+        /// Sentinel value the producer guarantees terminates the run.
+        /// Phase 2 only realises `0`.
+        sentinel: u64,
+    },
     /// Synthetic placeholder when type checking failed for an
     /// expression. Treated as compatible with any expected type so a
     /// single failure does not cascade.
@@ -194,6 +209,9 @@ impl std::fmt::Display for Ty {
             Self::Class(def_id) => write!(f, "<class#{}>", def_id.0),
             Self::Slice(elem) => write!(f, "[]{}", Self::Int(*elem)),
             Self::Ptr(elem) => write!(f, "*{}", Self::Int(*elem)),
+            Self::SentinelPtr { elem, sentinel } => {
+                write!(f, "[*:{sentinel}]{}", Self::Int(*elem))
+            }
             Self::Error => f.write_str("<error>"),
         }
     }
@@ -557,6 +575,42 @@ fn resolve_type(
                 }
             };
         }
+        Type::SentinelPtr(s) => {
+            // Phase 2 increment C.2: the corpus only needs `[*:0]u8`
+            // (the c-string type). Any other element type or sentinel
+            // value rejects with `UNSUPPORTED_CONSTRUCT` so callers
+            // see why their type didn't take.
+            let elem_ty = s
+                .element()
+                .map(|e| resolve_type(e, resolved, sm, diags))
+                .unwrap_or(Ty::Error);
+            let sentinel = s.sentinel().and_then(|e| literal_u64(e, sm));
+            return match (elem_ty, sentinel) {
+                (Ty::Int(IntTy::U8), Some(0)) => Ty::SentinelPtr {
+                    elem: IntTy::U8,
+                    sentinel: 0,
+                },
+                (Ty::Error, _) => Ty::Error,
+                (other_elem, Some(other_sent)) => {
+                    diags.push(Diagnostic::error(
+                        ec::UNSUPPORTED_CONSTRUCT,
+                        Label::new(s.syntax().span, ""),
+                        format!(
+                            "Phase 2 only supports `[*:0]u8` sentinel pointers; `[*:{other_sent}]{other_elem}` is not yet supported"
+                        ),
+                    ));
+                    Ty::Error
+                }
+                (_, None) => {
+                    diags.push(Diagnostic::error(
+                        ec::UNSUPPORTED_CONSTRUCT,
+                        Label::new(s.syntax().span, ""),
+                        "sentinel-pointer sentinel must be an integer literal in Phase 2 (only `[*:0]u8` is wired up)",
+                    ));
+                    Ty::Error
+                }
+            };
+        }
         _ => {
             diags.push(Diagnostic::error(
                 ec::UNSUPPORTED_CONSTRUCT,
@@ -608,6 +662,7 @@ fn ty_span(t: &Type<'_>) -> Span {
         Type::Slice(p) => p.syntax().span,
         Type::Array(p) => p.syntax().span,
         Type::Ptr(p) => p.syntax().span,
+        Type::SentinelPtr(p) => p.syntax().span,
         Type::Stub(n) | Type::Error(n) => n.span,
     }
 }
@@ -892,6 +947,28 @@ fn try_narrow_literal<'a>(expr: Expr<'a>, expected: Ty, cx: &mut Cx<'a, '_, '_, 
     }
 }
 
+/// Extract a non-negative integer literal value from `expr` as `u64`.
+/// Used by `resolve_type` for the sentinel slot of `[*:S]T` (Phase 2
+/// C.2). Returns `None` for any non-`IntLit` shape, for negative
+/// literals, or for values that overflow `u64`.
+fn literal_u64(expr: Expr<'_>, sm: &SourceMap) -> Option<u64> {
+    let lit = match expr {
+        Expr::Literal(l) => l,
+        Expr::Paren(p) => return literal_u64(p.inner()?, sm),
+        _ => return None,
+    };
+    let (kind, span) = lit.token()?;
+    if kind != SyntaxKind::IntLit {
+        return None;
+    }
+    let raw = sm.slice(span)?;
+    let v = parse_unsigned_int_literal(raw)?;
+    if v < 0 {
+        return None;
+    }
+    u64::try_from(v).ok()
+}
+
 /// Parse the source text of an `IntLit` token. Token text is always
 /// non-negative (unary minus is a separate AST node); the result fits
 /// in `i128` for any Phase-1-supported width up to `u64`.
@@ -969,11 +1046,16 @@ fn synth_literal(l: LiteralExpr<'_>, _cx: &mut Cx<'_, '_, '_, '_>) -> Ty {
         Some(SyntaxKind::ByteCharLit) => Ty::Int(IntTy::U8),
         Some(SyntaxKind::StringLit | SyntaxKind::RawStringLit) => Ty::Slice(IntTy::U8),
         Some(SyntaxKind::CStringLit) => {
-            // C.1: `c"..."` synthesises to `*u8` directly. The
-            // sentinel-aware `[*:0]u8` distinction lands in C.2; until
-            // then the literal's value flows wherever a `*u8` is
-            // accepted (extern fn arg slots first and foremost).
-            Ty::Ptr(IntTy::U8)
+            // C.2: `c"..."` synthesises as `[*:0]u8`. The
+            // `[*:0]T → *T` coercion in `ty_assignable` keeps the
+            // C.1 tracer's `puts(c"hi")` shape working — the literal's
+            // sentinel-typed value flows into `*u8` arg slots without
+            // an explicit cast — while preserving the type-level
+            // distinction the spec asks for.
+            Ty::SentinelPtr {
+                elem: IntTy::U8,
+                sentinel: 0,
+            }
         }
         _ => Ty::Error,
     }
@@ -1602,7 +1684,19 @@ fn synth_call<'a>(c: CallExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
 // ─── helpers ───────────────────────────────────────────────────────────
 
 fn ty_assignable(actual: Ty, expected: Ty) -> bool {
-    actual == expected || actual == Ty::Error || expected == Ty::Error
+    if actual == expected || actual == Ty::Error || expected == Ty::Error {
+        return true;
+    }
+    // Phase 2 C.2: `[*:S]T` decays to `*T` at any assignable position
+    // (extern call args, `let s: *u8 = c"hi";`, return-into-`*u8`).
+    // The decay is value-level identity — both lower to the same
+    // pointer at MIR/codegen — so accepting the implicit form here
+    // costs nothing at runtime and avoids forcing every c-string user
+    // to write an `as *u8` that doesn't yet parse.
+    matches!(
+        (actual, expected),
+        (Ty::SentinelPtr { elem: e1, .. }, Ty::Ptr(e2)) if e1 == e2,
+    )
 }
 
 fn require_same_numeric(lhs: Ty, rhs: Ty, span: Span, op: &str, cx: &mut Cx<'_, '_, '_, '_>) -> Ty {
@@ -1873,11 +1967,57 @@ mod tests {
 
     #[test]
     fn cstring_literal_does_not_coerce_to_slice() {
-        // C.1 keeps `c"..."` strictly typed as `*u8`; assigning it to
-        // a `[]u8` binding must diagnose. (The reverse — slice-into-
-        // *u8 — already rejects since slices are aggregate-typed.)
+        // C.2 keeps `c"..."` strictly typed as `[*:0]u8`; assigning
+        // it to a `[]u8` binding must diagnose. The C.2 coercion only
+        // covers `[*:S]T → *T`, never `[*:S]T → []T`.
         let src = "fn main() -> i32 { let s: []u8 = c\"hi\"; return 0; }";
         assert!(check(src) >= 1);
+    }
+
+    // ─── Phase 2 increment C.2: `[*:0]u8` sentinel pointer type ───────────
+
+    #[test]
+    fn cstring_synthesises_as_sentinel_ptr() {
+        // After C.2, `c"..."` types as `[*:0]u8`; a `let s: [*:0]u8`
+        // annotation accepts it without coercion.
+        let src = "fn main() -> i32 { let s: [*:0]u8 = c\"hi\"; return 0; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn sentinel_ptr_accepts_only_sentinel_zero_u8() {
+        // Phase 2 only realises `[*:0]u8`. Other element types
+        // (e.g. `[*:0]u32`) and other sentinels (`[*:1]u8`) reject
+        // with UNSUPPORTED_CONSTRUCT.
+        assert!(check("fn main() -> i32 { let s: [*:0]u32; return 0; }") >= 1);
+        assert!(check("fn main() -> i32 { let s: [*:1]u8; return 0; }") >= 1);
+    }
+
+    #[test]
+    fn sentinel_ptr_decays_to_raw_ptr_at_extern_call() {
+        // The C.1 tracer's coercion path: `c"..."` is now
+        // `[*:0]u8` but flows into `extern fn puts(*u8)` cleanly.
+        let src = "extern fn puts(s: *u8) -> i32; fn main() -> i32 { puts(c\"hi\"); return 0; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn sentinel_ptr_works_as_non_extern_fn_param() {
+        // Helper-fn fixtures need `[*:0]u8` in non-extern signatures
+        // (cleanup #1's `-> u0` default also exercised here).
+        let src = "extern fn puts(s: *u8) -> i32;\n\
+                   fn greet(s: [*:0]u8) { puts(s); }\n\
+                   fn main() -> i32 { greet(c\"hi\"); return 0; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn sentinel_ptr_displays_with_zig_syntax() {
+        let ty = Ty::SentinelPtr {
+            elem: IntTy::U8,
+            sentinel: 0,
+        };
+        assert_eq!(format!("{}", ty), "[*:0]u8");
     }
 
     /// Pre-A.4 a `[]u8` parameter rejected with UNSUPPORTED_CONSTRUCT.

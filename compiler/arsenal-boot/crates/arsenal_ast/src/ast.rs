@@ -1117,6 +1117,11 @@ pub enum Type<'a> {
     Array(ArrayType<'a>),
     /// `*T` — raw pointer.
     Ptr(PtrType<'a>),
+    /// `[*:S]T` — sentinel-terminated many-pointer (Phase 2 increment
+    /// C.2). The Phase-2 corpus only writes `[*:0]u8` for c-strings;
+    /// the AST view exposes both the element and sentinel sub-nodes
+    /// so a future widening doesn't have to reshape the view.
+    SentinelPtr(SentinelPtrType<'a>),
     /// Recognised but not yet typed.
     Stub(&'a SyntaxNode<'a>),
     /// Parser-recovery node.
@@ -1134,9 +1139,11 @@ impl<'a> Type<'a> {
             SliceType => Self::Slice(self::SliceType(n)),
             ArrayType => Self::Array(self::ArrayType(n)),
             PtrType => Self::Ptr(self::PtrType(n)),
+            SentinelPtrType => Self::SentinelPtr(self::SentinelPtrType(n)),
             // Hooks
-            ManyPtrType | SentinelPtrType | ErrorUnionType | TupleType | FnType | DynArrayType
-            | GenericArgs => Self::Stub(n),
+            ManyPtrType | ErrorUnionType | TupleType | FnType | DynArrayType | GenericArgs => {
+                Self::Stub(n)
+            }
             ErrorNode => Self::Error(n),
             _ => return None,
         })
@@ -1249,6 +1256,35 @@ impl<'a> PtrType<'a> {
     /// Pointee type.
     pub fn element(self) -> Option<Type<'a>> {
         self.0.child_nodes().find_map(Type::cast)
+    }
+}
+
+/// Sentinel-terminated many-pointer: `[*:S]T` (spec §5.4 / Zig-style).
+/// Phase 2 only realises `[*:0]u8` (the c-string type), but the view
+/// is shaped to carry an arbitrary sentinel expression so the parser
+/// surface and the AST can stay honest about what the source said.
+#[derive(Copy, Clone)]
+pub struct SentinelPtrType<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for SentinelPtrType<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::SentinelPtrType).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> SentinelPtrType<'a> {
+    /// Element type — the `T` in `[*:S]T`.
+    pub fn element(self) -> Option<Type<'a>> {
+        self.0.child_nodes().find_map(Type::cast)
+    }
+
+    /// Sentinel expression — the `S` in `[*:S]T`. Phase 2 typeck only
+    /// accepts a literal `0`; richer sentinel values land later.
+    pub fn sentinel(self) -> Option<Expr<'a>> {
+        self.0.child_nodes().find_map(Expr::cast)
     }
 }
 
