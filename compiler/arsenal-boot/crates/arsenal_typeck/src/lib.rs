@@ -53,9 +53,7 @@ pub mod ec {
     pub const RETURN_VALUE_MISMATCH: ErrorCode = ErrorCode(305);
     /// A construct outside the Phase-1 supported subset was reached.
     pub const UNSUPPORTED_CONSTRUCT: ErrorCode = ErrorCode(306);
-    /// Function declaration is missing its return type annotation
-    /// (Phase 1 requires explicit return types).
-    pub const MISSING_RETURN_TYPE: ErrorCode = ErrorCode(307);
+    // 307 retired (was MISSING_RETURN_TYPE; missing `-> T` now defaults to `u0`).
     /// Function parameter is missing its type annotation.
     pub const MISSING_PARAM_TYPE: ErrorCode = ErrorCode(308);
     /// `break` or `continue` used outside of a loop body.
@@ -485,16 +483,13 @@ fn check_fn_signature(
             });
         }
     }
+    // A missing return type defaults to `u0` (spec §5.4.1) — matches
+    // the elided form `fn f(...) { ... }` used in helpers that do I/O
+    // for side effects only. Out of grammar there is no syntactic
+    // distinction between "explicit `-> u0`" and "no `->` at all".
     let ret = match fn_decl.ret_type().and_then(|rt| rt.ty()) {
         Some(t) => resolve_type(t, resolved, sm, diags),
-        None => {
-            diags.push(Diagnostic::error(
-                ec::MISSING_RETURN_TYPE,
-                Label::new(fn_decl.span(), ""),
-                "function declaration is missing its return type; Phase 1 requires explicit `-> T`",
-            ));
-            Ty::Error
-        }
+        None => Ty::U0,
     };
     // Class- and slice-typed returns are accepted via the by-pointer
     // ABI (hidden out-pointer; classes A.3, slices A.4). Pointers
@@ -1771,6 +1766,21 @@ mod tests {
     #[test]
     fn empty_main_is_clean() {
         assert_eq!(check("fn main() -> i32 { return 0; }"), 0);
+    }
+
+    #[test]
+    fn missing_return_type_defaults_to_u0() {
+        // No `-> T` annotation — the helper falls through without a
+        // value, which is well-typed against the implicit `u0` return.
+        let src = "fn helper(x: i32) { let y: i32 = x; } fn main() -> i32 { helper(1); return 0; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn missing_return_type_rejects_value_return() {
+        // No `-> T` annotation defaults to `u0`; returning a non-unit
+        // value must still diagnose against the inferred `u0`.
+        assert!(check("fn helper() { return 1; } fn main() -> i32 { return 0; }") >= 1);
     }
 
     #[test]
