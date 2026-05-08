@@ -2,12 +2,16 @@
 
 This document is the entry point for the next development session. Read it first.
 
-> **Last updated:** after Phase 1 increment A.4 (Option-A follow-up complete).
+> **Last updated:** after Phase 13 increment B.5 (Option B complete — LLVM backend at corpus parity).
 > **Repo root:** `/Users/silmaril/Documents/GitHub/gw`
-> **Workspace test count:** 147 unit + integration tests, all green.
+> **Workspace test count:** 148 unit + integration tests, all green.
 > **Corpus size:** 61 Phase-0 lex+parse snapshots + 226 Phase-1 run-tests.
 > **Phase 1 exit gate met** (200-program target hit at 12h; the post-exit
 > follow-up A.1–A.4 added 26 more, for 226 total).
+> **Phase 13 (LLVM backend) complete** — `arsenal build --backend=llvm`
+> compiles and runs every program in the 226-program corpus, matching
+> Cranelift exit codes and stdout bit-exactly. Both backends ship in
+> the same workspace; `--backend=fast` (Cranelift) remains the default.
 
 ---
 
@@ -41,12 +45,20 @@ through fn signatures** via a hidden-out-pointer ABI. Helpers like
 `fn doubled(c: Counter) -> Counter` and `fn print_slice(s: []u8) -> u0`
 that previously had to be inlined at every call site now factor cleanly.
 
-**Phase 0 is complete. Phase 1 is functionally complete** — the
-architecture's exit criterion ("200 small `.gw` programs that compile and
-run") has been met, and the most-felt corpus-author walls (no class
-params, no width bridging) have been removed. The remaining items are
-the LLVM port (13), which was explicitly deferred when Cranelift
-replaced LLVM as the Phase-1 backend, plus the gaps listed under
+The Phase 13 bundle (B.1–B.5) reinstates LLVM as a parallel backend.
+`arsenal build --backend=llvm path/to/foo.gw` now compiles and runs
+all 226 corpus programs, with bit-exact agreement against Cranelift
+on every exit code and every byte of stdout that has an
+`.expected_stdout` file. The MIR is consumed unchanged by both
+backends; the LLVM crate (`arsenal_codegen_llvm`) was a doc-comment
+stub before B.1 and now carries roughly 950 LoC of compiler logic.
+Bug yield across the bundle: zero — neither backend disagreed about
+saturating fcvt, ordered float comparisons, sign-aware integer ops,
+or the System V "memory class" aggregate ABI.
+
+**Phase 0 is complete. Phase 1 is functionally complete. Phase 13 is
+complete.** The remaining work is Phase 2+ (comptime, modules,
+match, error unions) and the tactical-cleanup list under
 [What doesn't work yet](#what-doesnt-work-yet-phase-1-deferred-or-incomplete).
 
 ---
@@ -88,8 +100,8 @@ gw/
 │       ├── arsenal_typeck/      ★ active
 │       ├── arsenal_mir/         ★ active
 │       ├── arsenal_codegen_fast/★ active (Cranelift-backed)
+│       ├── arsenal_codegen_llvm/★ active (LLVM-18-backed via inkwell, Phase 13)
 │       ├── arsenal_driver/      ★ active (the `arsenal` binary)
-│       ├── arsenal_codegen_llvm/  stub  (Phase 13)
 │       ├── arsenal_borrow/        stub  (Phase 3)
 │       ├── arsenal_lir/           stub  (Phase 7)
 │       ├── arsenal_comptime/      stub  (Phase 2)
@@ -101,7 +113,7 @@ gw/
 └── .github/workflows/ci.yml      (Linux/macOS/Windows matrix)
 ```
 
-### Active crate roles (≈5 500 LoC of compiler logic)
+### Active crate roles (≈6 450 LoC of compiler logic)
 
 | Crate | Phase | Role |
 |---|---|---|
@@ -112,7 +124,8 @@ gw/
 | `arsenal_typeck` | 1 | Bidirectional checker. `Ty` enum: `U0`/`Bool`/`Int(IntTy)`/`Float(FloatTy)`/`Rune`/`Class(DefId)`/`Slice(IntTy)`/`Ptr(IntTy)`/`Error`. Emits a `TypedModule` with per-CST-node `expr_types`, `path_bindings`, `pat_bindings`, `call_targets`, `sigs`, `classes`. Slice + raw-pointer surface (11b/11c) are FFI-restricted. **Bidirectional literal narrowing (12d/12h)**: `check_expr` calls `try_narrow_literal` first — bare `IntLit`/`FloatLit`, `Unary(Minus, Literal)`, and `Paren(...)` shapes adopt the expected width when the value fits; out-of-range diagnoses against the literal span. `synth_binop_operands` extends the same rule across binary operators so `n < 2` (with `n: i64`) types cleanly. **`synth_cast` (A.1/A.2)** accepts the full numeric matrix `(Int\|Float, Int\|Float)`; non-numeric pairs reject with `UNSUPPORTED_CONSTRUCT`. **Class-/slice-typed fn params and returns (A.3/A.4)** are accepted via the by-pointer ABI; the `UNSUPPORTED_CONSTRUCT` rejections in `check_fn_signature` were dropped. |
 | `arsenal_mir` | 1 | CFG of basic blocks; primitive locals + aggregate stack-slot locals (class + slice); `Assign`/`AssignField` statements; `Use`/`BinOp`/`UnOp`/`Field`/`Cast` rvalues; `Goto`/`Branch`/`Return`/`Call`/`Unreachable` terminators. Loop-target stack for break/continue. `lower_for` desugar. `Const::DataAddr` + program-level `string_literals` table for `.rodata` payloads (11b). Implicit Print at stmt-position string lits desugars to `write(1, slice.data, slice.len)`; auto-injects `extern fn write` if user didn't declare one (11c). **Short-circuit `&&` / `\|\|` (12b)**: `lower_short_circuit` emits a 3-block control-flow shape (rhs-eval / short-circuit / join) and bypasses `lower_binary` so the RHS is only evaluated when the LHS doesn't determine the result. **`Rvalue::Cast` (A.1/A.2)** carries `kind: CastKind`, `operand`, `src_ty`, `dst_ty`; the closed `CastKind` enum has 7 variants, each maps to one Cranelift op. `select_cast_kind` factors the kind selection out of `lower_cast`. **`def_to_fn` fix (A.3)**: pre-A.3 the map stored each def's position in `resolved.defs` (including class defs); A.3 only counts `Fn`/`SyntheticMain` defs when assigning indices, matching the order `functions` is populated. |
 | `arsenal_codegen_fast` | 1 | Cranelift-backed (placeholder until Phase 7 TPDE port). Aggregate (class + slice) layouts → stack slots; field reads/writes → stack_load/stack_store; aggregate-aggregate assigns → field-by-field copy. String literals materialised via `module.declare_data` + `define_data_object` under `__gw_str_<i>` symbols (11b). `*T` raw pointers lower as pointer-sized scalars (11c). **Float comparisons (12a)**: `lower_binop` branches on `ty.is_float()` for `Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge` — floats use `fcmp` with the matching `FloatCC`, ints keep `icmp`. **Cast lowering (A.1/A.2)**: `Rvalue::Cast` arm reads operand at `clif_ty(src_ty)` and applies one Cranelift op per `CastKind` — `sextend`/`uextend`/`ireduce` for ints, `fcvt_from_sint`/`fcvt_from_uint` and saturating `fcvt_to_*_sat` for int↔float, `fpromote`/`fdemote` for floats. Same-width `*Bitcast` variants need no instruction. **Aggregate-by-pointer ABI (A.3/A.4)**: `make_signature` prepends a hidden out-pointer for aggregate returns and substitutes pointer-typed `AbiParam` for aggregate params. `define_fn` defers the entry-block switch until the lower-block loop's first iteration to keep Cranelift's "fill before switching" rule satisfied; aggregate params copy in via `copy_aggregate_from_ptr`, and `Terminator::Return` for an aggregate-returning fn copies out through `copy_aggregate_to_ptr`. `Terminator::Call` prepends `stack_addr(dst_slot)` for aggregate returns and substitutes `stack_addr` for aggregate args. |
-| `arsenal_driver` | 0/1 | Subcommands: `arsenal new <name>`, `arsenal build <file.gw>`, `arsenal dump <path>`, `arsenal --version`. Build pipeline: lex → parse → resolve → typeck → MIR → Cranelift → object → `cc` link → executable. |
+| `arsenal_codegen_llvm` | 13 | LLVM-18-backed via `inkwell` (B.1–B.5). Same `MirProgram → object bytes` contract as `arsenal_codegen_fast` — driver picks at `--backend=fast\|llvm`. Storage: alloca-per-local in the entry block (clang `-O0` style), `[N x i8]` allocas for aggregates with alignment bumped to the layout's max-field align via `InstructionValue::set_alignment`. Field addressing via byte-offset GEP through `i8` (opaque pointers; no struct types declared to LLVM). Bool stays at LLVM `i1` end-to-end (no i8 storage adapter). Float comparisons use ordered predicates (`OEQ`/`OLT`/etc.); float-→int casts route through the saturating `llvm.fpto{si,ui}.sat` intrinsics for Rust ≥ 1.45 / Cranelift parity. `Const::Float` lowers via `build_bit_cast(int_const, float_ty)` to preserve NaN payloads (a `const_float(f64)` round-trip would lose them on the F32 path). String literals materialise as one private `__gw_str_<i>` global per `MirProgram::string_literals` entry; `Const::DataAddr(id)` returns the global's address as `ptr`. Aggregate ABI: hidden out-pointer for aggregate returns; by-pointer for aggregate user params. `sret`/`byval` attributes intentionally omitted — corpus aggregates flow only between GW fns, plain-`ptr` agrees with Cranelift's manual `stack_addr` convention end-to-end. A small `build.rs` adds Homebrew's `lib` prefix to the linker search path on macOS so LLVM-18's system-libs (zstd, ffi, xml2, curses) resolve without `RUSTFLAGS` rituals. |
+| `arsenal_driver` | 0/1 | Subcommands: `arsenal new <name>`, `arsenal build [--backend=fast\|llvm] <file.gw>`, `arsenal dump <path>`, `arsenal --version`. Build pipeline: lex → parse → resolve → typeck → MIR → (Cranelift OR LLVM) → object → `cc` link → executable. `--backend=fast` is the default; both backends emit the same `Vec<u8>` object-bytes shape so the linker invocation is shared. |
 
 ---
 
@@ -146,6 +159,11 @@ Each increment shipped one or more corpus programs and a single commit.
 | A.2 | `as` cast float bridge | `258cc70` | +6 | extends `synth_cast` to numeric ↔ numeric; `CastKind` adds `IntToFloat`/`FloatToInt`/`FloatExt`/`FloatTrunc`/`FloatBitcast`; codegen wires `fcvt_*`/`fpromote`/`fdemote` (saturating + NaN→0 for float→int); +3 net typeck and +7 MIR unit tests | 0 |
 | A.3 | class-by-pointer ABI | `a6dc722` | +8 | typeck drops `UNSUPPORTED_CONSTRUCT` on class params/returns; codegen `make_signature` prepends hidden out-ptr for aggregate returns and substitutes ptr params for aggregate args; `copy_aggregate_from_ptr` at fn entry, `copy_aggregate_to_ptr` at return, `stack_addr` substitution at call sites; param prelude moved into the lower-block loop's iter-0 to satisfy Cranelift's "fill before switching" rule; +4 typeck and +1 MIR unit tests | **1** — latent `def_to_fn` off-by-N (counted class defs when assigning FnIdx); never triggered pre-A.3 because no class+fn-call combination existed |
 | A.4 | slice-by-pointer ABI | `5d71372` | +4 | typeck drops `UNSUPPORTED_CONSTRUCT` on slice params/returns; **zero codegen changes** — `is_aggregate_ty` already covered `Ty::Slice`; +3 net typeck unit tests | 0 |
+| B.1 | LLVM tracer bullet (`return 0` only) | `0c3a9fe` | (LLVM corpus 0 → 1) | `arsenal_codegen_llvm` from doc-comment stub to working `MirProgram → object bytes` via `inkwell`; `--backend=fast\|llvm` flag; `arsenal_codegen_llvm/build.rs` adds Homebrew lib paths on macOS for LLVM-18's system-libs (zstd / ffi / xml2 / curses); `arsenal_driver/tests/llvm_backend.rs` integration test; +1 integration test | 0 |
+| B.2 | int + control flow + extern fns + recursion | `9384331` | (LLVM corpus 1 → 135) | alloca-per-local in entry block (clang `-O0` style); `Rvalue::Use`/`BinOp`/`UnOp` for ints + bools (signedness-aware Div/Mod/Shr); `Operand::Const(Int\|Bool\|Unit)` and `Operand::Local`; `Terminator::{Goto, Branch, Return, Call, Unreachable}`; bool stays at LLVM `i1` end-to-end so `Branch` needs no zext / trunc adapter | 0 |
+| B.3 | float ops + `as` cast matrix | `9e6192c` | (LLVM corpus 135 → 168) | `Const::Float` via `build_bit_cast(int_const, float_ty)` (preserves NaN payloads); `lower_float_binop` uses ordered predicates (`OEQ`/`OLT`/etc.); `Rvalue::Cast` flat dispatch on `CastKind` (sext / zext / trunc / sitofp / uitofp / `llvm.fpto{si,ui}.sat` / fpext / fptrunc / no-op); intrinsic dispatch via `Intrinsic::find` + `get_declaration` per overload pair | 0 |
+| B.4 | aggregate ABI (class + slice by-pointer) | `1129232` | (LLVM corpus 168 → 203) | aggregate locals: `[N x i8]` alloca with `set_alignment(layout.align)`; field addressing via byte-offset GEP through `i8`; aggregate Assign / Return / param entry copy via `llvm.memcpy`; `make_fn_type` prepends `ptr` for sret + substitutes `ptr` for aggregate args; `LoweringCx::ret_out_ptr` captured at fn entry; `lower_call` prepends `dst.alloca` for aggregate returns and substitutes `src.alloca` for aggregate args. `sret`/`byval` attributes intentionally omitted (no C-ABI consumers in Phase 1) | 0 |
+| B.5 | string literals + Print desugar | `8c2a6df` | (LLVM corpus 203 → 226 — full parity) | private `__gw_str_<i>` global per `MirProgram::string_literals` entry, `Const::DataAddr(id) → global.as_pointer_value()`; `Ty::Ptr(_) → ptr` in `llvm_basic_type` and `make_fn_type` (extern `fn write(*u8, ...)` declares cleanly, `slice.data` loads back as `ptr`); empty-payload one-byte pad mirrors Cranelift; hand-curated `SUPPORTED` allow-list dropped in favour of iterate-the-corpus loop | 0 |
 
 **Key pattern**: each "0 bugs" increment was almost pure corpus growth (the
 plumbing was already in place). Each "≥1 bug" increment caught real
@@ -163,6 +181,18 @@ ratio: A.3 was the only "new pipeline shape" sub-bundle (the by-pointer
 calling convention) and yielded exactly one bug; A.1, A.2, A.4 were
 recombinations and yielded zero. The heuristic is reliable enough to
 use as a risk weighting when planning future bundles.
+
+Phase 13 (B.1–B.5) is the one significant exception, and worth
+recording. The pre-bundle prediction was *high* yield: B.3 (saturating
+fcvt) and B.4 (aggregate ABI) were both shape-novel for a brand-new
+backend, and "Cranelift / LLVM divergence" was explicitly the bundle's
+selling point. Observed yield: zero across all five sub-bundles. The
+result is itself the datapoint — at the surfaces Phase 1 exercises
+(IEEE-754 ordered comparisons, sign-aware integer ops,
+saturating + NaN→0 fcvt, System V "memory class" aggregate ABI),
+LLVM 18 and Cranelift agree bit-exactly. The dual-backend test
+starts paying its keep at Phase 2's shapes (comptime, larger corpus,
+weirder values), not Phase 1's.
 
 ### What 226 corpus programs cover
 
@@ -271,6 +301,8 @@ built `path/to/some`
 $ ./path/to/some
 $ echo $?
 21
+$ arsenal build --backend=llvm path/to/some.gw   # Phase 13
+built `path/to/some`
 $ arsenal dump path/to/some.gw     # AST dump for debugging
 $ arsenal --version
 arsenal 0.0.1
@@ -278,16 +310,25 @@ arsenal 0.0.1
 
 ### Test infrastructure
 
-- `cargo test` at workspace root runs the entire suite (121 tests).
+- `cargo test` at workspace root runs the entire suite (148 tests).
 - `cargo test -p arsenal_parse --test snake_eater` runs the lex+parse
   insta snapshot corpus (61 pass, 5 fail).
 - `cargo test -p arsenal_driver --test phase1_run` runs every
-  `tests/snake_eater/pass/phase1/*.gw` end-to-end: builds, executes,
-  matches exit code (and stdout where `.expected_stdout` is present).
-  Skipped on Windows (`#![cfg(not(windows))]`) — `cc` integration is a
-  later concern.
+  `tests/snake_eater/pass/phase1/*.gw` end-to-end through the
+  Cranelift backend: builds, executes, matches exit code (and stdout
+  where `.expected_stdout` is present). Skipped on Windows
+  (`#![cfg(not(windows))]`) — `cc` integration is a later concern.
+- `cargo test -p arsenal_driver --test llvm_backend` runs the **same
+  226-program corpus** through `arsenal build --backend=llvm`. Both
+  tests share the corpus directory; any program added to
+  `tests/snake_eater/pass/phase1/` is automatically exercised through
+  both backends. Requires `LLVM_SYS_180_PREFIX` set at build time
+  (see Pre-flight checklist).
 - CI workflow at `.github/workflows/ci.yml` runs build + fmt --check +
-  clippy `-D warnings` + test on Linux / macOS / Windows.
+  clippy `-D warnings` + test on Linux / macOS / Windows. **Note:** CI
+  matrix has not yet been updated to install LLVM 18 / set
+  `LLVM_SYS_180_PREFIX`, so the `llvm_backend` integration test won't
+  build in CI until that lands. Tracked under tactical cleanup below.
 
 ---
 
@@ -306,9 +347,10 @@ arsenal 0.0.1
 | Pointer arithmetic, dereference (`*p`), address-of (`&x`) | No syntax / typing rules yet | Phase 3 with the memory model |
 | Mixing `putchar` and implicit Print in the same program | Output ordering under piped stdout is `[all writes][all putchars]` because stdio buffers putchar but `write(2)` syscall bypasses stdio | Add an `extern fn fflush(stream: *u8) -> i32;` corpus pattern, OR document the rule (current state — see corpus design notes below) |
 | Functions without explicit return type (`fn f(x: i32) {`) | Parser rejects with E0307 | Add a default `-> u0` arm to `parse_fn_decl` if the user wants to elide it. Currently every fn must declare its return type |
-| `BinOp::Mod` and `BinOp::Pow` on float operands | Codegen falls through to `srem`/`urem` (wrong) or traps (Pow) | Typeck doesn't currently produce float `%` / `**`. If a future corpus does, add float arms in `lower_binop` |
-| LLVM backend | `arsenal_codegen_llvm` stub only | **Increment 13** — not session-blocking |
+| `BinOp::Mod` and `BinOp::Pow` on float operands | Codegen falls through to `srem`/`urem` (wrong) or traps (Pow) | Typeck doesn't currently produce float `%` / `**`. If a future corpus does, add float arms in `lower_binop` (both backends now have a stub Unsupported / trap path) |
 | `arsenal new` template parses cleanly | Templates use `#virtuous {}` syntax that Phase 1 parser rejects | Swap templates to Phase-1 syntax (the bare-string-literal half now works after 11c, but the `#virtuous` directive is still rejected) |
+| CI matrix doesn't install LLVM 18 | `cargo test --workspace` in CI fails to build `arsenal_codegen_llvm` (no `llvm-config-18`); the `llvm_backend` integration test never runs in CI | Add a per-OS matrix step that installs LLVM 18 (`brew install llvm@18` on macOS; the official LLVM apt/yum repo on Linux; chocolatey on Windows) and exports `LLVM_SYS_180_PREFIX`. Until it lands, the LLVM backend is dev-machine-tested only |
+| Class field of type `bool` | Loads / stores at LLVM's `i1` width into a `(1, 1)` byte slot | No corpus program currently exercises this. If one shows up the fix is the standard zext-on-store / trunc-on-load adapter (matches the `i8`-storage convention rustc uses) |
 
 ### Corpus design notes (rules learned during increment 12 / A.x)
 
@@ -356,10 +398,16 @@ session start before changing them.
 1. **Tracer-bullet ordering**: each Phase-1 increment is end-to-end
    compileable + runnable, never "build subsystem N to completion then
    subsystem N+1". *(approved at start of Phase 1)*
-2. **Cranelift backend now, LLVM port deferred to Phase 13** — explicit
-   deviation from architecture Part F.2 which mandates LLVM for Phase 1.
-   `arsenal_codegen_llvm` stub still pinned to `inkwell 0.5` /
-   `llvm-sys 180` in workspace deps.
+2. **Cranelift and LLVM ship as parallel backends** (Phase 13 / B.1–B.5)
+   — `arsenal build --backend=fast` (Cranelift, default) and
+   `--backend=llvm` (LLVM 18 via inkwell) both compile the entire
+   226-program corpus. Both consume the same `MirProgram`. LLVM is
+   pinned to 18.x (inkwell 0.5 + `llvm-sys 180`); upgrading the
+   feature flag in `[workspace.dependencies]` is a coordinated change
+   to `arsenal_codegen_llvm/src/lib.rs` (intrinsic names + opaque-
+   pointer assumptions). Architecture Part F.2 is now satisfied —
+   LLVM is the architecture-mandated backend, Cranelift remains
+   because it's the placeholder for the Phase 7 TPDE port.
 3. **`cc` for linking, not bundled `lld`** — architecture wants lld
    eventually (Part J.3); Phase 1 shells out to system `cc` (clang on
    macOS, gcc on Linux). Windows linker untested.
@@ -475,6 +523,57 @@ session start before changing them.
     terminator ever dispatched to a fn defined after a class. A.3
     surfaces it; the fix only increments the FnIdx counter for `Fn` /
     `SyntheticMain` defs.
+24. **Backend selection is a CLI flag, not a feature** (B.1) — the
+    `--backend=fast|llvm` flag in `cmd_build.rs` dispatches to
+    either `arsenal_codegen_fast::compile_program` or
+    `arsenal_codegen_llvm::compile_program`. Both crates are
+    unconditional workspace dependencies; there's no `cfg` gate on
+    LLVM. Building the workspace requires LLVM 18 to be installed
+    (see #25). Default is `fast` so `arsenal build foo.gw` keeps
+    behaving as before. Naming reflects the crate names — `fast`
+    survives the eventual TPDE swap inside `arsenal_codegen_fast`
+    without a rename.
+25. **LLVM 18 build prerequisites** (B.1) — the workspace needs
+    `LLVM_SYS_180_PREFIX` set when invoking `cargo build` /
+    `cargo test`. On macOS: `brew install llvm@18` and
+    `export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18`. On Linux:
+    install LLVM 18 dev libs from the official LLVM apt/yum repo
+    (Ubuntu's bundled `llvm-dev` may be too old) and set
+    `LLVM_SYS_180_PREFIX` to its prefix. Additionally, LLVM 18's
+    system-libs (zstd / ffi / xml2 / curses) must be linker-findable;
+    `arsenal_codegen_llvm/build.rs` adds `/opt/homebrew/lib` and
+    `/usr/local/lib` on macOS so Homebrew's keg-only `zstd` etc.
+    resolve without `RUSTFLAGS` rituals.
+26. **LLVM aggregate ABI: plain `ptr`, no `sret`/`byval` attrs** (B.4)
+    — `arsenal_codegen_llvm::make_fn_type` emits a hidden `ptr` for
+    aggregate returns and `ptr` for aggregate user params, with no
+    `sret(<type>)` / `byval(<type>)` parameter attributes attached.
+    This is sufficient because corpus aggregates flow only between GW
+    fns, never through C ABI; the plain-`ptr` form agrees bit-exactly
+    with Cranelift's manual `stack_addr` convention across the
+    corpus. **If Phase 2+ ever passes an aggregate to a C extern**
+    (extending the corpus or adding a real FFI surface), add `sret` /
+    `byval` then; both inkwell methods exist and the codegen call is
+    a one-line addition per arm.
+27. **Bool stays at LLVM `i1` end-to-end** (B.2) — alloca `i1`,
+    store `i1`, load `i1`, branch on `i1`. No `i8` storage adapter
+    (clang / rustc use `i8` storage for ABI compliance with C
+    `_Bool`). The decision keeps the lowering code uniform but means
+    a class field of type `bool` would store/load at `i1` width
+    against a 1-byte slot — works on x86_64 / aarch64-apple-darwin
+    (which tolerate misaligned 1-bit access) but isn't strictly C-
+    ABI-compliant. No corpus program currently has a bool class field;
+    if one shows up, switch to the zext-on-store / trunc-on-load
+    adapter.
+28. **One LLVM `Context` per `compile_program` call** (B.1) — every
+    `arsenal build --backend=llvm` invocation creates a fresh
+    `inkwell::context::Context`, builds the module, emits the object,
+    drops the context. There's no cross-call context reuse. This is
+    the reason the LLVM corpus test takes ~30s for 226 programs —
+    LLVM target init dominates. Once we batch-compile in Phase 2 (a
+    single `cargo build` of a multi-file project), share one context
+    across the whole build invocation. For one-shot `arsenal build
+    foo.gw` the per-call cost is unimportant.
 
 ---
 
@@ -483,8 +582,9 @@ session start before changing them.
 
 The architecture's Phase-1 exit gate (200-program corpus) is met
 **and** the Phase-1 follow-up "Option A" (class/slice ABI + `as` casts)
-landed across A.1–A.4. The two remaining direction calls (B / C) and
-a tactical-cleanup list are below; pick based on session goal.
+landed across A.1–A.4. The "Option B" Phase-13 LLVM backend then
+shipped across B.1–B.5. Only Option C and the tactical-cleanup list
+remain; pick based on session goal.
 
 ### Option A — DONE
 
@@ -494,35 +594,18 @@ ABI (5d71372). One bug yielded across the four sub-bundles (the
 latent `def_to_fn` off-by-N surfaced by A.3). Corpus 200 → 226;
 unit tests 121 → 147.
 
-### Option B — Phase 13: LLVM backend port
+### Option B — DONE
 
-`arsenal_codegen_llvm` is currently a stub. The architecture's Part
-F.2 originally mandated LLVM for Phase 1; we deviated to Cranelift
-to ship faster. Phase 13 is reinstating LLVM as a parallel backend,
-which then becomes the default for release builds.
-
-Workspace deps already pin `inkwell 0.5` / `llvm-sys 180`. The MIR is
-backend-agnostic; both Cranelift and LLVM consume the same
-`MirProgram`. Port the existing 226-program corpus through a
-`--backend=llvm` driver flag and ensure exit codes / stdout match.
-
-Estimated cost: 15–30 hours. Bug yield: high — every backend
-divergence (NaN handling, sign extension, calling convention quirks)
-shows up as a divergence between the two backends. The 226-program
-corpus now exercises a much wider surface than the 200 it would
-have at the start of session: `as` casts (saturating fcvt is a
-classic Cranelift/LLVM divergence point), aggregate calling
-convention (LLVM has its own `byval`/`sret` attributes), float
-literal narrowing. **Higher expected bug yield than at 12h.**
-
-A natural sub-bundling, mirroring the 12 / A.x rhythm:
-- **B.1** — tracer bullet: `--backend=llvm` flag, `return 0` only.
-- **B.2** — int arithmetic, control flow, all primitive ops.
-- **B.3** — float ops + `as` casts (saturating semantics divergence
-  is the most likely yielder here).
-- **B.4** — aggregate ABI (sret / byval — LLVM has explicit
-  attributes for this, unlike Cranelift's manual stack_addr dance).
-- **B.5** — extern fns + Print desugar + final corpus parity.
+B.1–B.5 shipped in this order: tracer bullet (0c3a9fe), int +
+control flow + extern + recursion (9384331), float ops + `as`
+matrix (9e6192c), aggregate ABI (1129232), string literals + Print
+desugar (8c2a6df). Zero bugs yielded across the five sub-bundles —
+the dual-backend invariant held bit-exactly across saturating fcvt,
+ordered float comparisons, sign-aware integer ops, and the System V
+"memory class" aggregate ABI. LLVM corpus 0 → 226 (full parity);
+unit tests 147 → 148. The architecture's Part F.2 LLVM mandate is
+now satisfied; Cranelift remains as the placeholder for the Phase 7
+TPDE port.
 
 ### Option C — Phase 2: comptime + module system
 
@@ -538,6 +621,11 @@ where the parser stops emitting `ErrorNode` for the spec's harder
 features and where the runtime model gets complicated (compile-time
 evaluation, module resolution, async).
 
+The dual-backend test now in place means any Phase 2 codegen change
+is automatically validated against both Cranelift and LLVM; this
+becomes useful as larger / weirder shapes start flowing through the
+pipeline.
+
 ### Tactical cleanup (any session)
 
 These are all self-contained and worth landing whenever a session
@@ -550,13 +638,29 @@ runs short on time for the bigger items:
    fix: rewrite the templates to use today's syntax.
 3. **`-> u0` returning `()` semicolons.** Confirm the corpus rules
    hold for fn bodies that fall through without a `return`.
-4. **Float `Mod` and `Pow`** codegen arms (currently fall through to
-   integer ops; harmless because typeck doesn't produce them, but
-   not future-proof).
+4. **Float `Mod` and `Pow`** codegen arms (Cranelift falls through
+   to integer ops; LLVM returns `Unsupported`. Both are harmless
+   today — typeck doesn't produce them — but neither is
+   future-proof. Add float arms in both backends together so they
+   stay in lockstep).
 5. **Non-`u8` slice elements.** `resolve_type` for `Ty::Slice` only
-   accepts `[]u8` today; A.4 didn't widen this. `aggregate_layout`
-   already handles 8-byte fields generically, so the typeck-only
-   change is small. Worth ~30 min if a corpus program wants `[]i32`.
+   accepts `[]u8` today; A.4 didn't widen this. Both backends'
+   aggregate paths already handle arbitrary 8-byte fields, so the
+   typeck-only change is small. Worth ~30 min if a corpus program
+   wants `[]i32`.
+6. **Wire LLVM 18 into CI** (`.github/workflows/ci.yml`). Per-OS
+   matrix step that installs LLVM 18 and exports
+   `LLVM_SYS_180_PREFIX`. Until this lands, the `llvm_backend`
+   integration test runs only on dev machines. ~30–60 min, mostly
+   YAML and bisecting whichever Linux distro's package name for
+   `llvm-18-dev` is current.
+7. **`ld: warning: no platform load command found`** spam from
+   LLVM-emitted Mach-O objects on macOS. The LLVM module isn't
+   tagging the object with `LC_BUILD_VERSION`. Cosmetic; binaries
+   still run. Likely fix: either set the macOS triple's deployment
+   target on the `TargetMachine` or add an `-mmacosx-version-min`
+   flag at the `cc` invocation. Trivial when someone gets annoyed
+   enough.
 
 ---
 
@@ -602,17 +706,27 @@ state this doc describes:
 ```bash
 cd /Users/silmaril/Documents/GitHub/gw
 git log --oneline | head -10
-# expect tip: A.4 (5d71372), A.3 (a6dc722), A.2 (258cc70), A.1 (c1b091e),
-#             then 635b6d3 (HANDOFF for 12), 8bc26a4 (12h), 42e17cc (12g),
-#             3d91072 (12f), 3543601 (12e), aa1536d (12d) at the bottom
-#             of the head -10.
+# expect tip: B.5 (8c2a6df), B.4 (1129232), B.3 (9e6192c), B.2 (9384331),
+#             B.1 (0c3a9fe), then a8e9ea0 (HANDOFF for A.x), 5d71372 (A.4),
+#             a6dc722 (A.3), 258cc70 (A.2), c1b091e (A.1) at the bottom
+#             of the head -10. (The HANDOFF refresh you're reading sits on
+#             top of B.5.)
 
 git status
 # expect: clean working tree (no .DS_Store, no .probe leftovers)
 
+# LLVM 18 must be installed and discoverable for the workspace to build.
+# On macOS:
+which /opt/homebrew/opt/llvm@18/bin/llvm-config && /opt/homebrew/opt/llvm@18/bin/llvm-config --version
+# expect: "18.x.x" (any 18.x — `brew install llvm@18` installs the
+# current bottle, currently 18.1.8). If absent, `brew install llvm@18`
+# and `brew install zstd` (LLVM 18's bottle links zstd).
+
+export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
+
 . "$HOME/.cargo/env"
 cargo test --manifest-path compiler/arsenal-boot/Cargo.toml --workspace 2>&1 | grep "test result" | awk '{p+=$4;f+=$6}END{print p,f}'
-# expect: "147 0"
+# expect: "148 0"
 
 ls tests/snake_eater/pass/phase1/*.gw | wc -l
 # expect: 226
@@ -624,19 +738,29 @@ ls compiler/arsenal-boot/crates/ | wc -l
 If any of those fail, **don't start the next session's work** —
 investigate first. The most likely culprits are stale `target/`
 directories, an outdated `Cargo.lock`, or someone else's commits
-between sessions.
+between sessions. If `cargo build` fails inside `arsenal_codegen_llvm`
+or `llvm-sys`, double-check `LLVM_SYS_180_PREFIX` and make sure the
+LLVM 18 install hasn't been replaced by a newer version (the pin is
+to 18.x specifically; 19+ won't work without bumping the inkwell
+feature flag in `[workspace.dependencies]`).
 
 ---
 
 ## Appendix — useful commands
 
 ```bash
-# Build the compiler
+# Build the compiler (needs LLVM_SYS_180_PREFIX in the env)
+export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
 cargo build --manifest-path compiler/arsenal-boot/Cargo.toml -p arsenal_driver
 
-# Compile and run a single .gw file
+# Compile and run a single .gw file (Cranelift, default)
 ARSENAL=compiler/arsenal-boot/target/debug/arsenal
 $ARSENAL build path/to/file.gw
+./path/to/file
+echo $?
+
+# Same file through the LLVM backend
+$ARSENAL build --backend=llvm path/to/file.gw
 ./path/to/file
 echo $?
 
@@ -647,9 +771,13 @@ $ARSENAL dump path/to/file.gw
 otool -tv path/to/binary  # macOS
 objdump -d path/to/binary # Linux
 
-# Run only the Phase-1 run-corpus
+# Run only the Phase-1 run-corpus through Cranelift
 cargo test --manifest-path compiler/arsenal-boot/Cargo.toml \
     -p arsenal_driver --test phase1_run
+
+# Run the same corpus through the LLVM backend
+cargo test --manifest-path compiler/arsenal-boot/Cargo.toml \
+    -p arsenal_driver --test llvm_backend
 
 # Run just the lex+parse snapshot corpus
 cargo test --manifest-path compiler/arsenal-boot/Cargo.toml \
@@ -659,6 +787,11 @@ cargo test --manifest-path compiler/arsenal-boot/Cargo.toml \
 INSTA_UPDATE=always cargo test \
     --manifest-path compiler/arsenal-boot/Cargo.toml \
     -p arsenal_parse --test snake_eater
+
+# Inspect generated LLVM IR for a single file (handy when debugging a
+# B.x miscompile — emit .ll instead of .o by tweaking the driver, OR
+# disassemble the .o to confirm what landed):
+otool -tv path/to/file       # disassembled native code
 ```
 
 ---
@@ -666,7 +799,9 @@ INSTA_UPDATE=always cargo test \
 ## One-line architecture summary
 
 ```
-.gw → lex → parse → resolve → typeck → MIR → Cranelift → object → cc → executable
+                                              ┌─→ Cranelift ─┐
+.gw → lex → parse → resolve → typeck → MIR ───┤              ├─→ object → cc → executable
+                                              └─→ LLVM 18 ───┘
 ```
 
 Each arrow is a separate active crate; each bug we've caught lived at exactly
@@ -682,5 +817,8 @@ extended every arrow except `lex` and `resolve`: parser added postfix
 `as`, AST added `CastExpr`, typeck added `synth_cast` plus the dropped
 class/slice rejections, MIR added `Rvalue::Cast` and the `def_to_fn`
 fix, codegen added the seven `CastKind` arms and the aggregate-by-
-pointer ABI. The 226-program corpus is the direct test surface for
-every one of those arrows.
+pointer ABI. The B.1–B.5 bundle added the LLVM fork on the right side
+of the diamond — same MIR consumed by both backends, same `Vec<u8>`
+object-bytes shape produced. The 226-program corpus is the direct test
+surface for every one of those arrows, exercised through both backends
+in CI (once #6 in the tactical-cleanup list lands).
