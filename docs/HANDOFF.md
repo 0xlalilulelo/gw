@@ -2,16 +2,24 @@
 
 This document is the entry point for the next development session. Read it first.
 
-> **Last updated:** after tactical-cleanup #6 (CI now installs LLVM 18 and runs the dual-backend test on every push).
+> **Last updated:** after Phase-2 increments cleanup #1 / C.1 / C.2 (the
+> first c-strings surface lands; `[*:0]u8` is now the spec-correct type
+> for `c"..."` literals and decays to `*u8` at extern call sites).
 > **Repo root:** `/Users/silmaril/Documents/GitHub/gw`
-> **Workspace test count:** 148 unit + integration tests, all green.
-> **Corpus size:** 61 Phase-0 lex+parse snapshots + 226 Phase-1 run-tests.
+> **Workspace test count:** 159 unit + integration tests, all green.
+> **Corpus size:** 61 Phase-0 lex+parse snapshots + 230 Phase-1 / Phase-2 run-tests.
 > **Phase 1 exit gate met** (200-program target hit at 12h; the post-exit
 > follow-up A.1–A.4 added 26 more, for 226 total).
 > **Phase 13 (LLVM backend) complete** — `arsenal build --backend=llvm`
-> compiles and runs every program in the 226-program corpus, matching
-> Cranelift exit codes and stdout bit-exactly. Both backends ship in
-> the same workspace; `--backend=fast` (Cranelift) remains the default.
+> compiles and runs every program in the corpus, matching Cranelift exit
+> codes and stdout bit-exactly. Both backends ship in the same workspace;
+> `--backend=fast` (Cranelift) remains the default.
+> **Phase 2 entry started** — c-strings sub-bundle (C.1 + C.2) shipped.
+> Three c-string corpus programs run through both backends; `c"..."`
+> literals type as `[*:0]u8`, lower via a new `Const::CStrAddr` MIR
+> variant against a parallel `cstring_literals` table, and decay to
+> `*u8` at extern fn boundaries. Cleanup #1 (default `-> u0` on missing
+> return type) shipped alongside.
 
 ---
 
@@ -56,10 +64,21 @@ Bug yield across the bundle: zero — neither backend disagreed about
 saturating fcvt, ordered float comparisons, sign-aware integer ops,
 or the System V "memory class" aggregate ABI.
 
+The Phase-2 entry (C.1 + C.2) brings c-strings end-to-end. `c"..."`
+literals lex / parse / typeck / MIR / Cranelift / LLVM; `[*:0]u8` is
+a parsed-and-type-system-distinct sentinel pointer that decays to
+`*u8` at extern call sites and at `let` annotations. Three corpus
+programs exercise the full surface (helper-fn taking `[*:0]u8`,
+escapes round-trip, sentinel-ptr-typed local). Cleanup #1 dropped
+the explicit-return-type requirement so unit-returning helpers
+(`fn greet(s: [*:0]u8) { puts(s); }`) can elide `-> u0`.
+
 **Phase 0 is complete. Phase 1 is functionally complete. Phase 13 is
-complete.** The remaining work is Phase 2+ (comptime, modules,
-match, error unions) and the tactical-cleanup list under
-[What doesn't work yet](#what-doesnt-work-yet-phase-1-deferred-or-incomplete).
+complete. Phase 2 is in progress** (c-strings sub-bundle landed; the
+remaining sub-bundles are `match`, error unions / optionals, and
+comptime / modules — see the [After Phase 1](#after-phase-1) section
+below). The tactical-cleanup list under [What doesn't work yet](#what-doesnt-work-yet-phase-1-deferred-or-incomplete)
+shrinks accordingly.
 
 ---
 
@@ -113,18 +132,18 @@ gw/
 └── .github/workflows/ci.yml      (Linux/macOS/Windows matrix)
 ```
 
-### Active crate roles (≈6 450 LoC of compiler logic)
+### Active crate roles (≈6 700 LoC of compiler logic)
 
 | Crate | Phase | Role |
 |---|---|---|
 | `arsenal_lex` | 0 | UTF-8 lexer state machine. 108-variant `TokenKind`, phf keyword table, `Span`/`SourceMap`/`Diagnostic`/`DiagBag` types. |
-| `arsenal_ast` | 0 | Hand-rolled rowan-style CST + typed AST. Single unified `SyntaxKind` enum (188 variants). Typed views for ~33 Phase-1 node kinds; `Stub` variants for the rest. `Module::stmts()` exposes top-level stmts (11a). `CastExpr` typed view added in A.1. Bumpalo arena per file. Pretty-printer for `arsenal dump`. |
-| `arsenal_parse` | 0 | Recursive-descent + Pratt expression precedence. Error-recovering. Produces both CST and AST. No parser generator. `parse_module` forks on `peek_item_keyword` between item and stmt (11a). `parse_type` handles `*T` / `[]T` / `&T` / `?T` / `[N]T`. **Postfix `as Type` (A.1)** at left binding power 22 — between `*`/`/`/`%` (19/20) and prefix unary (23), matching Rust precedence so `-1 as u32` parses as `(-1) as u32`. |
+| `arsenal_ast` | 0 | Hand-rolled rowan-style CST + typed AST. Single unified `SyntaxKind` enum (188 variants). Typed views for ~34 Phase-1 / Phase-2 node kinds; `Stub` variants for the rest. `Module::stmts()` exposes top-level stmts (11a). `CastExpr` typed view added in A.1. **`SentinelPtrType` typed view (C.2)** with `element()` + `sentinel()` accessors. Bumpalo arena per file. Pretty-printer for `arsenal dump`. |
+| `arsenal_parse` | 0 | Recursive-descent + Pratt expression precedence. Error-recovering. Produces both CST and AST. No parser generator. `parse_module` forks on `peek_item_keyword` between item and stmt (11a). `parse_type` handles `*T` / `[]T` / `&T` / `?T` / `[N]T` / **`[*:S]T` (C.2 — sentinel many-pointer; peek-at-1 of `Star` distinguishes from slice / array)**. **Postfix `as Type` (A.1)** at left binding power 22 — between `*`/`/`/`%` (19/20) and prefix unary (23), matching Rust precedence so `-1 as u32` parses as `(-1) as u32`. |
 | `arsenal_resolve` | 1 | Walks the AST, registers top-level fn + class defs, exports `primitive_type_name()`. `DefKind::SyntheticMain` is registered when top-level stmts coexist without explicit `fn main` (11a). |
-| `arsenal_typeck` | 1 | Bidirectional checker. `Ty` enum: `U0`/`Bool`/`Int(IntTy)`/`Float(FloatTy)`/`Rune`/`Class(DefId)`/`Slice(IntTy)`/`Ptr(IntTy)`/`Error`. Emits a `TypedModule` with per-CST-node `expr_types`, `path_bindings`, `pat_bindings`, `call_targets`, `sigs`, `classes`. Slice + raw-pointer surface (11b/11c) are FFI-restricted. **Bidirectional literal narrowing (12d/12h)**: `check_expr` calls `try_narrow_literal` first — bare `IntLit`/`FloatLit`, `Unary(Minus, Literal)`, and `Paren(...)` shapes adopt the expected width when the value fits; out-of-range diagnoses against the literal span. `synth_binop_operands` extends the same rule across binary operators so `n < 2` (with `n: i64`) types cleanly. **`synth_cast` (A.1/A.2)** accepts the full numeric matrix `(Int\|Float, Int\|Float)`; non-numeric pairs reject with `UNSUPPORTED_CONSTRUCT`. **Class-/slice-typed fn params and returns (A.3/A.4)** are accepted via the by-pointer ABI; the `UNSUPPORTED_CONSTRUCT` rejections in `check_fn_signature` were dropped. |
-| `arsenal_mir` | 1 | CFG of basic blocks; primitive locals + aggregate stack-slot locals (class + slice); `Assign`/`AssignField` statements; `Use`/`BinOp`/`UnOp`/`Field`/`Cast` rvalues; `Goto`/`Branch`/`Return`/`Call`/`Unreachable` terminators. Loop-target stack for break/continue. `lower_for` desugar. `Const::DataAddr` + program-level `string_literals` table for `.rodata` payloads (11b). Implicit Print at stmt-position string lits desugars to `write(1, slice.data, slice.len)`; auto-injects `extern fn write` if user didn't declare one (11c). **Short-circuit `&&` / `\|\|` (12b)**: `lower_short_circuit` emits a 3-block control-flow shape (rhs-eval / short-circuit / join) and bypasses `lower_binary` so the RHS is only evaluated when the LHS doesn't determine the result. **`Rvalue::Cast` (A.1/A.2)** carries `kind: CastKind`, `operand`, `src_ty`, `dst_ty`; the closed `CastKind` enum has 7 variants, each maps to one Cranelift op. `select_cast_kind` factors the kind selection out of `lower_cast`. **`def_to_fn` fix (A.3)**: pre-A.3 the map stored each def's position in `resolved.defs` (including class defs); A.3 only counts `Fn`/`SyntheticMain` defs when assigning indices, matching the order `functions` is populated. |
-| `arsenal_codegen_fast` | 1 | Cranelift-backed (placeholder until Phase 7 TPDE port). Aggregate (class + slice) layouts → stack slots; field reads/writes → stack_load/stack_store; aggregate-aggregate assigns → field-by-field copy. String literals materialised via `module.declare_data` + `define_data_object` under `__gw_str_<i>` symbols (11b). `*T` raw pointers lower as pointer-sized scalars (11c). **Float comparisons (12a)**: `lower_binop` branches on `ty.is_float()` for `Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge` — floats use `fcmp` with the matching `FloatCC`, ints keep `icmp`. **Cast lowering (A.1/A.2)**: `Rvalue::Cast` arm reads operand at `clif_ty(src_ty)` and applies one Cranelift op per `CastKind` — `sextend`/`uextend`/`ireduce` for ints, `fcvt_from_sint`/`fcvt_from_uint` and saturating `fcvt_to_*_sat` for int↔float, `fpromote`/`fdemote` for floats. Same-width `*Bitcast` variants need no instruction. **Aggregate-by-pointer ABI (A.3/A.4)**: `make_signature` prepends a hidden out-pointer for aggregate returns and substitutes pointer-typed `AbiParam` for aggregate params. `define_fn` defers the entry-block switch until the lower-block loop's first iteration to keep Cranelift's "fill before switching" rule satisfied; aggregate params copy in via `copy_aggregate_from_ptr`, and `Terminator::Return` for an aggregate-returning fn copies out through `copy_aggregate_to_ptr`. `Terminator::Call` prepends `stack_addr(dst_slot)` for aggregate returns and substitutes `stack_addr` for aggregate args. |
-| `arsenal_codegen_llvm` | 13 | LLVM-18-backed via `inkwell` (B.1–B.5). Same `MirProgram → object bytes` contract as `arsenal_codegen_fast` — driver picks at `--backend=fast\|llvm`. Storage: alloca-per-local in the entry block (clang `-O0` style), `[N x i8]` allocas for aggregates with alignment bumped to the layout's max-field align via `InstructionValue::set_alignment`. Field addressing via byte-offset GEP through `i8` (opaque pointers; no struct types declared to LLVM). Bool stays at LLVM `i1` end-to-end (no i8 storage adapter). Float comparisons use ordered predicates (`OEQ`/`OLT`/etc.); float-→int casts route through the saturating `llvm.fpto{si,ui}.sat` intrinsics for Rust ≥ 1.45 / Cranelift parity. `Const::Float` lowers via `build_bit_cast(int_const, float_ty)` to preserve NaN payloads (a `const_float(f64)` round-trip would lose them on the F32 path). String literals materialise as one private `__gw_str_<i>` global per `MirProgram::string_literals` entry; `Const::DataAddr(id)` returns the global's address as `ptr`. Aggregate ABI: hidden out-pointer for aggregate returns; by-pointer for aggregate user params. `sret`/`byval` attributes intentionally omitted — corpus aggregates flow only between GW fns, plain-`ptr` agrees with Cranelift's manual `stack_addr` convention end-to-end. A small `build.rs` adds Homebrew's `lib` prefix to the linker search path on macOS so LLVM-18's system-libs (zstd, ffi, xml2, curses) resolve without `RUSTFLAGS` rituals. |
+| `arsenal_typeck` | 1 / 2 | Bidirectional checker. `Ty` enum: `U0`/`Bool`/`Int(IntTy)`/`Float(FloatTy)`/`Rune`/`Class(DefId)`/`Slice(IntTy)`/`Ptr(IntTy)`/**`SentinelPtr { elem: IntTy, sentinel: u64 }` (C.2)**/`Error`. Emits a `TypedModule` with per-CST-node `expr_types`, `path_bindings`, `pat_bindings`, `call_targets`, `sigs`, `classes`. Slice + raw-pointer surface (11b/11c) are FFI-restricted; sentinel-pointer surface (C.2) is *not* — `[*:0]u8` flows through non-extern fn signatures because the producer-side sentinel guarantee gives the safety raw `*T` lacks. **Bidirectional literal narrowing (12d/12h)**: `check_expr` calls `try_narrow_literal` first — bare `IntLit`/`FloatLit`, `Unary(Minus, Literal)`, and `Paren(...)` shapes adopt the expected width when the value fits; out-of-range diagnoses against the literal span. `synth_binop_operands` extends the same rule across binary operators so `n < 2` (with `n: i64`) types cleanly. **`synth_cast` (A.1/A.2)** accepts the full numeric matrix `(Int\|Float, Int\|Float)`; non-numeric pairs reject with `UNSUPPORTED_CONSTRUCT`. **Class-/slice-typed fn params and returns (A.3/A.4)** are accepted via the by-pointer ABI; the `UNSUPPORTED_CONSTRUCT` rejections in `check_fn_signature` were dropped. **C.1 / C.2**: `synth_literal` types `c"..."` as `Ty::SentinelPtr { U8, 0 }`; `ty_assignable` adds the lone coercion `[*:S]T → *T` so the C.1 tracer's `puts(c"hi")` shape works without an explicit cast; missing return type defaults to `Ty::U0` (cleanup #1) instead of diagnosing — error code 307 is retired. |
+| `arsenal_mir` | 1 / 2 | CFG of basic blocks; primitive locals + aggregate stack-slot locals (class + slice); `Assign`/`AssignField` statements; `Use`/`BinOp`/`UnOp`/`Field`/`Cast` rvalues; `Goto`/`Branch`/`Return`/`Call`/`Unreachable` terminators. Loop-target stack for break/continue. `lower_for` desugar. `Const::DataAddr` + program-level `string_literals` table for `.rodata` payloads (11b). Implicit Print at stmt-position string lits desugars to `write(1, slice.data, slice.len)`; auto-injects `extern fn write` if user didn't declare one (11c). **Short-circuit `&&` / `\|\|` (12b)**: `lower_short_circuit` emits a 3-block control-flow shape (rhs-eval / short-circuit / join) and bypasses `lower_binary` so the RHS is only evaluated when the LHS doesn't determine the result. **`Rvalue::Cast` (A.1/A.2)** carries `kind: CastKind`, `operand`, `src_ty`, `dst_ty`; the closed `CastKind` enum has 7 variants, each maps to one Cranelift op. `select_cast_kind` factors the kind selection out of `lower_cast`. **`def_to_fn` fix (A.3)**: pre-A.3 the map stored each def's position in `resolved.defs` (including class defs); A.3 only counts `Fn`/`SyntheticMain` defs when assigning indices, matching the order `functions` is populated. **C.1 / C.2**: `Const::CStrAddr(CStrLitId)` + program-level `cstring_literals` table parallel to `string_literals` (no shared dedup keys — slice payloads and c-string payloads carry different semantics). `lower_cstring_literal` interns the decoded bytes (no NUL terminator stored — codegen appends it) and returns the operand directly without materialising a slice aggregate. |
+| `arsenal_codegen_fast` | 1 / 2 | Cranelift-backed (placeholder until Phase 7 TPDE port). Aggregate (class + slice) layouts → stack slots; field reads/writes → stack_load/stack_store; aggregate-aggregate assigns → field-by-field copy. String literals materialised via `module.declare_data` + `define_data_object` under `__gw_str_<i>` symbols (11b). `*T` raw pointers lower as pointer-sized scalars (11c). **Float comparisons (12a)**: `lower_binop` branches on `ty.is_float()` for `Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge` — floats use `fcmp` with the matching `FloatCC`, ints keep `icmp`. **Cast lowering (A.1/A.2)**: `Rvalue::Cast` arm reads operand at `clif_ty(src_ty)` and applies one Cranelift op per `CastKind` — `sextend`/`uextend`/`ireduce` for ints, `fcvt_from_sint`/`fcvt_from_uint` and saturating `fcvt_to_*_sat` for int↔float, `fpromote`/`fdemote` for floats. Same-width `*Bitcast` variants need no instruction. **Aggregate-by-pointer ABI (A.3/A.4)**: `make_signature` prepends a hidden out-pointer for aggregate returns and substitutes pointer-typed `AbiParam` for aggregate params. `define_fn` defers the entry-block switch until the lower-block loop's first iteration to keep Cranelift's "fill before switching" rule satisfied; aggregate params copy in via `copy_aggregate_from_ptr`, and `Terminator::Return` for an aggregate-returning fn copies out through `copy_aggregate_to_ptr`. `Terminator::Call` prepends `stack_addr(dst_slot)` for aggregate returns and substitutes `stack_addr` for aggregate args. **C.1**: parallel `__gw_cstr_<i>` rodata pass — payload is `bytes ++ "\0"`; `Const::CStrAddr` lowers via `module.declare_data_in_func` + `ins.global_value` exactly like `Const::DataAddr`. **C.2**: explicit `Ty::SentinelPtr { .. }` arms in `clif_ty` / `primitive_size_align` route to pointer-width — same shape as `Ty::Ptr`. |
+| `arsenal_codegen_llvm` | 13 / 2 | LLVM-18-backed via `inkwell` (B.1–B.5). Same `MirProgram → object bytes` contract as `arsenal_codegen_fast` — driver picks at `--backend=fast\|llvm`. Storage: alloca-per-local in the entry block (clang `-O0` style), `[N x i8]` allocas for aggregates with alignment bumped to the layout's max-field align via `InstructionValue::set_alignment`. Field addressing via byte-offset GEP through `i8` (opaque pointers; no struct types declared to LLVM). Bool stays at LLVM `i1` end-to-end (no i8 storage adapter). Float comparisons use ordered predicates (`OEQ`/`OLT`/etc.); float-→int casts route through the saturating `llvm.fpto{si,ui}.sat` intrinsics for Rust ≥ 1.45 / Cranelift parity. `Const::Float` lowers via `build_bit_cast(int_const, float_ty)` to preserve NaN payloads (a `const_float(f64)` round-trip would lose them on the F32 path). String literals materialise as one private `__gw_str_<i>` global per `MirProgram::string_literals` entry; `Const::DataAddr(id)` returns the global's address as `ptr`. Aggregate ABI: hidden out-pointer for aggregate returns; by-pointer for aggregate user params. `sret`/`byval` attributes intentionally omitted — corpus aggregates flow only between GW fns, plain-`ptr` agrees with Cranelift's manual `stack_addr` convention end-to-end. A small `build.rs` adds Homebrew's `lib` prefix to the linker search path on macOS so LLVM-18's system-libs (zstd, ffi, xml2, curses) resolve without `RUSTFLAGS` rituals. **C.1**: parallel pass for c-string globals — one private `__gw_cstr_<i>` per `MirProgram::cstring_literals` entry, payload `bytes ++ "\0"`; `Const::CStrAddr` returns the global's `as_pointer_value()`. **C.2**: explicit `Ty::SentinelPtr { .. }` arm in `llvm_basic_type` routes to opaque `ptr` — agrees with Cranelift's bit-exact output across all three c-string corpus programs. |
 | `arsenal_driver` | 0/1 | Subcommands: `arsenal new <name>`, `arsenal build [--backend=fast\|llvm] <file.gw>`, `arsenal dump <path>`, `arsenal --version`. Build pipeline: lex → parse → resolve → typeck → MIR → (Cranelift OR LLVM) → object → `cc` link → executable. `--backend=fast` is the default; both backends emit the same `Vec<u8>` object-bytes shape so the linker invocation is shared. |
 
 ---
@@ -164,6 +183,9 @@ Each increment shipped one or more corpus programs and a single commit.
 | B.3 | float ops + `as` cast matrix | `9e6192c` | (LLVM corpus 135 → 168) | `Const::Float` via `build_bit_cast(int_const, float_ty)` (preserves NaN payloads); `lower_float_binop` uses ordered predicates (`OEQ`/`OLT`/etc.); `Rvalue::Cast` flat dispatch on `CastKind` (sext / zext / trunc / sitofp / uitofp / `llvm.fpto{si,ui}.sat` / fpext / fptrunc / no-op); intrinsic dispatch via `Intrinsic::find` + `get_declaration` per overload pair | 0 |
 | B.4 | aggregate ABI (class + slice by-pointer) | `1129232` | (LLVM corpus 168 → 203) | aggregate locals: `[N x i8]` alloca with `set_alignment(layout.align)`; field addressing via byte-offset GEP through `i8`; aggregate Assign / Return / param entry copy via `llvm.memcpy`; `make_fn_type` prepends `ptr` for sret + substitutes `ptr` for aggregate args; `LoweringCx::ret_out_ptr` captured at fn entry; `lower_call` prepends `dst.alloca` for aggregate returns and substitutes `src.alloca` for aggregate args. `sret`/`byval` attributes intentionally omitted (no C-ABI consumers in Phase 1) | 0 |
 | B.5 | string literals + Print desugar | `8c2a6df` | (LLVM corpus 203 → 226 — full parity) | private `__gw_str_<i>` global per `MirProgram::string_literals` entry, `Const::DataAddr(id) → global.as_pointer_value()`; `Ty::Ptr(_) → ptr` in `llvm_basic_type` and `make_fn_type` (extern `fn write(*u8, ...)` declares cleanly, `slice.data` loads back as `ptr`); empty-payload one-byte pad mirrors Cranelift; hand-curated `SUPPORTED` allow-list dropped in favour of iterate-the-corpus loop | 0 |
+| cleanup #1 | default `-> u0` on missing return type | `e394571` | (no corpus add) | typeck `check_fn_signature` defaults the return type to `Ty::U0` instead of emitting MISSING_RETURN_TYPE (error code 307 retired); +2 typeck unit tests | 0 |
+| C.1 | c-string tracer bullet | `1e8752c` | +1 (227) | typeck `synth_literal` for `CStringLit` returns `Ty::Ptr(IntTy::U8)` (provisional, retyped in C.2); MIR `Const::CStrAddr(CStrLitId)` + `MirProgram::cstring_literals` parallel table; `lower_cstring_literal` / `decode_cstring_literal` (delegates escape handling to the existing `decode_string_literal`); both backends gain a `__gw_cstr_<i>` rodata pass with `bytes ++ "\0"` payload; `Const::CStrAddr` lowers identically to `Const::DataAddr`; +2 typeck and +2 MIR unit tests | 0 |
+| C.2 | `[*:0]u8` sentinel pointer type | `bd3cf5d` | +3 (228–230) | parser `[*:S]T` arm (peek-at-1 of `Star` distinguishes from slice / array); AST `Type::SentinelPtr(SentinelPtrType)` view promoted from `Stub`; `Ty::SentinelPtr { elem, sentinel }` (Phase 2 only realises `[*:0]u8`); `synth_literal` retypes `c"..."` from `*u8` to `[*:0]u8`; `ty_assignable` adds the lone coercion `[*:S]T → *T` so the C.1 tracer's `puts(c"hi")` shape works without explicit cast; both backends gain explicit `Ty::SentinelPtr { .. }` arms routing to pointer-width; +5 typeck unit tests | 0 |
 
 **Key pattern**: each "0 bugs" increment was almost pure corpus growth (the
 plumbing was already in place). Each "≥1 bug" increment caught real
@@ -194,7 +216,21 @@ LLVM 18 and Cranelift agree bit-exactly. The dual-backend test
 starts paying its keep at Phase 2's shapes (comptime, larger corpus,
 weirder values), not Phase 1's.
 
-### What 226 corpus programs cover
+C.1 + C.2 + cleanup #1 also produced zero bugs across both backends.
+Pre-bundle prediction by the 12/A.x heuristic was ~1 (the new `Ty`
+variant + `[*:S]T → *T` coercion + new `Const::CStrAddr` MIR shape
+were all shape-novel, and there was no reference oracle for c-string
+typing). Observed yield: zero. The c-string surface is small enough,
+and its value-level lowering identical enough across the two pointer
+variants, that there was nowhere for a divergence to live. This
+extends the Phase-13 pattern: when the *value-level* lowering of a
+shape-novel feature is identical to an already-validated one (here:
+`*T` and `[*:0]u8` both lower to opaque `ptr`), bug yield collapses
+toward zero even when the *type-level* shape is new. Weight future
+sub-bundles' predicted yield by how much value-level novelty they
+introduce, not just how much surface novelty.
+
+### What 230 corpus programs cover
 
 - Phase-0 syntax: every TokenKind variant, every operator precedence
   level, every supported statement form.
@@ -235,6 +271,15 @@ weirder values), not Phase 1's.
   chains); mixed extern functions (`abs`, `getpid`) chained into
   arithmetic, into class fields, under short-circuit conditions, and
   in loop bounds.
+- Phase 2 increment C.1 / C.2 surface: `c"..."` literals lex / parse /
+  typeck / lower / codegen; `[*:0]u8` sentinel-pointer type as a
+  parser-level distinct form, type-level distinct from `*u8`,
+  value-level identical (both lower to opaque `ptr`); `[*:S]T → *T`
+  decay at extern-call arg slots and at `let` annotations; c-string
+  helper-fn fixtures with `[*:0]u8` flowing through a non-extern
+  signature (uses cleanup #1's `-> u0` default to elide the return
+  type); escapes round-trip (`\t`, `\\`, `\"`, etc.) decoded via the
+  shared `decode_string_literal` after `c"` prefix strip.
 - Phase 1 follow-up A.1–A.4 surface: postfix `as Type` at Rust-style
   precedence; the full numeric cast matrix (int↔int with widen / trunc /
   signedness reinterpret; int↔float with signedness-aware fcvt;
@@ -288,6 +333,28 @@ No `main`, no extern declarations, no imports — the parser accepts the
 top-level statement (11a), typeck assigns `[]u8` (11b), and the MIR
 desugar emits a `write(1, str.data, str.len)` against an auto-injected
 `extern fn write` (11c). Cranelift links it to libc's `write` symbol.
+
+The Phase-2 c-string surface (C.1 + C.2) brings the canonical libc
+shape:
+
+```gw
+extern fn puts(s: *u8) -> i32;
+
+fn greet(s: [*:0]u8) {
+    puts(s);
+}
+
+fn main() -> i32 {
+    greet(c"first");
+    greet(c"second");
+    return 0;
+}
+```
+
+`c"..."` types as `[*:0]u8`, the sentinel-pointer type decays to
+`*u8` at the `puts(s)` call site, the helper fn `greet` elides its
+return type via cleanup #1's `-> u0` default. Both backends compile
+this program to the same `first\nsecond\n` output.
 
 ### Driver UX
 
@@ -348,11 +415,9 @@ arsenal 0.0.1
 | Non-`u8` slice element types | Typeck rejects `[]i32` etc. (only `[]u8` accepted today) | Generalise the slice arm in `resolve_type`; aggregate_layout already handles arbitrary 8-byte fields, so codegen mostly follows |
 | `match`, error unions (`!T`), generics, `cipher`, async, comptime | Parser produces `ErrorNode`s | Phases 2–4 |
 | Multi-segment paths in expressions (`std::mem::Foo`) | Typeck `UNSUPPORTED_CONSTRUCT` | Phase 2 (frequencies / module imports) |
-| `c"..."` C-string literals (`[*:0]u8`) | Typeck records `Ty::Error` | Phase 2 — sentinel-pointer machinery |
 | Slice slicing (`s[1..3]`), array-to-slice coercion | No syntax / typing rules yet | Phase 2 |
 | Pointer arithmetic, dereference (`*p`), address-of (`&x`) | No syntax / typing rules yet | Phase 3 with the memory model |
 | Mixing `putchar` and implicit Print in the same program | Output ordering under piped stdout is `[all writes][all putchars]` because stdio buffers putchar but `write(2)` syscall bypasses stdio | Add an `extern fn fflush(stream: *u8) -> i32;` corpus pattern, OR document the rule (current state — see corpus design notes below) |
-| Functions without explicit return type (`fn f(x: i32) {`) | Parser rejects with E0307 | Add a default `-> u0` arm to `parse_fn_decl` if the user wants to elide it. Currently every fn must declare its return type |
 | `BinOp::Mod` and `BinOp::Pow` on float operands | Codegen falls through to `srem`/`urem` (wrong) or traps (Pow) | Typeck doesn't currently produce float `%` / `**`. If a future corpus does, add float arms in `lower_binop` (both backends now have a stub Unsupported / trap path) |
 | `arsenal new` template parses cleanly | Templates use `#virtuous {}` syntax that Phase 1 parser rejects | Swap templates to Phase-1 syntax (the bare-string-literal half now works after 11c, but the `#virtuous` directive is still rejected) |
 | Windows CI coverage | `arsenal_codegen_llvm`'s `llvm-sys 180` dep can't be satisfied on Windows runners (no usable dev install path); Windows is dropped from the CI matrix | Either (a) feature-gate `arsenal_codegen_llvm` so Windows builds the rest of the workspace without it, or (b) find / build an llvm-sys-compatible LLVM 18 distribution for Windows. Until then, fmt / clippy / build / test all run only on Linux + macOS |
@@ -393,6 +458,17 @@ Phase-1 surface that any future corpus author needs to know.
    local slot. The cost is the entry copy plus the field-by-field
    return store; cheap for Phase-1-sized aggregates, irrelevant once
    the TPDE backend lands.
+6. **`[*:0]u8` and `*u8` are type-distinct, value-identical** (C.1/C.2).
+   `c"..."` literals are `[*:0]u8`; the producer side guarantees the
+   trailing NUL. The lone `[*:S]T → *T` coercion lives in
+   `ty_assignable` so existing `extern fn x(*u8)` slots accept
+   c-string args without explicit casts. There is no reverse
+   coercion: a `*u8` you got from `slice.data` does *not* type as
+   `[*:0]u8` (the sentinel guarantee isn't there). The Phase-1
+   FFI-only restriction on raw `*T` (decision #13) does *not*
+   extend to `[*:0]u8` — sentinel-pointer params and locals are
+   permitted in non-extern fns because the producer-callee contract
+   gives the safety raw `*T` lacks.
 
 ---
 
@@ -580,6 +656,48 @@ session start before changing them.
     single `cargo build` of a multi-file project), share one context
     across the whole build invocation. For one-shot `arsenal build
     foo.gw` the per-call cost is unimportant.
+29. **Default `-> u0` on missing fn return type** (cleanup #1) —
+    typeck `check_fn_signature` defaults the return type to
+    `Ty::U0` when the source omits `-> T`, instead of emitting
+    error 307 (now retired). `fn helper(c: Counter) { puts(c"x"); }`
+    is well-typed; `return 1;` from such a fn still diagnoses
+    against the inferred `u0` via the existing
+    RETURN_VALUE_MISMATCH path. The parser already accepted the
+    optional `RetType`; only the typeck rejection moved.
+30. **C-string literals: parallel MIR table, not a flag** (C.1) —
+    `MirProgram::cstring_literals: Vec<Vec<u8>>` lives next to
+    `string_literals` rather than the two sharing one table with
+    an `is_cstring` bool. Reasons: (a) the dedup keys differ —
+    a `"hi"` slice payload and a `c"hi"` payload are different
+    values even though their bytes overlap; (b) slice consumers
+    read the byte length to materialise the slice's `len` field,
+    while c-string consumers don't, and crosstalk would force
+    every reader to learn both shapes; (c) a new `Const::CStrAddr`
+    variant is self-documenting at every use site. Codegen mirror
+    the layout: parallel `__gw_cstr_<i>` rodata pass in both
+    backends, `bytes ++ "\0"` payload, identical lowering of
+    `Const::CStrAddr` and `Const::DataAddr` modulo the global they
+    point at. The empty-payload one-byte pad is unnecessary for
+    c-strings (the appended NUL guarantees ≥1 byte).
+31. **`Ty::SentinelPtr` decays only to `*T`, never to `[]T`** (C.2)
+    — `ty_assignable` adds exactly one new edge:
+    `Ty::SentinelPtr { elem: e1, .. } → Ty::Ptr(e2)` when `e1 ==
+    e2`. There is no reverse coercion (a `*u8` you got from
+    `slice.data` lacks the sentinel guarantee), no
+    `[*:S]T → []T` decay (slices have a length, c-strings don't),
+    and no implicit `[*:0]u8 → [*:0]u8` widening across element
+    types (Phase 2 only realises `[*:0]u8` anyway). Phase 2
+    explicitly accepts only `[*:0]u8` at `resolve_type`; other
+    sentinels and other element types diagnose with
+    UNSUPPORTED_CONSTRUCT, naming the rejected shape so users see
+    *why* their type didn't take. `Ty::SentinelPtr` does NOT
+    inherit the FFI-only restriction on `Ty::Ptr` (decision #13)
+    — it flows freely through non-extern fn signatures because
+    the producer-side sentinel terminator gives the safety raw
+    `*T` lacks. Both backends route `Ty::SentinelPtr { .. }` to
+    pointer-width / opaque `ptr` via explicit arms in `clif_ty`
+    / `llvm_basic_type` / `primitive_size_align`; MIR sees no
+    new shape (the Operand path is just `Const::CStrAddr`).
 
 ---
 
@@ -589,8 +707,9 @@ session start before changing them.
 The architecture's Phase-1 exit gate (200-program corpus) is met
 **and** the Phase-1 follow-up "Option A" (class/slice ABI + `as` casts)
 landed across A.1–A.4. The "Option B" Phase-13 LLVM backend then
-shipped across B.1–B.5. Only Option C and the tactical-cleanup list
-remain; pick based on session goal.
+shipped across B.1–B.5. The "Option C" Phase-2 entry started with
+the c-strings sub-bundle (C.1 + C.2) and cleanup #1; the remaining
+Phase-2 sub-bundles are `match`, `!T`/`?T`, and comptime + modules.
 
 ### Option A — DONE
 
@@ -620,48 +739,86 @@ The big jump. Phase 2 brings:
 - `frequencies` module imports (`use std::mem::Foo`).
 - `comptime` evaluator (workspace's `arsenal_comptime` stub).
 - `match` expressions, error unions `!T`, optional types `?T`.
-- `c"..."` C-string literals.
+- `c"..."` C-string literals — **C.1 + C.2 DONE** (commits
+  `1e8752c` + `bd3cf5d`). `c"..."` types as `[*:0]u8`, lowers via
+  `Const::CStrAddr` to a parallel `__gw_cstr_<i>` rodata pass in
+  both backends, decays to `*u8` at extern call sites; non-extern
+  fn signatures accept `[*:0]u8` directly.
 
-Estimated cost: dozens of hours. Bug yield: untyped — Phase 2 is
-where the parser stops emitting `ErrorNode` for the spec's harder
-features and where the runtime model gets complicated (compile-time
-evaluation, module resolution, async).
+Estimated cost remaining: dozens of hours. Bug yield: untyped —
+Phase 2 is where the parser stops emitting `ErrorNode` for the
+spec's harder features and where the runtime model gets complicated
+(compile-time evaluation, module resolution, async).
 
 The dual-backend test now in place means any Phase 2 codegen change
 is automatically validated against both Cranelift and LLVM; this
-becomes useful as larger / weirder shapes start flowing through the
-pipeline.
+became useful immediately on C.1 (the dual-backend invariant held
+bit-exactly across all three c-string corpus programs).
+
+#### Recommended next sub-bundle: `match`
+
+After C.1 + C.2 the remaining Phase-2 surface in ascending cost order:
+
+- **`match` expressions** — extends typeck (exhaustiveness rule,
+  pattern types) + MIR (n-way branch lowering or chained `Branch`
+  fall-through) + small parser additions. Stays inside the
+  Phase-1-shaped single-file surface, exercises shape-novel
+  control flow on both backends. **Recommended next.**
+- **`!T` / `?T`** (error unions / optionals) — typeck-heavy, touches
+  the type-system foundation, requires unwrapping syntax. Larger
+  blast radius than `match`; weight ~2 bugs by the 12/A.x heuristic.
+- **comptime + frequencies (modules)** — the architectural heavy
+  lift. New `arsenal_comptime` crate, multi-file builds, module
+  resolution. Should land in a session that can be devoted entirely
+  to it; gates `cipher` / `frequencies` so blocks the manifest-
+  driven driver UX.
+
+The argument for `match` first:
+- It's the largest standalone piece that still fits in a single
+  session.
+- Pattern-matching control flow is shape-novel for both backends
+  — the dual-backend test starts paying for itself again, having
+  collapsed to "no bugs" through the c-strings sub-bundle.
+- Doesn't depend on `!T`/`?T`/comptime, so it can land before any
+  of them.
+- The exhaustiveness rule is a typeck-only feature (no codegen
+  lowering); the hard part is the MIR decision-tree, which we'd
+  have to build anyway.
 
 ### Tactical cleanup (any session)
 
 These are all self-contained and worth landing whenever a session
 runs short on time for the bigger items:
 
-1. **Default `-> u0` for fn declarations.** One arm in `parse_fn_decl`.
+1. ~~**Default `-> u0` for fn declarations.** One arm in
+   `parse_fn_decl`.~~ **DONE in `e394571`** (cleanup #1) — the
+   fix lived in typeck, not the parser; the parser already
+   accepted the optional `RetType`. Fall-through-without-return
+   from a `u0` fn is implicitly confirmed by corpus #229
+   (`fn greet(s: [*:0]u8) { puts(s); }` runs cleanly on both
+   backends), which subsumes what was the original cleanup #3.
 2. **Fix `arsenal new` templates** so the generated `hello.gw` parses
    under Phase-1 syntax. The bare-string-literal half already works
    after 11c; the `#virtuous` directive is still rejected. Easiest
    fix: rewrite the templates to use today's syntax.
-3. **`-> u0` returning `()` semicolons.** Confirm the corpus rules
-   hold for fn bodies that fall through without a `return`.
-4. **Float `Mod` and `Pow`** codegen arms (Cranelift falls through
+3. **Float `Mod` and `Pow`** codegen arms (Cranelift falls through
    to integer ops; LLVM returns `Unsupported`. Both are harmless
    today — typeck doesn't produce them — but neither is
    future-proof. Add float arms in both backends together so they
    stay in lockstep).
-5. **Non-`u8` slice elements.** `resolve_type` for `Ty::Slice` only
+4. **Non-`u8` slice elements.** `resolve_type` for `Ty::Slice` only
    accepts `[]u8` today; A.4 didn't widen this. Both backends'
    aggregate paths already handle arbitrary 8-byte fields, so the
    typeck-only change is small. Worth ~30 min if a corpus program
    wants `[]i32`.
-6. **`ld: warning: no platform load command found`** spam from
+5. **`ld: warning: no platform load command found`** spam from
    LLVM-emitted Mach-O objects on macOS. The LLVM module isn't
    tagging the object with `LC_BUILD_VERSION`. Cosmetic; binaries
    still run. Likely fix: either set the macOS triple's deployment
    target on the `TargetMachine` or add an `-mmacosx-version-min`
    flag at the `cc` invocation. Trivial when someone gets annoyed
    enough.
-7. **Restore Windows to the CI matrix.** Currently dropped because
+6. **Restore Windows to the CI matrix.** Currently dropped because
    `llvm-sys 180` has no working install path on GitHub's
    `windows-latest` runners. Two practical paths: feature-gate
    `arsenal_codegen_llvm` so Windows can `cargo build --workspace`
@@ -716,11 +873,12 @@ state this doc describes:
 ```bash
 cd /Users/silmaril/Documents/GitHub/gw
 git log --oneline | head -10
-# expect tip: B.5 (8c2a6df), B.4 (1129232), B.3 (9e6192c), B.2 (9384331),
-#             B.1 (0c3a9fe), then a8e9ea0 (HANDOFF for A.x), 5d71372 (A.4),
-#             a6dc722 (A.3), 258cc70 (A.2), c1b091e (A.1) at the bottom
-#             of the head -10. (The HANDOFF refresh you're reading sits on
-#             top of B.5.)
+# expect tip: HANDOFF refresh after C.1/C.2 + cleanup #1 (this commit),
+#             bd3cf5d (C.2 sentinel ptr), 1e8752c (C.1 c-string tracer),
+#             e394571 (cleanup #1 default -> u0), 53f7e5f (HANDOFF after
+#             tactical cleanup #6), b99b0fa (CI native LLVM installs),
+#             29f6d81 (CI first attempt), cf1e8e1 (HANDOFF after Option B),
+#             8c2a6df (B.5), 1129232 (B.4) at the bottom of head -10.
 
 git status
 # expect: clean working tree (no .DS_Store, no .probe leftovers)
@@ -736,10 +894,10 @@ export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
 
 . "$HOME/.cargo/env"
 cargo test --manifest-path compiler/arsenal-boot/Cargo.toml --workspace 2>&1 | grep "test result" | awk '{p+=$4;f+=$6}END{print p,f}'
-# expect: "148 0"
+# expect: "159 0"
 
 ls tests/snake_eater/pass/phase1/*.gw | wc -l
-# expect: 226
+# expect: 230
 
 ls compiler/arsenal-boot/crates/ | wc -l
 # expect: 17
@@ -829,6 +987,12 @@ class/slice rejections, MIR added `Rvalue::Cast` and the `def_to_fn`
 fix, codegen added the seven `CastKind` arms and the aggregate-by-
 pointer ABI. The B.1–B.5 bundle added the LLVM fork on the right side
 of the diamond — same MIR consumed by both backends, same `Vec<u8>`
-object-bytes shape produced. The 226-program corpus is the direct test
-surface for every one of those arrows, exercised through both backends
-in CI (once #6 in the tactical-cleanup list lands).
+object-bytes shape produced. The C.1 + C.2 + cleanup #1 sub-bundle
+extended every arrow except `lex` and `resolve` again: parser added
+the `[*:S]T` arm (C.2), AST promoted `SentinelPtrType` from `Stub`
+(C.2), typeck added `Ty::SentinelPtr` + the `[*:S]T → *T` coercion
++ the default `-> u0` (C.2 / cleanup #1), MIR added `Const::CStrAddr`
++ the parallel `cstring_literals` table (C.1), both backends added
+the `__gw_cstr_<i>` rodata pass (C.1) and explicit `Ty::SentinelPtr`
+arms (C.2). The 230-program corpus is the direct test surface for
+every one of those arrows, exercised through both backends in CI.
