@@ -2,7 +2,7 @@
 
 This document is the entry point for the next development session. Read it first.
 
-> **Last updated:** after Phase 13 increment B.5 (Option B complete — LLVM backend at corpus parity).
+> **Last updated:** after tactical-cleanup #6 (CI now installs LLVM 18 and runs the dual-backend test on every push).
 > **Repo root:** `/Users/silmaril/Documents/GitHub/gw`
 > **Workspace test count:** 148 unit + integration tests, all green.
 > **Corpus size:** 61 Phase-0 lex+parse snapshots + 226 Phase-1 run-tests.
@@ -325,10 +325,16 @@ arsenal 0.0.1
   both backends. Requires `LLVM_SYS_180_PREFIX` set at build time
   (see Pre-flight checklist).
 - CI workflow at `.github/workflows/ci.yml` runs build + fmt --check +
-  clippy `-D warnings` + test on Linux / macOS / Windows. **Note:** CI
-  matrix has not yet been updated to install LLVM 18 / set
-  `LLVM_SYS_180_PREFIX`, so the `llvm_backend` integration test won't
-  build in CI until that lands. Tracked under tactical cleanup below.
+  clippy `-D warnings` + test on Linux / macOS. The matrix installs
+  LLVM 18 via each runner's native package manager (`brew install
+  llvm@18` on macOS; `apt.llvm.org/llvm.sh 18 all` on Linux) and
+  exports `LLVM_SYS_180_PREFIX`, so the full workspace — including
+  the `llvm_backend` integration test — runs on every push to main
+  and every PR. Windows is intentionally absent: `llvm-sys 180`
+  needs the LLVM 18 dev libraries, which lack a usable distribution
+  path on Windows (Choco's `llvm` is a clang+lld user toolchain, not
+  a dev install). Restore Windows when either `arsenal_codegen_llvm`
+  is feature-gated or a working Windows install path emerges.
 
 ---
 
@@ -349,7 +355,7 @@ arsenal 0.0.1
 | Functions without explicit return type (`fn f(x: i32) {`) | Parser rejects with E0307 | Add a default `-> u0` arm to `parse_fn_decl` if the user wants to elide it. Currently every fn must declare its return type |
 | `BinOp::Mod` and `BinOp::Pow` on float operands | Codegen falls through to `srem`/`urem` (wrong) or traps (Pow) | Typeck doesn't currently produce float `%` / `**`. If a future corpus does, add float arms in `lower_binop` (both backends now have a stub Unsupported / trap path) |
 | `arsenal new` template parses cleanly | Templates use `#virtuous {}` syntax that Phase 1 parser rejects | Swap templates to Phase-1 syntax (the bare-string-literal half now works after 11c, but the `#virtuous` directive is still rejected) |
-| CI matrix doesn't install LLVM 18 | `cargo test --workspace` in CI fails to build `arsenal_codegen_llvm` (no `llvm-config-18`); the `llvm_backend` integration test never runs in CI | Add a per-OS matrix step that installs LLVM 18 (`brew install llvm@18` on macOS; the official LLVM apt/yum repo on Linux; chocolatey on Windows) and exports `LLVM_SYS_180_PREFIX`. Until it lands, the LLVM backend is dev-machine-tested only |
+| Windows CI coverage | `arsenal_codegen_llvm`'s `llvm-sys 180` dep can't be satisfied on Windows runners (no usable dev install path); Windows is dropped from the CI matrix | Either (a) feature-gate `arsenal_codegen_llvm` so Windows builds the rest of the workspace without it, or (b) find / build an llvm-sys-compatible LLVM 18 distribution for Windows. Until then, fmt / clippy / build / test all run only on Linux + macOS |
 | Class field of type `bool` | Loads / stores at LLVM's `i1` width into a `(1, 1)` byte slot | No corpus program currently exercises this. If one shows up the fix is the standard zext-on-store / trunc-on-load adapter (matches the `i8`-storage convention rustc uses) |
 
 ### Corpus design notes (rules learned during increment 12 / A.x)
@@ -648,19 +654,23 @@ runs short on time for the bigger items:
    aggregate paths already handle arbitrary 8-byte fields, so the
    typeck-only change is small. Worth ~30 min if a corpus program
    wants `[]i32`.
-6. **Wire LLVM 18 into CI** (`.github/workflows/ci.yml`). Per-OS
-   matrix step that installs LLVM 18 and exports
-   `LLVM_SYS_180_PREFIX`. Until this lands, the `llvm_backend`
-   integration test runs only on dev machines. ~30–60 min, mostly
-   YAML and bisecting whichever Linux distro's package name for
-   `llvm-18-dev` is current.
-7. **`ld: warning: no platform load command found`** spam from
+6. **`ld: warning: no platform load command found`** spam from
    LLVM-emitted Mach-O objects on macOS. The LLVM module isn't
    tagging the object with `LC_BUILD_VERSION`. Cosmetic; binaries
    still run. Likely fix: either set the macOS triple's deployment
    target on the `TargetMachine` or add an `-mmacosx-version-min`
    flag at the `cc` invocation. Trivial when someone gets annoyed
    enough.
+7. **Restore Windows to the CI matrix.** Currently dropped because
+   `llvm-sys 180` has no working install path on GitHub's
+   `windows-latest` runners. Two practical paths: feature-gate
+   `arsenal_codegen_llvm` so Windows can `cargo build --workspace`
+   without it (the more honest fix; touches `arsenal_driver`'s
+   backend-dispatch code in `cmd_build.rs`), or find an LLVM 18 dev
+   distribution for Windows that ships `llvm-config.exe` + the
+   static archives (vcpkg may work; chocolatey's `llvm` package
+   does not). Either fix should re-add `windows-latest` to the
+   `os` matrix in `ci.yml`.
 
 ---
 
