@@ -1,16 +1,25 @@
 # CI per docs/architecture.md Part L Phase 0 + Phase 13:
-# build + fmt --check + clippy -D warnings + test on ubuntu / macos / windows.
-# LLVM 18 is installed and `LLVM_SYS_180_PREFIX` exported so the
-# `arsenal_codegen_llvm` crate (and its transitive `llvm-sys` build
-# script) compile. The Windows job builds the LLVM backend but skips
-# the `llvm_backend` integration test, which is `cfg(not(windows))`
-# alongside `phase1_run` because `cc` integration on Windows is a
-# later concern.
+# build + fmt --check + clippy -D warnings + test on ubuntu / macos.
+# LLVM 18 is installed via each runner's native package manager
+# (brew on macOS, apt.llvm.org on Linux) and `LLVM_SYS_180_PREFIX`
+# exported so the `arsenal_codegen_llvm` crate (and its transitive
+# `llvm-sys` build script) compile.
+#
+# Windows is intentionally absent from the matrix: `llvm-sys 180`
+# needs `llvm-config` + the LLVM 18 dev libraries (static archives
+# and headers), which are straightforward to install on macOS / Linux
+# but lack a usable distribution path on Windows (Choco's `llvm` and
+# the official LLVM project Windows binaries are clang+lld toolchains,
+# not dev installs). Restore Windows when either (a)
+# `arsenal_codegen_llvm` is feature-gated so Windows builds the rest
+# of the workspace without it, or (b) a working Windows install path
+# emerges. The `phase1_run` and `llvm_backend` integration tests are
+# already `cfg(not(windows))` because of the `cc` linker dependency,
+# so losing Windows coverage here is fmt / clippy / build only.
 #
 # Toolchain is the workspace-pinned `stable` channel from
 # `compiler/arsenal-boot/rust-toolchain.toml`. The cargo registry and
-# target dir are cached per-OS via Swatinem/rust-cache; the LLVM 18
-# install is cached per-OS via KyleMayes/install-llvm-action.
+# target dir are cached per-OS via Swatinem/rust-cache.
 
 name: CI
 
@@ -34,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,15 +53,19 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install LLVM 18
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "18.1"
-          cached: true
+      - name: Install LLVM 18 (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install llvm@18
+          echo "LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18" >> "$GITHUB_ENV"
 
-      - name: Export LLVM_SYS_180_PREFIX
-        shell: bash
-        run: echo "LLVM_SYS_180_PREFIX=$LLVM_PATH" >> "$GITHUB_ENV"
+      - name: Install LLVM 18 (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 18 all
+          echo "LLVM_SYS_180_PREFIX=/usr/lib/llvm-18" >> "$GITHUB_ENV"
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
