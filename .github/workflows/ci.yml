@@ -1,9 +1,16 @@
-# Phase 0 CI per docs/architecture.md Part L Phase 0:
+# CI per docs/architecture.md Part L Phase 0 + Phase 13:
 # build + fmt --check + clippy -D warnings + test on ubuntu / macos / windows.
+# LLVM 18 is installed and `LLVM_SYS_180_PREFIX` exported so the
+# `arsenal_codegen_llvm` crate (and its transitive `llvm-sys` build
+# script) compile. The Windows job builds the LLVM backend but skips
+# the `llvm_backend` integration test, which is `cfg(not(windows))`
+# alongside `phase1_run` because `cc` integration on Windows is a
+# later concern.
 #
 # Toolchain is the workspace-pinned `stable` channel from
 # `compiler/arsenal-boot/rust-toolchain.toml`. The cargo registry and
-# target dir are cached per-OS via Swatinem/rust-cache.
+# target dir are cached per-OS via Swatinem/rust-cache; the LLVM 18
+# install is cached per-OS via KyleMayes/install-llvm-action.
 
 name: CI
 
@@ -36,6 +43,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - name: Install LLVM 18
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18.1"
+          cached: true
+
+      - name: Export LLVM_SYS_180_PREFIX
+        shell: bash
+        run: echo "LLVM_SYS_180_PREFIX=$LLVM_PATH" >> "$GITHUB_ENV"
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
