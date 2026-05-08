@@ -4,7 +4,7 @@
 //! `MirProgram → object bytes`. The driver picks between the two backends
 //! at `arsenal build --backend=fast|llvm`.
 //!
-//! Supported MIR subset (B.1 → B.4):
+//! Supported MIR subset (B.1 → B.5):
 //! - integer + bool + float + class + slice params and returns; `u0`
 //!   returns
 //! - alloca-backed locals for every type (primitives use a typed alloca;
@@ -26,15 +26,22 @@
 //!   #21). `sret`/`byval` attributes are intentionally omitted: corpus
 //!   aggregates flow only between GW fns, not through C ABI, and the
 //!   plain-`ptr` form agrees with Cranelift's manual `stack_addr`
-//!   convention end-to-end. If a future C-extern ever needs aggregate
-//!   ABI compliance, add the attrs then.
-//! - `Operand::Const(Int|Bool|Float|Unit)`, `Operand::Local`
+//!   convention end-to-end.
+//! - string literals: one private `__gw_str_<i>` global per entry in
+//!   `MirProgram::string_literals`, populated with the decoded bytes.
+//!   `Const::DataAddr(id)` materialises as the global's address (an
+//!   opaque `ptr`). The slice value lowers via two `AssignField`s into
+//!   an `[]u8` aggregate slot; the implicit Print desugar then reads
+//!   `slice.data` (typed `*u8`) and `slice.len` (typed `usize`) and
+//!   passes them to an auto-injected `extern fn write`.
+//! - `*T` raw pointers in extern fn signatures (per HANDOFF #13) and as
+//!   the type of `slice.data` lower as opaque `ptr`. Non-extern uses
+//!   stay rejected by typeck.
+//! - `Operand::Const(Int|Bool|Float|Unit|DataAddr)`, `Operand::Local`
 //! - `Terminator::{Goto, Branch, Return, Call, Unreachable}`
 //!
-//! Deferred to B.5: string literals (`Const::DataAddr`) + the implicit
-//! Print desugar; `*T` raw pointers in non-extern signatures (those
-//! stay rejected by typeck regardless). Anything outside the supported
-//! set returns [`CodegenError::Unsupported`] with a descriptive message.
+//! Anything outside the supported set returns
+//! [`CodegenError::Unsupported`] with a descriptive message.
 
 use arsenal_mir::{
     BinOp, BlockId, CastKind, Const, FnIdx, Local, MirFn, MirProgram, MirStmt, Operand, Rvalue,
@@ -50,7 +57,8 @@ use inkwell::targets::{
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FloatType, FunctionType, IntType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FloatValue, FunctionValue, IntValue, PointerValue,
+    BasicMetadataValueEnum, BasicValueEnum, FloatValue, FunctionValue, GlobalValue, IntValue,
+    PointerValue,
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 use rustc_hash::FxHashMap;
@@ -130,12 +138,46 @@ pub fn compile_program(
         fn_values.push(function);
     }
 
+    // Pass 1b: declare and initialise one read-only global per string
+    // literal in the MIR. `Const::DataAddr(id)` lowers to the matching
+    // global's address. Mirrors `arsenal_codegen_fast`'s rodata pass —
+    // same naming (`__gw_str_<i>`), same private linkage, so binaries
+    // produced by either backend look the same to a disassembler.
+    let mut string_globals: Vec<GlobalValue<'_>> = Vec::with_capacity(prog.string_literals.len());
+    for (i, bytes) in prog.string_literals.iter().enumerate() {
+        // Cranelift pads zero-length payloads to one byte so the symbol
+        // still resolves; do the same so the two backends emit
+        // structurally-identical objects. The GW-level `len` comes from
+        // the slice's `len` field (set by the Const::Int AssignField),
+        // so a 1-byte real payload still reads as len=0.
+        let payload: Vec<u8> = if bytes.is_empty() {
+            vec![0]
+        } else {
+            bytes.clone()
+        };
+        let const_str = context.const_string(&payload, false);
+        let global = module.add_global(const_str.get_type(), None, &format!("__gw_str_{i}"));
+        global.set_initializer(&const_str);
+        global.set_constant(true);
+        global.set_linkage(Linkage::Private);
+        global.set_unnamed_addr(true);
+        string_globals.push(global);
+    }
+
     // Pass 2: define non-extern bodies.
     for (i, f) in prog.functions.iter().enumerate() {
         if f.is_extern {
             continue;
         }
-        define_fn(&context, &module, f, fn_values[i], &fn_values, prog)?;
+        define_fn(
+            &context,
+            &module,
+            f,
+            fn_values[i],
+            &fn_values,
+            &string_globals,
+            prog,
+        )?;
     }
 
     // Verify the module before emitting. Catches malformed IR with a
@@ -169,6 +211,9 @@ struct LoweringCx<'ctx, 'a> {
     bbs: Vec<BasicBlock<'ctx>>,
     /// Function values declared in pass 1, indexed by [`FnIdx`].
     fn_values: &'a [FunctionValue<'ctx>],
+    /// Global values for each string literal, indexed by `StringLitId`.
+    /// `Const::DataAddr(id)` reads its address.
+    string_globals: &'a [GlobalValue<'ctx>],
     prog: &'a MirProgram,
     /// Hidden out-pointer for aggregate-returning fns, captured at fn
     /// entry from the prepended LLVM param. Used by `Terminator::Return`
@@ -282,12 +327,14 @@ fn aggregate_field_ty(ty: Ty, field_idx: u32, prog: &MirProgram) -> Ty {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn define_fn<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
     f: &MirFn,
     function: FunctionValue<'ctx>,
     fn_values: &[FunctionValue<'ctx>],
+    string_globals: &[GlobalValue<'ctx>],
     prog: &MirProgram,
 ) -> Result<(), CodegenError> {
     // Pointer width — Phase-1 targets are all 64-bit (HANDOFF #16 /
@@ -404,6 +451,7 @@ fn define_fn<'ctx>(
         allocas,
         bbs,
         fn_values,
+        string_globals,
         prog,
         ret_out_ptr,
         ptr_bytes,
@@ -942,7 +990,7 @@ fn read_operand<'ctx>(
     ty: Ty,
 ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
     match op {
-        Operand::Const(c) => emit_const(builder, cx.context, c, ty),
+        Operand::Const(c) => emit_const(builder, cx, c, ty),
         Operand::Local(l) => {
             let ptr = *cx.allocas.get(l).ok_or_else(|| {
                 CodegenError::Builder(format!(
@@ -963,10 +1011,11 @@ fn read_operand<'ctx>(
 
 fn emit_const<'ctx>(
     builder: &inkwell::builder::Builder<'ctx>,
-    context: &'ctx Context,
+    cx: &LoweringCx<'ctx, '_>,
     c: &Const,
     ty: Ty,
 ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+    let context = cx.context;
     match c {
         Const::Int { value, ty: int_ty } => {
             let lty = llvm_int_type(context, *int_ty);
@@ -1016,9 +1065,18 @@ fn emit_const<'ctx>(
             };
             Ok(v)
         }
-        Const::DataAddr(_) => Err(CodegenError::Unsupported(
-            "`Const::DataAddr` (string literal) — deferred to B.5".into(),
-        )),
+        Const::DataAddr(id) => {
+            // The global was declared in pass 1b. Its `as_pointer_value`
+            // is the constant address LLVM will emit at the use site.
+            let global = cx.string_globals.get(id.0 as usize).ok_or_else(|| {
+                CodegenError::Builder(format!(
+                    "Const::DataAddr({}) but only {} string globals declared",
+                    id.0,
+                    cx.string_globals.len()
+                ))
+            })?;
+            Ok(global.as_pointer_value().into())
+        }
         Const::Error => Err(CodegenError::Unsupported(
             "`Const::Error` reached codegen; typeck should have errored".into(),
         )),
@@ -1223,13 +1281,15 @@ fn llvm_basic_type<'ctx>(context: &'ctx Context, ty: Ty) -> Option<BasicTypeEnum
         Ty::Bool => Some(context.bool_type().into()),
         Ty::Int(int_ty) => Some(llvm_int_type(context, int_ty).into()),
         Ty::Float(float_ty) => Some(llvm_float_type(context, float_ty).into()),
+        // `*T` raw pointers (FFI-restricted at typeck per HANDOFF #13;
+        // also the type of `slice.data`) lower as opaque `ptr`. With
+        // LLVM ≥ 15's opaque pointers the pointee type isn't part of
+        // the value, so `*u8` and `*i8` etc. are all the same `ptr`.
+        Ty::Ptr(_) => Some(context.ptr_type(AddressSpace::default()).into()),
         // Aggregates: routed through the by-pointer ABI / `[N x i8]`
         // allocas; `llvm_basic_type` is for *scalar* type lookup only.
         Ty::Class(_) | Ty::Slice(_) => None,
-        // `*T` raw pointers in non-extern signatures stay rejected by
-        // typeck (Phase 1 limit). `Rune` and `Error` are also non-scalar
-        // for codegen purposes.
-        Ty::Ptr(_) | Ty::Rune | Ty::Error => None,
+        Ty::Rune | Ty::Error => None,
         // `Ty` is non-exhaustive (Phase 2 will add `?T`, `!T`, etc.);
         // anything new lands here as Unsupported until handled.
         _ => None,
