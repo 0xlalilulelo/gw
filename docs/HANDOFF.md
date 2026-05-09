@@ -2,29 +2,32 @@
 
 This document is the entry point for the next development session. Read it first.
 
-> **Last updated:** after Phase-2 increment O.1 (`?T` optional type
-> with `nil`, `T → ?T` coercion, and the `??` coalesce operator —
-> first Phase-2 sub-bundle that introduced value-level novelty).
+> **Last updated:** after Phase-2 increments O.2 (`?T` match
+> patterns + `nil` arm) and O.3 (`!T` error union + postfix
+> `!`-assert). The optional / error-union sub-bundle is now closed.
 > **Repo root:** `/Users/silmaril/Documents/GitHub/gw`
-> **Workspace test count:** 185 unit + integration tests, all green.
-> **Corpus size:** 61 Phase-0 lex+parse snapshots + 239 Phase-1 / Phase-2 run-tests.
+> **Workspace test count:** 196 unit + integration tests, all green.
+> **Corpus size:** 61 Phase-0 lex+parse snapshots + 241 Phase-1 / Phase-2 run-tests.
 > **Phase 1 exit gate met** (200-program target hit at 12h; the post-exit
 > follow-up A.1–A.4 added 26 more, for 226 total).
 > **Phase 13 (LLVM backend) complete** — `arsenal build --backend=llvm`
 > compiles and runs every program in the corpus, matching Cranelift exit
 > codes and stdout bit-exactly. Both backends ship in the same workspace;
 > `--backend=fast` (Cranelift) remains the default.
-> **Phase 2 entry in progress** — c-strings sub-bundle (C.1 + C.2)
-> closed first; the match sub-bundle (M.1 + M.2 + M.3) closed
-> next; the `?T` tracer (O.1) closed third. `?i32` / `?bool` types
-> as a 2-field `{tag: u8, payload: T}` aggregate, `nil` adopts the
-> Optional, `T → ?T` coerces at let-init / return / call-arg, and
-> `??` reads the tag and lazily evaluates the default on the nil
-> branch. O.1 is the first Phase-2 sub-bundle that introduced
-> value-level novelty (tag bytes), and the dual-backend test
-> caught one bug at first run — exactly the 12/A.x prediction.
-> Cleanup #1 (default `-> u0` on missing return type) shipped
-> alongside C.1.
+> **Phase 2 entry in progress** — c-strings sub-bundle (C.1 + C.2),
+> match sub-bundle (M.1 + M.2 + M.3), and optional / error-union
+> sub-bundle (O.1 + O.2 + O.3) all closed. `?T` and `!T` lower as
+> 2-field `{tag, payload}` aggregates with `T → ?T` and `T → !T`
+> coercions at let-init / return / call-arg via a single canonical
+> wrap helper. `??` reads the optional's tag and lazily evaluates a
+> default; `expr!` reads the error-union's tag and traps on err.
+> `match opt { nil => ..., _ => ... }` exercises the existing
+> decision-tree pattern infrastructure. Three bugs caught across
+> the entire Phase-2 entry (O.1: 1, O.3: 2; everything else 0) —
+> all three were latent multi-site predicate-canonicalisation
+> bugs that the dual-backend test surfaced when value-level novelty
+> entered. Cleanup #1 (default `-> u0` on missing return type)
+> shipped alongside C.1.
 
 ---
 
@@ -70,32 +73,34 @@ saturating fcvt, ordered float comparisons, sign-aware integer ops,
 or the System V "memory class" aggregate ABI.
 
 The Phase-2 entry brings c-strings (C.1 + C.2), `match` (M.1 +
-M.2 + M.3), and `?T` (O.1) end-to-end. `c"..."` literals lex /
-parse / typeck / MIR / Cranelift / LLVM; `[*:0]u8` is a
-parsed-and-type-system-distinct sentinel pointer that decays to
-`*u8` at extern call sites and at `let` annotations. `match`
-accepts integer-literal, bool-literal, inclusive-range (`lo..=hi`),
-or-pattern (`a | b | c`), and wildcard forms; arms unify against a
-single result type, exhaustiveness requires either a `_` arm or
-(for bool) both `true` + `false` arms. `?T` lands as a 2-field
-`{tag: u8, payload: T}` aggregate (Phase-2 minimum: integer +
-bool inners); `nil` types as `?T` in any Optional context; bare
-`T` coerces to `?T` at assignable positions; `??` reads the tag
-byte and lazily evaluates the RHS default on the nil branch.
-The MIR-side decision-tree helper `lower_pattern_test` recurses
-for or-patterns and emits short-circuit pairs for ranges; `??`
-emits a 3-block tag-test CFG. Twelve new corpus programs (eight
-match + three c-string + one `?T`) exercise the full Phase-2-entry
-surface across both backends. Cleanup #1 dropped the
-explicit-return-type requirement so unit-returning helpers
+M.2 + M.3), and the optional / error-union sub-bundle (O.1 + O.2
++ O.3) end-to-end. `c"..."` literals lex / parse / typeck / MIR
+/ Cranelift / LLVM; `[*:0]u8` is a parsed-and-type-system-
+distinct sentinel pointer that decays to `*u8` at extern call
+sites and at `let` annotations. `match` accepts integer-literal,
+bool-literal, inclusive-range (`lo..=hi`), or-pattern
+(`a | b | c`), wildcard, and (for `?T` scrutinees) `nil`
+patterns; arms unify against a single result type. `?T` and
+`!T` land as 2-field `{tag: u8, payload: T}` aggregates with
+the same layout (Phase-2 minimum: integer + bool inners); `nil`
+adopts `?T`, bare `T` coerces to `?T` and to `!T` at let-init /
+return / call-arg through a single canonical wrap helper. `??`
+reads the optional's tag and lazily evaluates a default;
+`expr!` reads the error-union's tag and traps on err. The
+MIR-side decision-tree helper `lower_pattern_test` recurses for
+or-patterns, emits short-circuit pairs for ranges, and reads
+the tag byte for `nil` patterns; `??` and `expr!` emit
+3-block tag-test CFGs. Fifteen new corpus programs (eight
+match + three c-string + four `?T`/`!T`) exercise the full
+Phase-2-entry surface across both backends. Cleanup #1 dropped
+the explicit-return-type requirement so unit-returning helpers
 (`fn greet(s: [*:0]u8) { puts(s); }`) can elide `-> u0`.
 
 **Phase 0 is complete. Phase 1 is functionally complete. Phase 13 is
-complete. Phase 2 is in progress** (c-strings + match + `?T`
-sub-bundles landed; the remaining sub-bundles are `?T` match
-patterns (O.2), error unions `!T` + `!`-assert (O.3), and comptime
-/ modules — see the [After Phase 1](#after-phase-1) section below).
-The tactical-cleanup list under
+complete. Phase 2 entry is closed.** The remaining Phase-2 work
+is comptime + frequencies/modules — the architectural heavy lift,
+deserves its own session. See the [After Phase 1](#after-phase-1)
+section below. The tactical-cleanup list under
 [What doesn't work yet](#what-doesnt-work-yet-phase-1-deferred-or-incomplete)
 shrinks accordingly.
 
@@ -151,7 +156,7 @@ gw/
 └── .github/workflows/ci.yml      (Linux/macOS/Windows matrix)
 ```
 
-### Active crate roles (≈7 250 LoC of compiler logic)
+### Active crate roles (≈7 700 LoC of compiler logic)
 
 | Crate | Phase | Role |
 |---|---|---|
@@ -159,10 +164,10 @@ gw/
 | `arsenal_ast` | 0 | Hand-rolled rowan-style CST + typed AST. Single unified `SyntaxKind` enum (189 variants — `RangePat` added in M.3). Typed views for ~38 Phase-1 / Phase-2 node kinds; `Stub` variants for the rest. `Module::stmts()` exposes top-level stmts (11a). `CastExpr` typed view added in A.1. **`SentinelPtrType` typed view (C.2)** with `element()` + `sentinel()` accessors. **`Expr::Match` (M.1)** + `MatchExpr::scrutinee()` / `arms()`, `MatchArmList::arms()`, `MatchArm::pattern()` / `body()`. **`Pattern::Literal` (M.1) / `Range` (M.3) / `Or` (M.3)** promoted from `Stub`; views expose `value()` / `lo()` + `hi()` / `alternatives()` respectively. Bumpalo arena per file. Pretty-printer for `arsenal dump`. |
 | `arsenal_parse` | 0 | Recursive-descent + Pratt expression precedence. Error-recovering. Produces both CST and AST. No parser generator. `parse_module` forks on `peek_item_keyword` between item and stmt (11a). `parse_type` handles `*T` / `[]T` / `&T` / `?T` / `[N]T` / **`[*:S]T` (C.2 — sentinel many-pointer; peek-at-1 of `Star` distinguishes from slice / array)**. **Postfix `as Type` (A.1)** at left binding power 22 — between `*`/`/`/`%` (19/20) and prefix unary (23), matching Rust precedence so `-1 as u32` parses as `(-1) as u32`. **Match (M.1–M.3)**: `parse_match_expr` invoked from `parse_primary` on `KwMatch`; scrutinee parsed with `struct_literals_allowed = false`. New `parse_match_pattern` separate from `parse_pattern` (used by `let` / `for in`) — match-arm patterns accept `_` / `Ident` / `IntLit` / `Minus IntLit` / `KwTrue` / `KwFalse` / `lo..=hi` / `a \| b \| c` chains; the literal-side parsing uses a custom `parse_pattern_literal_value` instead of `parse_expr` so `\|` (bp 9, bitwise OR) and `..=` stay available for the pattern grammar. Or-pattern wrapping uses `start_node_at` checkpoint; range-pattern wrapping uses the same trick. |
 | `arsenal_resolve` | 1 | Walks the AST, registers top-level fn + class defs, exports `primitive_type_name()`. `DefKind::SyntheticMain` is registered when top-level stmts coexist without explicit `fn main` (11a). |
-| `arsenal_typeck` | 1 / 2 | Bidirectional checker. `Ty` enum: `U0`/`Bool`/`Int(IntTy)`/`Float(FloatTy)`/`Rune`/`Class(DefId)`/`Slice(IntTy)`/`Ptr(IntTy)`/**`SentinelPtr { elem: IntTy, sentinel: u64 }` (C.2)**/**`Optional(OptInner)` (O.1) where `OptInner = Int(IntTy) \| Bool` is a closed enum**/`Error`. Emits a `TypedModule` with per-CST-node `expr_types`, `path_bindings`, `pat_bindings`, `call_targets`, `sigs`, `classes`. Slice + raw-pointer surface (11b/11c) are FFI-restricted; sentinel-pointer surface (C.2) is *not* — `[*:0]u8` flows through non-extern fn signatures because the producer-side sentinel guarantee gives the safety raw `*T` lacks. **Bidirectional literal narrowing (12d/12h)**: `check_expr` calls `try_narrow_literal` first — bare `IntLit`/`FloatLit`, `Unary(Minus, Literal)`, and `Paren(...)` shapes adopt the expected width when the value fits; out-of-range diagnoses against the literal span. `synth_binop_operands` extends the same rule across binary operators so `n < 2` (with `n: i64`) types cleanly. **`synth_cast` (A.1/A.2)** accepts the full numeric matrix `(Int\|Float, Int\|Float)`; non-numeric pairs reject with `UNSUPPORTED_CONSTRUCT`. **Class-/slice-typed fn params and returns (A.3/A.4)** are accepted via the by-pointer ABI; the `UNSUPPORTED_CONSTRUCT` rejections in `check_fn_signature` were dropped. **C.1 / C.2**: `synth_literal` types `c"..."` as `Ty::SentinelPtr { U8, 0 }`; `ty_assignable` adds the lone coercion `[*:S]T → *T` so the C.1 tracer's `puts(c"hi")` shape works without an explicit cast; missing return type defaults to `Ty::U0` (cleanup #1) instead of diagnosing — error code 307 is retired. **Match (M.1–M.3)**: `synth_match` synthesises the scrutinee, validates each arm's pattern via `check_match_pattern`, unifies arm bodies (first non-Error arm sets the result type, subsequent arms are checked against it). `check_match_pattern` accepts wildcards everywhere, integer-typed literal patterns + integer ranges (`Range`) when scrutinee is `Ty::Int(_)` (re-using the bidirectional narrowing for both bounds), `true`/`false` patterns when scrutinee is `Ty::Bool`, and `Or` patterns by recursing on each alternative. Exhaustiveness rule: every `match` requires either a `_` arm or — for bool scrutinees — both `true` and `false` literal patterns at top-level arms. Identifier patterns and other shapes still diagnose with UNSUPPORTED_CONSTRUCT until later widenings. **Optional (O.1)**: `Type::Opt(inner)` resolves to `Ty::Optional(OptInner)` when inner is integer/bool primitive (other inners reject); `try_narrow_literal` recognises `nil` in any `?T` context and adopts the expected Optional; `synth_literal` for `nil` outside an Optional context now diagnoses TYPE_MISMATCH (used to fall through silently to `Ty::Error` and pass any check); `ty_assignable` adds the lone `T → ?T` coercion edge — value-level distinct (the wrap below) but uniform at the source. Reverse direction (`?T → T`) is rejected; the user must unwrap. `synth_binary` dispatches `??` to `synth_coalesce`: LHS must be Optional, RHS checks against the inner, result type is the inner. |
-| `arsenal_mir` | 1 / 2 | CFG of basic blocks; primitive locals + aggregate stack-slot locals (class + slice); `Assign`/`AssignField` statements; `Use`/`BinOp`/`UnOp`/`Field`/`Cast` rvalues; `Goto`/`Branch`/`Return`/`Call`/`Unreachable` terminators. Loop-target stack for break/continue. `lower_for` desugar. `Const::DataAddr` + program-level `string_literals` table for `.rodata` payloads (11b). Implicit Print at stmt-position string lits desugars to `write(1, slice.data, slice.len)`; auto-injects `extern fn write` if user didn't declare one (11c). **Short-circuit `&&` / `\|\|` (12b)**: `lower_short_circuit` emits a 3-block control-flow shape (rhs-eval / short-circuit / join) and bypasses `lower_binary` so the RHS is only evaluated when the LHS doesn't determine the result. **`Rvalue::Cast` (A.1/A.2)** carries `kind: CastKind`, `operand`, `src_ty`, `dst_ty`; the closed `CastKind` enum has 7 variants, each maps to one Cranelift op. `select_cast_kind` factors the kind selection out of `lower_cast`. **`def_to_fn` fix (A.3)**: pre-A.3 the map stored each def's position in `resolved.defs` (including class defs); A.3 only counts `Fn`/`SyntheticMain` defs when assigning indices, matching the order `functions` is populated. **C.1 / C.2**: `Const::CStrAddr(CStrLitId)` + program-level `cstring_literals` table parallel to `string_literals` (no shared dedup keys — slice payloads and c-string payloads carry different semantics). `lower_cstring_literal` interns the decoded bytes (no NUL terminator stored — codegen appends it) and returns the operand directly without materialising a slice aggregate. **Match (M.1–M.3)**: `lower_match` allocates `body_bb` + `next_bb` per arm, calls the recursive `lower_pattern_test` helper, lowers the body in `body_bb`, restores cursor to `next_bb` for the next arm. `lower_pattern_test` emits `Goto(body_bb)` for wildcards, `cmp = Eq; Branch` for literals, two short-circuit `Ge` / `Le` tests for inclusive ranges, and recursive chains (each alternative threads through a fresh `alt_next_bb`) for or-patterns. The chain-of-Branch shape is the same control flow already used by short-circuit `&&` / `\|\|`, so codegen needs zero new arms across the entire match sub-bundle. **Optional (O.1)**: new `let_ty_from_ast` helper resolves `?T` annotations so `lower_let` allocates the binding local at the correct Optional aggregate type. `wrap_to_optional_if_needed` materialises the implicit `T → ?T` coercion at let-init time — allocates a fresh aggregate temp, writes tag = 1 + payload via `AssignField`, returns `Operand::Local`. `lower_nil_literal` mirrors the shape for `nil`: tag = 0, no payload write (the tag distinguishes empty). `lower_coalesce` emits the 3-block decision: read tag → compare tag == 0 → `Branch` into nil-default-block (lazy RHS evaluation, assign result) or some-payload-block (read field 1 directly into result). Both arms `Goto` a shared join. |
-| `arsenal_codegen_fast` | 1 / 2 | Cranelift-backed (placeholder until Phase 7 TPDE port). Aggregate (class + slice) layouts → stack slots; field reads/writes → stack_load/stack_store; aggregate-aggregate assigns → field-by-field copy. String literals materialised via `module.declare_data` + `define_data_object` under `__gw_str_<i>` symbols (11b). `*T` raw pointers lower as pointer-sized scalars (11c). **Float comparisons (12a)**: `lower_binop` branches on `ty.is_float()` for `Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge` — floats use `fcmp` with the matching `FloatCC`, ints keep `icmp`. **Cast lowering (A.1/A.2)**: `Rvalue::Cast` arm reads operand at `clif_ty(src_ty)` and applies one Cranelift op per `CastKind` — `sextend`/`uextend`/`ireduce` for ints, `fcvt_from_sint`/`fcvt_from_uint` and saturating `fcvt_to_*_sat` for int↔float, `fpromote`/`fdemote` for floats. Same-width `*Bitcast` variants need no instruction. **Aggregate-by-pointer ABI (A.3/A.4)**: `make_signature` prepends a hidden out-pointer for aggregate returns and substitutes pointer-typed `AbiParam` for aggregate params. `define_fn` defers the entry-block switch until the lower-block loop's first iteration to keep Cranelift's "fill before switching" rule satisfied; aggregate params copy in via `copy_aggregate_from_ptr`, and `Terminator::Return` for an aggregate-returning fn copies out through `copy_aggregate_to_ptr`. `Terminator::Call` prepends `stack_addr(dst_slot)` for aggregate returns and substitutes `stack_addr` for aggregate args. **C.1**: parallel `__gw_cstr_<i>` rodata pass — payload is `bytes ++ "\0"`; `Const::CStrAddr` lowers via `module.declare_data_in_func` + `ins.global_value` exactly like `Const::DataAddr`. **C.2**: explicit `Ty::SentinelPtr { .. }` arms in `clif_ty` / `primitive_size_align` route to pointer-width — same shape as `Ty::Ptr`. **O.1**: `is_aggregate_ty` extended to include `Ty::Optional(_)`; `aggregate_layout` / `aggregate_field_ty` add `Optional` arms (tag at offset 0 / 1 byte; payload at the inner's natural alignment; total size aligned to inner align). Local-allocation site + `lower_assign_stmt`'s aggregate-dst branch now both go through `is_aggregate_ty` — fixed two inline `matches!(..., Class \| Slice)` patterns that silently routed Optional locals into the wrong storage and the wrong assign path (caught at the first dual-backend run). |
-| `arsenal_codegen_llvm` | 13 / 2 | LLVM-18-backed via `inkwell` (B.1–B.5). Same `MirProgram → object bytes` contract as `arsenal_codegen_fast` — driver picks at `--backend=fast\|llvm`. Storage: alloca-per-local in the entry block (clang `-O0` style), `[N x i8]` allocas for aggregates with alignment bumped to the layout's max-field align via `InstructionValue::set_alignment`. Field addressing via byte-offset GEP through `i8` (opaque pointers; no struct types declared to LLVM). Bool stays at LLVM `i1` end-to-end (no i8 storage adapter). Float comparisons use ordered predicates (`OEQ`/`OLT`/etc.); float-→int casts route through the saturating `llvm.fpto{si,ui}.sat` intrinsics for Rust ≥ 1.45 / Cranelift parity. `Const::Float` lowers via `build_bit_cast(int_const, float_ty)` to preserve NaN payloads (a `const_float(f64)` round-trip would lose them on the F32 path). String literals materialise as one private `__gw_str_<i>` global per `MirProgram::string_literals` entry; `Const::DataAddr(id)` returns the global's address as `ptr`. Aggregate ABI: hidden out-pointer for aggregate returns; by-pointer for aggregate user params. `sret`/`byval` attributes intentionally omitted — corpus aggregates flow only between GW fns, plain-`ptr` agrees with Cranelift's manual `stack_addr` convention end-to-end. A small `build.rs` adds Homebrew's `lib` prefix to the linker search path on macOS so LLVM-18's system-libs (zstd, ffi, xml2, curses) resolve without `RUSTFLAGS` rituals. **C.1**: parallel pass for c-string globals — one private `__gw_cstr_<i>` per `MirProgram::cstring_literals` entry, payload `bytes ++ "\0"`; `Const::CStrAddr` returns the global's `as_pointer_value()`. **C.2**: explicit `Ty::SentinelPtr { .. }` arm in `llvm_basic_type` routes to opaque `ptr` — agrees with Cranelift's bit-exact output across all three c-string corpus programs. **O.1**: `is_aggregate_ty` / `aggregate_layout` / `aggregate_field_ty` extended for `Ty::Optional(_)` — same formula as Cranelift via the shared `optional_layout` helper, so the by-pointer ABI agrees byte-for-byte across backends. LLVM produced the correct 7 / 100 / 107 on first run; Cranelift did not (the inline-match bug above), and the dual-backend test surfaced the divergence immediately. |
+| `arsenal_typeck` | 1 / 2 | Bidirectional checker. `Ty` enum: `U0`/`Bool`/`Int(IntTy)`/`Float(FloatTy)`/`Rune`/`Class(DefId)`/`Slice(IntTy)`/`Ptr(IntTy)`/**`SentinelPtr { elem: IntTy, sentinel: u64 }` (C.2)**/**`Optional(OptInner)` (O.1)**/**`ErrorUnion(OptInner)` (O.3)** where `OptInner = Int(IntTy) \| Bool` is a closed enum/`Error`. Emits a `TypedModule` with per-CST-node `expr_types`, `path_bindings`, `pat_bindings`, `call_targets`, `sigs`, `classes`. Slice + raw-pointer surface (11b/11c) are FFI-restricted; sentinel-pointer surface (C.2) is *not* — `[*:0]u8` flows through non-extern fn signatures because the producer-side sentinel guarantee gives the safety raw `*T` lacks. **Bidirectional literal narrowing (12d/12h)**: `check_expr` calls `try_narrow_literal` first — bare `IntLit`/`FloatLit`, `Unary(Minus, Literal)`, and `Paren(...)` shapes adopt the expected width when the value fits; out-of-range diagnoses against the literal span. `synth_binop_operands` extends the same rule across binary operators so `n < 2` (with `n: i64`) types cleanly. **`synth_cast` (A.1/A.2)** accepts the full numeric matrix `(Int\|Float, Int\|Float)`; non-numeric pairs reject with `UNSUPPORTED_CONSTRUCT`. **Class-/slice-typed fn params and returns (A.3/A.4)** are accepted via the by-pointer ABI; the `UNSUPPORTED_CONSTRUCT` rejections in `check_fn_signature` were dropped. **C.1 / C.2**: `synth_literal` types `c"..."` as `Ty::SentinelPtr { U8, 0 }`; `ty_assignable` adds the lone coercion `[*:S]T → *T` so the C.1 tracer's `puts(c"hi")` shape works without an explicit cast; missing return type defaults to `Ty::U0` (cleanup #1) instead of diagnosing — error code 307 is retired. **Match (M.1–M.3)**: `synth_match` synthesises the scrutinee, validates each arm's pattern via `check_match_pattern`, unifies arm bodies (first non-Error arm sets the result type, subsequent arms are checked against it). `check_match_pattern` accepts wildcards everywhere, integer-typed literal patterns + integer ranges (`Range`) when scrutinee is `Ty::Int(_)` (re-using the bidirectional narrowing for both bounds), `true`/`false` patterns when scrutinee is `Ty::Bool`, and `Or` patterns by recursing on each alternative. Exhaustiveness rule: every `match` requires either a `_` arm or — for bool scrutinees — both `true` and `false` literal patterns at top-level arms. Identifier patterns and other shapes still diagnose with UNSUPPORTED_CONSTRUCT until later widenings. **Optional (O.1)**: `Type::Opt(inner)` resolves to `Ty::Optional(OptInner)` when inner is integer/bool primitive (other inners reject); `try_narrow_literal` recognises `nil` in any `?T` context and adopts the expected Optional; `synth_literal` for `nil` outside an Optional context now diagnoses TYPE_MISMATCH (used to fall through silently to `Ty::Error` and pass any check); `ty_assignable` adds the lone `T → ?T` coercion edge — value-level distinct (the wrap below) but uniform at the source. Reverse direction (`?T → T`) is rejected; the user must unwrap. `synth_binary` dispatches `??` to `synth_coalesce`: LHS must be Optional, RHS checks against the inner, result type is the inner. **Match-on-?T (O.2)**: `check_match_pattern`'s Literal arm gains an Optional-scrutinee branch — `nil` accepts (records `expr_types[value] = scrut_ty`), other literals reject with a "use `_` to match the some side" hint. New `is_nil_literal` helper recurses through parens. The exhaustiveness rule fires unchanged for Optional scrutinees because they're not bool. **Error union (O.3)**: `Type::ErrorUnion(inner)` resolves to `Ty::ErrorUnion(OptInner)` with the same primitive-only constraint as O.1. `ty_assignable` adds a `T → !T` coercion edge parallel to `T → ?T`; `?T` and `!T` stay type-distinct (no exchange in either direction). New `synth_must` for `expr!`: LHS must be `Ty::ErrorUnion(_)`, result is the unwrapped inner. |
+| `arsenal_mir` | 1 / 2 | CFG of basic blocks; primitive locals + aggregate stack-slot locals (class + slice); `Assign`/`AssignField` statements; `Use`/`BinOp`/`UnOp`/`Field`/`Cast` rvalues; `Goto`/`Branch`/`Return`/`Call`/`Unreachable` terminators. Loop-target stack for break/continue. `lower_for` desugar. `Const::DataAddr` + program-level `string_literals` table for `.rodata` payloads (11b). Implicit Print at stmt-position string lits desugars to `write(1, slice.data, slice.len)`; auto-injects `extern fn write` if user didn't declare one (11c). **Short-circuit `&&` / `\|\|` (12b)**: `lower_short_circuit` emits a 3-block control-flow shape (rhs-eval / short-circuit / join) and bypasses `lower_binary` so the RHS is only evaluated when the LHS doesn't determine the result. **`Rvalue::Cast` (A.1/A.2)** carries `kind: CastKind`, `operand`, `src_ty`, `dst_ty`; the closed `CastKind` enum has 7 variants, each maps to one Cranelift op. `select_cast_kind` factors the kind selection out of `lower_cast`. **`def_to_fn` fix (A.3)**: pre-A.3 the map stored each def's position in `resolved.defs` (including class defs); A.3 only counts `Fn`/`SyntheticMain` defs when assigning indices, matching the order `functions` is populated. **C.1 / C.2**: `Const::CStrAddr(CStrLitId)` + program-level `cstring_literals` table parallel to `string_literals` (no shared dedup keys — slice payloads and c-string payloads carry different semantics). `lower_cstring_literal` interns the decoded bytes (no NUL terminator stored — codegen appends it) and returns the operand directly without materialising a slice aggregate. **Match (M.1–M.3)**: `lower_match` allocates `body_bb` + `next_bb` per arm, calls the recursive `lower_pattern_test` helper, lowers the body in `body_bb`, restores cursor to `next_bb` for the next arm. `lower_pattern_test` emits `Goto(body_bb)` for wildcards, `cmp = Eq; Branch` for literals, two short-circuit `Ge` / `Le` tests for inclusive ranges, and recursive chains (each alternative threads through a fresh `alt_next_bb`) for or-patterns. The chain-of-Branch shape is the same control flow already used by short-circuit `&&` / `\|\|`, so codegen needs zero new arms across the entire match sub-bundle. **Optional (O.1)**: new `let_ty_from_ast` helper resolves `?T` annotations so `lower_let` allocates the binding local at the correct Optional aggregate type. `wrap_to_optional_if_needed` materialises the implicit `T → ?T` coercion at let-init time — allocates a fresh aggregate temp, writes tag = 1 + payload via `AssignField`, returns `Operand::Local`. `lower_nil_literal` mirrors the shape for `nil`: tag = 0, no payload write (the tag distinguishes empty). `lower_coalesce` emits the 3-block decision: read tag → compare tag == 0 → `Branch` into nil-default-block (lazy RHS evaluation, assign result) or some-payload-block (read field 1 directly into result). Both arms `Goto` a shared join. **Match-on-?T (O.2)**: `lower_pattern_test`'s Literal arm gains an Optional-scrutinee branch — read tag (`Rvalue::Field` with `field_idx = 0`), compare `tag == 0`, `Branch`. New helpers `pattern_value_is_nil` (recognise nil-literal patterns) and `ensure_scrut_local` (materialise an aggregate temp if `scrut_op` isn't already a `Local`). **Error union (O.3)**: `let_ty_from_ast` also resolves `!T` annotations. `wrap_to_optional_if_needed` generalised to `Ty::Optional(_) \| Ty::ErrorUnion(_)` — both share the `{tag, payload}` layout, so the wrap shape is identical. New `lower_must` for `expr!`: read tag, branch on `tag == 0` into a trap block (`Terminator::Unreachable`, which both backends lower as a hardware trap), read payload field on success. **The wrap helper now fires at three sites** — `lower_let`, `lower_return` (uses new `LowerCx::fn_return_ty`), and `lower_call` (consults `typed.sigs` for each callee param). |
+| `arsenal_codegen_fast` | 1 / 2 | Cranelift-backed (placeholder until Phase 7 TPDE port). Aggregate (class + slice) layouts → stack slots; field reads/writes → stack_load/stack_store; aggregate-aggregate assigns → field-by-field copy. String literals materialised via `module.declare_data` + `define_data_object` under `__gw_str_<i>` symbols (11b). `*T` raw pointers lower as pointer-sized scalars (11c). **Float comparisons (12a)**: `lower_binop` branches on `ty.is_float()` for `Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge` — floats use `fcmp` with the matching `FloatCC`, ints keep `icmp`. **Cast lowering (A.1/A.2)**: `Rvalue::Cast` arm reads operand at `clif_ty(src_ty)` and applies one Cranelift op per `CastKind` — `sextend`/`uextend`/`ireduce` for ints, `fcvt_from_sint`/`fcvt_from_uint` and saturating `fcvt_to_*_sat` for int↔float, `fpromote`/`fdemote` for floats. Same-width `*Bitcast` variants need no instruction. **Aggregate-by-pointer ABI (A.3/A.4)**: `make_signature` prepends a hidden out-pointer for aggregate returns and substitutes pointer-typed `AbiParam` for aggregate params. `define_fn` defers the entry-block switch until the lower-block loop's first iteration to keep Cranelift's "fill before switching" rule satisfied; aggregate params copy in via `copy_aggregate_from_ptr`, and `Terminator::Return` for an aggregate-returning fn copies out through `copy_aggregate_to_ptr`. `Terminator::Call` prepends `stack_addr(dst_slot)` for aggregate returns and substitutes `stack_addr` for aggregate args. **C.1**: parallel `__gw_cstr_<i>` rodata pass — payload is `bytes ++ "\0"`; `Const::CStrAddr` lowers via `module.declare_data_in_func` + `ins.global_value` exactly like `Const::DataAddr`. **C.2**: explicit `Ty::SentinelPtr { .. }` arms in `clif_ty` / `primitive_size_align` route to pointer-width — same shape as `Ty::Ptr`. **O.1 / O.3**: `is_aggregate_ty` extended to include `Ty::Optional(_)` and `Ty::ErrorUnion(_)`; `aggregate_layout` / `aggregate_field_ty` route both through the shared `optional_layout` formula (tag at offset 0 / 1 byte; payload at the inner's natural alignment; total size aligned to inner align). Local-allocation site + `lower_assign_stmt`'s aggregate-dst branch now both go through `is_aggregate_ty` — fixed two inline `matches!(..., Class \| Slice)` patterns from O.1 that silently routed Optional locals into the wrong storage and the wrong assign path (caught at the first dual-backend run). |
+| `arsenal_codegen_llvm` | 13 / 2 | LLVM-18-backed via `inkwell` (B.1–B.5). Same `MirProgram → object bytes` contract as `arsenal_codegen_fast` — driver picks at `--backend=fast\|llvm`. Storage: alloca-per-local in the entry block (clang `-O0` style), `[N x i8]` allocas for aggregates with alignment bumped to the layout's max-field align via `InstructionValue::set_alignment`. Field addressing via byte-offset GEP through `i8` (opaque pointers; no struct types declared to LLVM). Bool stays at LLVM `i1` end-to-end (no i8 storage adapter). Float comparisons use ordered predicates (`OEQ`/`OLT`/etc.); float-→int casts route through the saturating `llvm.fpto{si,ui}.sat` intrinsics for Rust ≥ 1.45 / Cranelift parity. `Const::Float` lowers via `build_bit_cast(int_const, float_ty)` to preserve NaN payloads (a `const_float(f64)` round-trip would lose them on the F32 path). String literals materialise as one private `__gw_str_<i>` global per `MirProgram::string_literals` entry; `Const::DataAddr(id)` returns the global's address as `ptr`. Aggregate ABI: hidden out-pointer for aggregate returns; by-pointer for aggregate user params. `sret`/`byval` attributes intentionally omitted — corpus aggregates flow only between GW fns, plain-`ptr` agrees with Cranelift's manual `stack_addr` convention end-to-end. A small `build.rs` adds Homebrew's `lib` prefix to the linker search path on macOS so LLVM-18's system-libs (zstd, ffi, xml2, curses) resolve without `RUSTFLAGS` rituals. **C.1**: parallel pass for c-string globals — one private `__gw_cstr_<i>` per `MirProgram::cstring_literals` entry, payload `bytes ++ "\0"`; `Const::CStrAddr` returns the global's `as_pointer_value()`. **C.2**: explicit `Ty::SentinelPtr { .. }` arm in `llvm_basic_type` routes to opaque `ptr` — agrees with Cranelift's bit-exact output across all three c-string corpus programs. **O.1 / O.3**: `is_aggregate_ty` / `aggregate_layout` / `aggregate_field_ty` extended for `Ty::Optional(_)` and `Ty::ErrorUnion(_)` — same formula via the shared `optional_layout` helper, so the by-pointer ABI agrees byte-for-byte across backends. **O.3 also fixed `make_fn_type`**: the aggregate-return arm previously had a hardcoded allow-list (`Class \| Slice`) that excluded the new variants; now routes through `is_aggregate_ty` so future aggregate variants auto-handle. |
 | `arsenal_driver` | 0/1 | Subcommands: `arsenal new <name>`, `arsenal build [--backend=fast\|llvm] <file.gw>`, `arsenal dump <path>`, `arsenal --version`. Build pipeline: lex → parse → resolve → typeck → MIR → (Cranelift OR LLVM) → object → `cc` link → executable. `--backend=fast` is the default; both backends emit the same `Vec<u8>` object-bytes shape so the linker invocation is shared. |
 
 ---
@@ -209,6 +214,8 @@ Each increment shipped one or more corpus programs and a single commit.
 | M.2 | bool match + statement-position match | `7d9c04d` | +2 (234–235) | parser `parse_match_pattern` accepts `KwTrue` / `KwFalse` as start tokens for `LiteralPat`; typeck `check_match_pattern` adds bool-scrutinee arm; `synth_match` tracks `has_true` / `has_false` so `match b { true => ..., false => ... }` is exhaustive without `_`; statement-position match works without further plumbing (existing `lower_expr_stmt → lower_expr → lower_match` path; `result_local` already short-circuits on `Ty::U0`); +4 typeck unit tests | 0 |
 | M.3 | match range + or-patterns | `2d85e65` | +3 (236–238) | new `RangePat` SyntaxKind; AST `Pattern::Range(RangePat)` + `Pattern::Or(OrPat)` promoted from `Stub`; parser `parse_match_pattern` reads atoms separated by `\|` (wraps in `OrPat` via checkpoint), retroactively wraps a literal in `RangePat` if `..=` follows; new `parse_pattern_literal_value` helper avoids `parse_expr`'s Pratt operators stealing `\|` / `..=` from the pattern grammar; typeck `check_match_pattern` adds `Range` (integer scrutinee, both bounds narrow via `check_expr`) and `Or` (recurses on each alternative); MIR refactors into recursive `lower_pattern_test` helper — `Range` emits two short-circuit `Ge` + `Le` tests, `Or` chains alternatives through fresh `alt_next_bb`s, the helper centralises the "cursor ends at next_bb" invariant so `lower_match` shrinks; +5 typeck unit tests | 0 |
 | O.1 | `?T` tracer (`Ty::Optional`, nil, `T → ?T`, `??`) | `7c46d5b` | +1 (239) | parser `??` infix at (16, 15) right-assoc; new `Ty::Optional(OptInner)` variant with closed `OptInner = Int(IntTy) \| Bool` enum; `resolve_type` for `Type::Opt` accepts integer / bool inners (rejects wider with UNSUPPORTED_CONSTRUCT); `try_narrow_literal` adopts `?T` for `nil` in any Optional context; `synth_literal` for `nil` outside Optional context now diagnoses TYPE_MISMATCH; `ty_assignable` adds the lone `T → ?T` coercion edge; new `synth_coalesce` (LHS Optional, RHS inner, result inner). MIR: `let_ty_from_ast` resolves `?T` so `lower_let` allocates the binding at the right type; `wrap_to_optional_if_needed` materialises the `T → ?T` coercion as a fresh aggregate temp (tag = 1, payload = T); `lower_nil_literal` writes only tag = 0; `lower_coalesce` emits a 3-block decision (read tag → compare = 0 → Branch nil-default vs payload-read). Both backends extended for `Ty::Optional(_)`: `is_aggregate_ty`, `aggregate_layout` (via shared `optional_layout` formula — tag at 0, payload at inner align, total aligned), `aggregate_field_ty` (u8 tag, inner payload). Cranelift's local-allocation + `lower_assign_stmt` paths both go through `is_aggregate_ty` now (fixing the predicted bug — see below); +8 typeck and +3 MIR unit tests | **1** — silent miscompile: Cranelift's local-allocation site and `lower_assign_stmt` aggregate-dst branch had inline `matches!(ty, Class \| Slice)` checks that didn't go through `is_aggregate_ty`. Optional locals routed into Variable storage instead of StackSlot, then the aggregate-Assign fell through to the primitive path — first run gave Cranelift exit 1 / 0 across the tracer's three smoke tests while LLVM gave the correct 7 / 100 / 107. Fixed by routing both sites through `is_aggregate_ty`; future aggregate variants are auto-handled |
+| O.2 | `?T` match patterns + `nil` arm | `c555777` | +1 (240) | parser `parse_pattern_literal_value` accepts `KwNil`; typeck `check_match_pattern`'s Literal arm gains Optional-scrutinee branch — `nil` accepts (records `expr_types[value] = scrut_ty`), other literals reject with hint to use `_` for the some side; new `is_nil_literal` helper recurses through parens; MIR `lower_pattern_test` Literal arm reads tag (`Rvalue::Field` field_idx 0), compares `tag == 0`, branches; new `pattern_value_is_nil` + `ensure_scrut_local` helpers; codegen unchanged (chain-of-Branch + Field reuse from M.x and O.1); +4 typeck unit tests | 0 |
+| O.3 | `!T` error union + `!`-assert | `5282bc8` | +1 (241) | parser `!T` arm in `parse_type` produces `ErrorUnionType`; postfix `!` arm in `parse_expr_bp` produces `MustExpr`; AST `Type::ErrorUnion(ErrorUnionType)` and `Expr::Must(MustExpr)` promoted from `Stub`; new `Ty::ErrorUnion(OptInner)` variant reusing the same closed inner; `resolve_type` for `Type::ErrorUnion` accepts integer / bool inners; `ty_assignable` adds `T → !T` coercion (parallel to O.1's `T → ?T`); `?T` and `!T` stay type-distinct (no exchange). New `synth_must` (LHS must be ErrorUnion, result is inner). MIR `lower_must` emits 3-block decision (read tag → compare = 0 → Branch trap vs payload-read; trap-block uses `Terminator::Unreachable` which both backends lower as hardware trap); `wrap_to_optional_if_needed` generalised to `Optional \| ErrorUnion`. New `LowerCx::fn_return_ty` field carries the current fn's declared return type so `lower_return` applies the wrap; `lower_call` reads each callee param's type from `typed.sigs` and applies the wrap per-arg. Both backends extended for `Ty::ErrorUnion(_)` via the same `optional_layout` formula. **LLVM `make_fn_type` now routes the aggregate-return arm through `is_aggregate_ty`** instead of the inline `Class \| Slice` allow-list. +7 typeck unit tests | **2** — both fixed inline: (a) LLVM `make_fn_type` had a hardcoded `Class \| Slice` allow-list for aggregate returns, rejecting `!T` (and would have rejected `?T` if the O.1 tracer had used it). Fixed by routing through `is_aggregate_ty`. (b) MIR `lower_return` didn't apply the `T → ?T` / `T → !T` wrap when returning a bare `T` from an aggregate-typed fn. Cranelift produced exit 2 (low byte of un-wrapped primitive in aggregate slot); LLVM produced 7 (similar miscompile). Fixed by adding `LowerCx::fn_return_ty` and calling `wrap_to_optional_if_needed` from `lower_return`. Pre-emptively also fixed `lower_call`'s arg path (same shape, same risk). |
 
 **Key pattern**: each "0 bugs" increment was almost pure corpus growth (the
 plumbing was already in place). Each "≥1 bug" increment caught real
@@ -281,7 +288,31 @@ new aggregate type variant lands, every place that switches on
 aggregate variants (sum types, tagged unions, …) are
 auto-handled.
 
-### What 239 corpus programs cover
+**O.2 confirms the recombination rule.** Pure recombination of
+M.x's decision-tree + O.1's Optional aggregate machinery. Pre-bundle
+prediction: ~1 bug. Observed yield: 0. The new pattern shape
+(`nil` arm) introduces no new value-level surface: the tag-byte
+read was already validated through `??` (O.1), and the
+chain-of-Branch shape was already validated through M.x.
+
+**O.3 generalises the O.1 lesson and finds two new bugs.** Pre-
+bundle prediction: ~1-2 bugs. Observed yield: 2 — both *latent
+O.1 bugs* that the O.3 tracer happened to surface: (a) LLVM
+`make_fn_type` had a hardcoded `Class \| Slice` allow-list for
+aggregate fn returns; the O.1 tracer didn't use a `?T`-returning
+fn, so the bug stayed dormant. (b) MIR `lower_return` didn't
+apply the `T → ?T` / `T → !T` wrap when returning a bare `T`
+from an aggregate-typed fn — same pattern as the existing
+`lower_let` wrap, just at a different syntactic site. Both fixes
+generalise the O.1 lesson: every site that switches on
+T-vs-aggregate-tagged-T should go through one canonical
+`wrap_to_optional_if_needed` helper, the same way every site
+that switches on aggregate-vs-primitive must go through
+`is_aggregate_ty`. Three sites now do (`lower_let`,
+`lower_return`, `lower_call`); future variants like
+`Result<T, E>` or sum types should auto-handle.
+
+### What 241 corpus programs cover
 
 - Phase-0 syntax: every TokenKind variant, every operator precedence
   level, every supported statement form.
@@ -331,18 +362,26 @@ auto-handled.
   signature (uses cleanup #1's `-> u0` default to elide the return
   type); escapes round-trip (`\t`, `\\`, `\"`, etc.) decoded via the
   shared `decode_string_literal` after `c"` prefix strip.
-- Phase 2 increment O.1 surface: `?T` optional type for primitive
-  inners (`?i32`, `?i64`, `?bool`, …) at `let` annotations, fn
-  signatures (param + return), and call-arg slots; `nil` literal
-  adopts `?T` from any Optional context; bare `T` coerces to `?T`
-  at any assignable position (let-init, return, call-arg);
-  reverse direction (`?T → T`) rejected — user must unwrap. `??`
-  coalesce operator: reads the LHS's tag byte, returns the
-  payload if `tag == 1`, lazily evaluates the RHS default if
-  `tag == 0`. The `?T` aggregate lowers as `{ tag: u8 @ 0,
-  payload: T @ align_of(T) }`, total size aligned to the inner's
-  alignment (`?i32` = 8 bytes, `?i64` = 16 bytes, `?bool` = 2
-  bytes). Both backends agree byte-for-byte.
+- Phase 2 increment O.1 / O.2 / O.3 surface: `?T` optional and
+  `!T` error-union types for primitive inners (`?i32`, `?i64`,
+  `?bool`, `!i32`, `!bool`, …) at `let` annotations, fn signatures
+  (param + return), and call-arg slots; `nil` literal adopts `?T`
+  from any Optional context; bare `T` coerces to `?T` and `!T` at
+  any assignable position via a single canonical wrap helper that
+  fires at three sites (`lower_let`, `lower_return`, `lower_call`).
+  Reverse directions (`?T → T`, `!T → T`, `?T ↔ !T`) rejected —
+  user must unwrap. `??` coalesce operator: reads the LHS optional's
+  tag byte, returns the payload if `tag == 1`, lazily evaluates the
+  RHS default if `tag == 0`. `expr!` postfix assert: reads the LHS
+  error-union's tag byte, returns the payload if `tag == 1`, traps
+  on `tag == 0` (via `Terminator::Unreachable` which both backends
+  lower as a hardware trap). `match opt { nil => …, _ => … }`
+  exercises the existing decision-tree pattern infrastructure with
+  a tag-byte read in the `nil`-arm test. Both `?T` and `!T`
+  aggregates lower as `{ tag: u8 @ 0, payload: T @ align_of(T) }`,
+  total size aligned to the inner's alignment (`?i32` / `!i32` =
+  8 bytes, `?i64` / `!i64` = 16, `?bool` / `!bool` = 2). Both
+  backends agree byte-for-byte.
 - Phase 2 increment M.1 / M.2 / M.3 surface: `match scrutinee {
   pattern => expr, ... }` at expression and statement position;
   pattern shapes accepted are wildcards (`_`), bare integer
@@ -469,6 +508,26 @@ fn main() -> i32 {
 Exit code: 107. `7` wraps into `{tag: 1, payload: 7}`, `nil` lowers
 as `{tag: 0, ...}`, the two `??` reads check tag bytes and lazily
 pick payload-or-default. Both backends produce 107 byte-for-byte.
+
+The Phase-2 `!T` surface (O.3) brings the parallel error-union
+shape with postfix `!`-assert:
+
+```gw
+fn safe_compute(seed: i32) -> !i32 {
+    return seed * 3;
+}
+
+fn main() -> i32 {
+    let r: !i32 = safe_compute(7);
+    return r!;
+}
+```
+
+Exit code: 21. The fn return wraps `seed * 3 = 21` into `{tag: 1,
+payload: 21}` (the `T → !T` coercion fires at `lower_return`), and
+`r!` reads the payload field (tag = 1 → ok branch). On a hypothetical
+`tag = 0` (err) value, the `!` postfix would trap via
+`Terminator::Unreachable`. Both backends produce 21 byte-for-byte.
 
 ### Driver UX
 
@@ -878,16 +937,43 @@ session start before changing them.
     tag, branch, nil-default-block / some-payload-block,
     shared join) is independent of the inner type's lowering.
 38. **`is_aggregate_ty` is the canonical aggregate predicate**
-    (O.1 lesson) — every site that switches on
+    (O.1 lesson, expanded by O.3) — every site that switches on
     "aggregate vs primitive" must go through `is_aggregate_ty`,
     never inline `matches!(ty, Class | Slice)` checks. The O.1
     Cranelift bug was exactly this: two sites (local-allocation
-    + `lower_assign_stmt` aggregate-dst branch) had
-    out-of-sync inline patterns, so adding `Ty::Optional` to
-    `is_aggregate_ty` alone didn't help — Optional locals
-    silently routed into the wrong storage. After O.1 both
-    sites go through the helper; future aggregate variants
-    (sum types, tagged unions, …) auto-fix.
+    + `lower_assign_stmt` aggregate-dst branch) had out-of-sync
+    inline patterns. The O.3 LLVM bug was a third (`make_fn_type`'s
+    aggregate-return arm). All three sites now route through the
+    helper; future aggregate variants (sum types, tagged unions,
+    …) auto-fix.
+39. **`?T` and `!T` are type-distinct, layout-identical** (O.3) —
+    Phase 2 reuses the same `optional_layout` formula and the same
+    `OptInner` enum for both `Ty::Optional(_)` and
+    `Ty::ErrorUnion(_)`. `ty_assignable` adds `T → !T` parallel to
+    `T → ?T` but never permits `?T ↔ !T` exchange in either
+    direction; the source-level distinction enables future
+    propagation operators (`try`, `catch`) to attach to `!T` only,
+    while `??` and `nil`-pattern attach to `?T` only.
+40. **`wrap_to_optional_if_needed` is the canonical wrap helper**
+    (O.3 lesson) — every site that switches on T-vs-aggregate-
+    tagged-T must go through this helper, never inline allocate
+    + `AssignField` sequences. Three sites currently call it:
+    `lower_let` (let-init coercion), `lower_return` (uses
+    `LowerCx::fn_return_ty`), and `lower_call` (consults each
+    callee param's type from `typed.sigs`). The O.3 retrospective
+    found a fourth implicit site that didn't yet exist (no `match`
+    arm bodies coerce to ?T/!T currently), but when one lands the
+    same helper should fire. Mirrors decision #38: canonical
+    predicate + canonical wrap.
+41. **`Terminator::Unreachable` doubles as a trap** (O.3) — the
+    `!`-assert err branch and any other "this point is
+    unreachable, abort if reached" path use `Terminator::Unreachable`,
+    which both backends lower as a hardware trap (Cranelift
+    `fb.ins().trap(...)` with a user trap code; LLVM `unreachable`
+    IR which the backend emits as `ud2` / equivalent). Phase 2 has
+    no panic-message infrastructure yet; later sub-bundles
+    (perhaps a `panic` runtime hook, or the Phase 3 borrow-check
+    machinery) can attach metadata to the trap.
 
 ---
 
@@ -897,11 +983,11 @@ session start before changing them.
 The architecture's Phase-1 exit gate (200-program corpus) is met
 **and** the Phase-1 follow-up "Option A" (class/slice ABI + `as` casts)
 landed across A.1–A.4. The "Option B" Phase-13 LLVM backend then
-shipped across B.1–B.5. The "Option C" Phase-2 entry has now landed
-three sub-bundles: c-strings (C.1 + C.2 + cleanup #1), match
-(M.1 + M.2 + M.3), and the `?T` tracer (O.1). The remaining
-Phase-2 sub-bundles are O.2 (`?T` match patterns + nil arm), O.3
-(`!T` error union + `!`-assert), and comptime + modules.
+shipped across B.1–B.5. The "Option C" Phase-2 entry has closed
+its three pre-comptime sub-bundles: c-strings (C.1 + C.2 + cleanup
+#1), match (M.1 + M.2 + M.3), and optional / error-union (O.1 +
+O.2 + O.3). The remaining Phase-2 work is comptime + frequencies
+/ modules — the architectural heavy lift, deserves its own session.
 
 ### Option A — DONE
 
@@ -936,70 +1022,83 @@ The big jump. Phase 2 brings:
   (`a | b | c`), and wildcard forms; the MIR-side
   `lower_pattern_test` helper recurses for or-patterns and emits
   short-circuit pairs for ranges; codegen unchanged.
-- error unions `!T`, optional types `?T` — **O.1 (?T tracer) DONE**
-  (commit `7c46d5b`). `?T` as a 2-field aggregate {tag, payload}
-  for primitive inners; `nil` literal; `T → ?T` coercion; `??`
-  coalesce operator with lazy RHS. O.2 adds `match` patterns over
-  `?T`; O.3 adds `!T` error union + `!`-assert.
+- error unions `!T`, optional types `?T` — **O.1 + O.2 + O.3 DONE**
+  (commits `7c46d5b` + `c555777` + `5282bc8`). `?T` and `!T` as
+  parallel 2-field aggregates {tag, payload} for primitive inners;
+  `nil` literal adopts `?T`; bare `T` coerces to `?T` and `!T`;
+  `??` coalesce operator on `?T`; `expr!` assert on `!T`;
+  `match opt { nil => ..., _ => ... }` over `?T` scrutinees.
+  Three bugs caught and fixed across the sub-bundle (O.1: 1, O.3:
+  2; O.2: 0); all three were latent multi-site predicate-canonical
+  -isation bugs of the form "every site that does X must go through
+  one canonical helper" — both `is_aggregate_ty` (decision #38)
+  and `wrap_to_optional_if_needed` (decision #40) now have three
+  call sites each.
 - `c"..."` C-string literals — **C.1 + C.2 DONE** (commits
   `1e8752c` + `bd3cf5d`). `c"..."` types as `[*:0]u8`, lowers via
   `Const::CStrAddr` to a parallel `__gw_cstr_<i>` rodata pass in
   both backends, decays to `*u8` at extern call sites; non-extern
   fn signatures accept `[*:0]u8` directly.
 
-Estimated cost remaining: dozens of hours. Bug yield so far is
-1 across all six closed Phase-2 sub-bundles (C.1+C.2+M.1+M.2+M.3 = 0,
-O.1 = 1, against a 12/A.x prediction of ~4). The remaining
-sub-bundles introduce additional *value-level* novelty (tag-byte
-reads in pattern matching for O.2; new aggregate layout + trap
-machinery for O.3; comptime evaluator state and multi-file build
-orchestration for the comptime sub-bundle), so the prediction
-stays armed.
+Estimated cost remaining: dozens of hours, mostly in the comptime
++ modules sub-bundle. Bug yield so far is 3 across all eight
+closed Phase-2 sub-bundles (C.1+C.2+M.1+M.2+M.3+O.2 = 0, O.1 = 1,
+O.3 = 2, against a 12/A.x prediction of ~6 — the recombination
+sub-bundles (M.x and O.2) under-shot prediction because they
+reused already-validated value-level shapes; the value-level-
+novel sub-bundles (O.1 and O.3) hit prediction exactly). The
+comptime sub-bundle introduces a brand-new evaluator state +
+multi-file build orchestration, so the prediction stays armed —
+this will be the largest bug surface in Phase 2 by an order of
+magnitude.
 
 The dual-backend test now in place means any Phase 2 codegen change
 is automatically validated against both Cranelift and LLVM; this
 became useful immediately on C.1 and stayed useful through M.3.
 
-#### Recommended next sub-bundle: O.2 (`?T` match patterns)
+#### Only remaining Phase-2 sub-bundle: comptime + modules
 
-After O.1 closes the `?T` tracer, the natural next step is
-extending the existing match infrastructure (M.1–M.3) to scrutinise
-optional values. The remaining Phase-2 surface in ascending cost
-order:
+After O.3 closes the optional / error-union sub-bundle, the only
+remaining Phase-2 work is comptime + frequencies (modules). This
+is the architectural heavy lift and deserves its own session.
 
-- **O.2 `?T` match patterns** — adds `match opt { nil => ..., _ =>
-  ... }` (and possibly bare-pattern wildcards on the some-arm
-  side, depending on whether O.2 includes binding patterns or
-  defers them to O.4). MIR adds a `nil`-pattern arm to
-  `lower_pattern_test` that emits `cmp = (tag == 0); Branch`.
-  Typeck extends `check_match_pattern` to handle Optional
-  scrutinees. Bug yield estimate: ~1 (new pattern + tag-byte read
-  combination, but reuses both M.x and O.1 machinery).
-- **O.3 `!T` error union + `!`-assert** — `!T` is a 2-field
-  aggregate parallel to `?T` with an error-tag-and-payload
-  layout. `expr!` asserts the success tag and traps on the error
-  tag. Needs trap-on-mismatch machinery (a new `Terminator::Trap`
-  or reuse of `Terminator::Unreachable` with a side-channel
-  diagnostic). New value-level novelty re-arms the prediction —
-  ~1-2 bugs.
-- **comptime + frequencies (modules)** — the architectural heavy
-  lift. New `arsenal_comptime` crate, multi-file builds, module
-  resolution. Should land in a session that can be devoted entirely
-  to it; gates `cipher` / `frequencies` so blocks the manifest-
-  driven driver UX.
+- **comptime + frequencies (modules)** — new `arsenal_comptime`
+  crate (currently a stub), multi-file builds, module resolution.
+  Gates `cipher` (the package manager) and the manifest-driven
+  driver UX. Bug yield estimate: highest of any Phase-2
+  sub-bundle by an order of magnitude — the comptime evaluator
+  is genuinely new code (no parallel implementation to crib
+  from), multi-file build orchestration touches the driver +
+  resolve + typeck end-to-end, and module-level `use` /
+  `frequencies` declarations require new AST + parser surface
+  area. The 12/A.x heuristic predicts ~3-5 bugs across the
+  bundle; without value-level-novel surface, even the lowest
+  estimate is several genuinely-new shapes.
 
-The argument for O.2 → O.3 next (in this order):
-- O.2 reuses both M.x (decision-tree lowering) and O.1 (Optional
-  aggregate layout) infrastructure — it's the smallest possible
-  next step that actually exercises something new (tag-byte read
-  in a pattern test).
-- O.3 introduces a parallel aggregate layout (`!T`) that's
-  structurally similar to `?T` but with different semantics
-  (error vs nil); the lessons from O.1's bug surface (canonical
-  `is_aggregate_ty` predicate) should carry forward and prevent a
-  repeat.
-- Both can ship within a single session.
-- Neither depends on comptime / modules and neither gates them.
+Suggested sub-bundling (rough — finalise at session start):
+- **F.1 multi-file tracer** — driver reads multiple `.gw` files
+  into one SourceMap, lex / parse each separately, resolve
+  cross-file (no namespace yet), one MirProgram with all fns
+  visible. Tracer: 2-file project where `main.gw` calls a fn
+  defined in `lib.gw`. No `use` / `frequencies` yet. Smallest
+  meaningful step into multi-file.
+- **F.2 `frequencies` / `use` declarations** — actual module
+  syntax. `frequencies foo;` declares a module; `use foo;` (or
+  `use foo::bar;`) imports.
+- **CT.1 comptime tracer** — `comptime fn foo() -> i32 { return
+  42; }` evaluates at compile time; runtime calls become the
+  constant. Smallest comptime step: pure-int constant evaluator.
+- **CT.2 comptime over more types** — extend the evaluator to
+  handle arithmetic, bool, classes, strings…
+- **CT.3 comptime + frequencies integration** — `comptime use
+  foo;` etc. (Tentative; depends on what F.x and CT.x lock in.)
+
+The session-start move: read this section, choose F.1 vs CT.1 as
+the very first step (both viable; F.1 has the simpler
+infrastructure but doesn't prove the comptime evaluator works;
+CT.1 proves the evaluator but doesn't help multi-file builds).
+Either way, surface design decisions before writing code — this
+is the largest sub-bundle entry of Phase 2.
 
 ### Tactical cleanup (any session)
 
@@ -1089,13 +1188,13 @@ state this doc describes:
 ```bash
 cd /Users/silmaril/Documents/GitHub/gw
 git log --oneline | head -10
-# expect tip: HANDOFF refresh after O.1 (this commit), 7c46d5b (O.1
-#             ?T tracer), 598cece (HANDOFF after match sub-bundle),
-#             2d85e65 (M.3 range + or-patterns), 7d9c04d (M.2 bool +
-#             stmt-position), 183e5b8 (M.1 match tracer), d8a217e
-#             (HANDOFF after C.1/C.2 + cleanup #1), bd3cf5d (C.2
-#             sentinel ptr), 1e8752c (C.1 c-string tracer), e394571
-#             (cleanup #1 default -> u0) at the bottom of head -10.
+# expect tip: HANDOFF refresh after O.2/O.3 (this commit), 5282bc8
+#             (O.3 !T error union), c555777 (O.2 ?T match patterns),
+#             8a270dc (HANDOFF after O.1), 7c46d5b (O.1 ?T tracer),
+#             598cece (HANDOFF after match sub-bundle), 2d85e65 (M.3
+#             range + or-patterns), 7d9c04d (M.2 bool + stmt-position),
+#             183e5b8 (M.1 match tracer), d8a217e (HANDOFF after
+#             C.1/C.2 + cleanup #1) at the bottom of head -10.
 
 git status
 # expect: clean working tree (no .DS_Store, no .probe leftovers)
@@ -1111,10 +1210,10 @@ export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
 
 . "$HOME/.cargo/env"
 cargo test --manifest-path compiler/arsenal-boot/Cargo.toml --workspace 2>&1 | grep "test result" | awk '{p+=$4;f+=$6}END{print p,f}'
-# expect: "185 0"
+# expect: "196 0"
 
 ls tests/snake_eater/pass/phase1/*.gw | wc -l
-# expect: 239
+# expect: 241
 
 ls compiler/arsenal-boot/crates/ | wc -l
 # expect: 17
@@ -1220,14 +1319,20 @@ typeck added `synth_match` + `check_match_pattern` with the
 exhaustiveness rule; MIR added `lower_match` + the recursive
 `lower_pattern_test` helper. Both backends still gain zero
 new arms across the entire match sub-bundle (the chain-of-Branch
-shape was already validated by 12b). The O.1 `?T` tracer extended
-the same arrows yet again: parser added `??` (16, 15) right-assoc;
-typeck added `Ty::Optional(OptInner)` with closed inner enum, plus
-the `T → ?T` coercion rule and `nil`-narrowing; MIR added
-`let_ty_from_ast`, `wrap_to_optional_if_needed`, `lower_nil_literal`,
-and `lower_coalesce` (3-block tag-test CFG); both backends added
-`Ty::Optional` arms to `is_aggregate_ty` / `aggregate_layout` /
-`aggregate_field_ty` (via the shared `optional_layout` formula
-so the by-pointer ABI agrees byte-for-byte). The 239-program
-corpus is the direct test surface for every one of those arrows,
-exercised through both backends in CI.
+shape was already validated by 12b). The O.1 + O.2 + O.3 sub-bundle extended the same arrows yet
+again: parser added `??` (16, 15) right-assoc and postfix `!`
++ `!T` type syntax; typeck added `Ty::Optional(OptInner)` and
+`Ty::ErrorUnion(OptInner)` with closed inner enum, plus
+`T → ?T` / `T → !T` coercion edges, `nil`-narrowing, and
+`?T` / `!T` literal-pattern dispatch; MIR added
+`let_ty_from_ast`, the canonical `wrap_to_optional_if_needed`
+helper firing at three sites (`lower_let`, `lower_return`,
+`lower_call`), `lower_nil_literal`, `lower_coalesce`,
+`lower_must`, and the Optional-scrutinee branch in
+`lower_pattern_test`; both backends added `Ty::Optional(_)` /
+`Ty::ErrorUnion(_)` arms to `is_aggregate_ty` /
+`aggregate_layout` / `aggregate_field_ty` (via the shared
+`optional_layout` formula), and LLVM's `make_fn_type`
+aggregate-return arm now routes through `is_aggregate_ty`. The
+241-program corpus is the direct test surface for every one of
+those arrows, exercised through both backends in CI.
