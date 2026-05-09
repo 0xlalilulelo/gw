@@ -918,12 +918,69 @@ fn parse_match_arm(p: &mut Parser<'_, '_, '_>) {
 /// (used by `let` and `for in`) by accepting `LiteralPat` shapes —
 /// bare integer literals and `Unary(Minus, IntLit)`. Letting `let 5
 /// = …` parse would silently widen the let surface, so the two
-/// parsers are kept separate.
+/// parsers are kept separate. Also handles top-level or-patterns
+/// (`a | b | c`) and inclusive range patterns (`lo..=hi`); both land
+/// in M.3.
 fn parse_match_pattern(p: &mut Parser<'_, '_, '_>) {
+    let cp = p.builder.checkpoint();
+    let start = p.cur_byte_start();
+    parse_match_pattern_atom(p);
+    if p.at(TokenKind::Pipe) {
+        // Wrap the first atom plus all subsequent `| atom` into a
+        // single `OrPat`. The checkpoint captures the position
+        // before the first atom so its node becomes the OrPat's
+        // first child.
+        p.builder.start_node_at(cp, SyntaxKind::OrPat, start);
+        while p.eat(TokenKind::Pipe) {
+            parse_match_pattern_atom(p);
+        }
+        let end = p.cur_byte_start();
+        p.builder.finish_node(end);
+    }
+}
+
+/// Parse a literal-only expression for a pattern slot: `IntLit`,
+/// `-IntLit`, `true`, `false`. Avoids `parse_expr`'s Pratt operators
+/// so `|` (bitwise OR, bp 9) and `..=` (range op) stay available for
+/// the pattern grammar to consume.
+fn parse_pattern_literal_value(p: &mut Parser<'_, '_, '_>) {
+    let start = p.cur_byte_start();
+    if p.at(TokenKind::Minus) {
+        p.builder.start_node(SyntaxKind::UnaryExpr, start);
+        p.bump_any(); // -
+        if p.at(TokenKind::IntLit) {
+            let lit_start = p.cur_byte_start();
+            p.builder.start_node(SyntaxKind::LiteralExpr, lit_start);
+            p.bump_any();
+            let lit_end = p.cur_byte_start();
+            p.builder.finish_node(lit_end);
+        } else {
+            p.unexpected("integer literal after `-` in pattern");
+        }
+        let end = p.cur_byte_start();
+        p.builder.finish_node(end);
+    } else if matches!(
+        p.current(),
+        TokenKind::IntLit | TokenKind::KwTrue | TokenKind::KwFalse
+    ) {
+        p.builder.start_node(SyntaxKind::LiteralExpr, start);
+        p.bump_any();
+        let end = p.cur_byte_start();
+        p.builder.finish_node(end);
+    } else {
+        p.unexpected("integer literal, `true`, `false`, or `-IntLit` in pattern");
+    }
+}
+
+/// One pattern alternative: a single non-or-shaped pattern. Wildcards,
+/// identifier patterns, literal patterns, and range patterns all land
+/// here. Range detection happens after the initial literal expression
+/// is parsed — if `..=` follows, we retroactively wrap the literal
+/// into a `RangePat` and parse the upper bound.
+fn parse_match_pattern_atom(p: &mut Parser<'_, '_, '_>) {
     let start = p.cur_byte_start();
     match p.current() {
         TokenKind::Ident => {
-            // Same `_` vs identifier classification as parse_pattern.
             let span = p.current_span();
             let is_underscore = p.span_bytes(span) == b"_";
             let kind = if is_underscore {
@@ -937,23 +994,34 @@ fn parse_match_pattern(p: &mut Parser<'_, '_, '_>) {
             p.builder.finish_node(end);
         }
         TokenKind::IntLit | TokenKind::Minus | TokenKind::KwTrue | TokenKind::KwFalse => {
-            // `LiteralPat` wraps the literal expression. `parse_expr`
-            // is overpowered for the supported shapes (typeck only
-            // accepts `IntLit` / `-IntLit` / `true` / `false`), but
-            // richer shapes diagnose with UNSUPPORTED_CONSTRUCT and
-            // reusing the expression parser keeps the precedence
-            // story uniform if M.3 widens patterns later.
-            p.builder.start_node(SyntaxKind::LiteralPat, start);
-            parse_expr(p);
-            let end = p.cur_byte_start();
-            p.builder.finish_node(end);
+            // Parse the literal value as a *literal-only* expression
+            // — `parse_expr` here would consume `|` as bitwise OR
+            // (binding power 9), stealing the alternation token from
+            // `parse_match_pattern`. Same reason the pattern parser
+            // doesn't see `..=` ranges as range *expressions*.
+            // After the literal, if `..=` follows, the whole atom is
+            // a `RangePat` (the literal is its lower bound); else
+            // wrap as `LiteralPat`.
+            let cp = p.builder.checkpoint();
+            parse_pattern_literal_value(p);
+            if p.at(TokenKind::DotDotEq) {
+                p.builder.start_node_at(cp, SyntaxKind::RangePat, start);
+                p.bump_any(); // consume `..=`
+                parse_pattern_literal_value(p);
+                let end = p.cur_byte_start();
+                p.builder.finish_node(end);
+            } else {
+                p.builder.start_node_at(cp, SyntaxKind::LiteralPat, start);
+                let end = p.cur_byte_start();
+                p.builder.finish_node(end);
+            }
         }
         _ => {
             let span = p.current_span();
             p.error(
                 ec::EXPECTED_PATTERN,
                 span,
-                "expected a pattern (`_`, identifier, integer literal, or `true`/`false`)",
+                "expected a pattern (`_`, identifier, integer literal, `true`/`false`, or `lo..=hi`)",
             );
             p.builder.start_node(SyntaxKind::ErrorNode, start);
             let end = p.cur_byte_start();

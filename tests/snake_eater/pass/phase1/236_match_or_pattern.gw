@@ -1,0 +1,14 @@
+fn classify(x: i32) -> i32 {
+    return match x {
+        1 | 2 | 3 => 10,
+        4 | 5 => 20,
+        _ => 99,
+    };
+}
+
+fn main() -> i32 {
+    let a: i32 = classify(2);
+    let b: i32 = classify(5);
+    let c: i32 = classify(7);
+    return a + b + c;
+}

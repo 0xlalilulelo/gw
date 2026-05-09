@@ -257,6 +257,8 @@ pub enum SyntaxKind {
 
     // Pattern hooks (Phase 2+)
     LiteralPat,
+    /// `lo..=hi` range pattern (Phase 2 increment M.3).
+    RangePat,
     StructPat,
     TuplePat,
     OrPat,

@@ -1745,6 +1745,35 @@ fn check_match_pattern<'a>(pat: Pattern<'a>, scrut_ty: Ty, cx: &mut Cx<'a, '_, '
                 ));
             }
         }
+        Pattern::Range(rp) => {
+            // Phase 2 M.3: only integer scrutinees take ranges. Both
+            // bounds re-use the bidirectional-narrowing path.
+            if matches!(scrut_ty, Ty::Int(_)) {
+                if let Some(lo) = rp.lo() {
+                    check_expr(lo, scrut_ty, cx);
+                }
+                if let Some(hi) = rp.hi() {
+                    check_expr(hi, scrut_ty, cx);
+                }
+            } else if scrut_ty != Ty::Error {
+                cx.diags.push(Diagnostic::error(
+                    ec::TYPE_MISMATCH,
+                    Label::new(rp.syntax().span, ""),
+                    format!(
+                        "range pattern can't match scrutinee of type `{scrut_ty}` (Phase 2 only types ranges over integers)"
+                    ),
+                ));
+            }
+        }
+        Pattern::Or(op) => {
+            // Each alternative recurses through this same routine.
+            // M.3 keeps top-level or-patterns only; a sub-pattern
+            // alternation (e.g. `Some(x | y)`) doesn't reach here
+            // because there's no parser path to it.
+            for alt in op.alternatives() {
+                check_match_pattern(alt, scrut_ty, cx);
+            }
+        }
         Pattern::Stub(n) | Pattern::Error(n) => {
             cx.diags.push(Diagnostic::error(
                 ec::UNSUPPORTED_CONSTRUCT,
@@ -2239,6 +2268,47 @@ mod tests {
                        match n { 0 => putchar(65), _ => putchar(63) };\n\
                    }\n\
                    fn main() -> i32 { shout(0); return 0; }";
+        assert_eq!(check(src), 0);
+    }
+
+    // ─── Phase 2 increment M.3: range + or-patterns ───────────────────────
+
+    #[test]
+    fn match_or_pattern_typechecks() {
+        let src = "fn classify(x: i32) -> i32 {\n\
+                       return match x { 1 | 2 | 3 => 10, _ => 0 };\n\
+                   }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn match_inclusive_range_pattern_typechecks() {
+        let src = "fn bucket(x: i32) -> i32 {\n\
+                       return match x { 0..=9 => 1, _ => 0 };\n\
+                   }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn match_range_pattern_rejects_non_int_scrutinee() {
+        // Range patterns over a bool scrutinee should diagnose.
+        let src = "fn f(b: bool) -> i32 { return match b { 0..=9 => 1, _ => 0 }; }";
+        assert!(check(src) >= 1);
+    }
+
+    #[test]
+    fn match_or_pattern_alternative_types_must_match_scrutinee() {
+        // One of the alternatives is type-mismatched against the
+        // scrutinee.
+        let src = "fn f(b: bool) -> i32 { return match b { true | 5 => 1, false => 0 }; }";
+        assert!(check(src) >= 1);
+    }
+
+    #[test]
+    fn match_range_pattern_bounds_narrow_to_scrutinee_width() {
+        // i64 scrutinee + i32-shaped literal bounds: the bidirectional
+        // narrowing path widens both bounds to i64.
+        let src = "fn f(x: i64) -> i32 { return match x { 100..=200 => 1, _ => 0 }; }";
         assert_eq!(check(src), 0);
     }
 

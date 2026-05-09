@@ -1621,64 +1621,31 @@ fn lower_match<'a>(
     };
 
     for arm in &arms {
-        let pat = arm.pattern();
         let body = arm.body();
         let body_bb = b.alloc_block();
+        let next_bb = b.alloc_block();
 
-        let is_wildcard = matches!(pat, Some(Pattern::Wildcard(_)));
-        if is_wildcard {
-            b.set_terminator(b.cur, Terminator::Goto(body_bb));
-        } else if let Some(Pattern::Literal(lp)) = pat {
-            let pat_val_op = match lp.value() {
-                Some(e) => lower_expr(b, e, lcx),
-                None => Operand::Const(Const::Error),
-            };
-            let cmp_local = b.alloc_local(LocalDecl {
-                ty: Ty::Bool,
-                span: m.syntax().span,
-            });
-            b.push_stmt(MirStmt::Assign {
-                dst: cmp_local,
-                value: Rvalue::BinOp {
-                    op: BinOp::Eq,
-                    ty: scrut_ty,
-                    lhs: scrut_op.clone(),
-                    rhs: pat_val_op,
-                },
-            });
-            let next_bb = b.alloc_block();
-            b.set_terminator(
-                b.cur,
-                Terminator::Branch {
-                    cond: Operand::Local(cmp_local),
-                    then_bb: body_bb,
-                    else_bb: next_bb,
-                },
+        if let Some(pat) = arm.pattern() {
+            lower_pattern_test(
+                b,
+                pat,
+                &scrut_op,
+                scrut_ty,
+                m.syntax().span,
+                body_bb,
+                next_bb,
+                lcx,
             );
-            // Lower the body in body_bb, then continue test chain in next_bb.
-            b.cur = body_bb;
-            let body_val = match body {
-                Some(e) => lower_expr(b, e, lcx),
-                None => Operand::Const(Const::Unit),
-            };
-            if let Some(local) = result_local {
-                b.push_stmt(MirStmt::Assign {
-                    dst: local,
-                    value: Rvalue::Use(body_val),
-                });
-            }
-            b.set_terminator(b.cur, Terminator::Goto(join_bb));
-            b.cur = next_bb;
-            continue;
         } else {
-            // Pattern shape rejected by typeck (Ident / Stub / Error /
-            // missing). Skip arm by going to the body anyway so we
-            // don't strand the test chain; codegen will see the dead
-            // path emerge in `Operand::Const(Const::Error)` form.
-            b.set_terminator(b.cur, Terminator::Goto(body_bb));
+            // No pattern AST node — typeck already errored. Skip arm
+            // so we don't strand the test chain.
+            b.set_terminator(b.cur, Terminator::Goto(next_bb));
         }
 
-        // Wildcard or rejected-shape body lowering.
+        // Lower the body in body_bb; b.cur was advanced to next_bb
+        // by lower_pattern_test. Switch to body_bb temporarily, then
+        // restore cursor to next_bb for the next arm's test.
+        let after_test = b.cur;
         b.cur = body_bb;
         let body_val = match body {
             Some(e) => lower_expr(b, e, lcx),
@@ -1691,17 +1658,7 @@ fn lower_match<'a>(
             });
         }
         b.set_terminator(b.cur, Terminator::Goto(join_bb));
-        // After a wildcard arm, any later arm is unreachable. We
-        // still need to terminate the current block before moving on
-        // to subsequent arms (typeck normally enforces wildcard-last,
-        // but parser recovery can leave dangling arms).
-        if is_wildcard {
-            // Switch to a fresh "unreachable" block so subsequent arm
-            // emit doesn't trip the "set_terminator on already-set
-            // block" guard.
-            let dead_bb = b.alloc_block();
-            b.cur = dead_bb;
-        }
+        b.cur = after_test;
     }
 
     // After processing all arms, b.cur is either the trailing
@@ -1715,6 +1672,135 @@ fn lower_match<'a>(
     match result_local {
         Some(l) => Operand::Local(l),
         None => Operand::Const(Const::Unit),
+    }
+}
+
+/// Phase 2 increments M.1 / M.3: lower one match-arm pattern test.
+/// Emits whatever comparison/branch sequence is needed; the cursor
+/// ends at `next_bb` (the no-match continuation), and a successful
+/// match jumps to `body_bb`. Recursive for `Pattern::Or`.
+#[allow(clippy::too_many_arguments)]
+fn lower_pattern_test<'a>(
+    b: &mut Builder,
+    pat: Pattern<'a>,
+    scrut_op: &Operand,
+    scrut_ty: Ty,
+    span: Span,
+    body_bb: BlockId,
+    next_bb: BlockId,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
+) {
+    match pat {
+        Pattern::Wildcard(_) => {
+            b.set_terminator(b.cur, Terminator::Goto(body_bb));
+            b.cur = next_bb;
+        }
+        Pattern::Literal(lp) => {
+            let pat_val_op = match lp.value() {
+                Some(e) => lower_expr(b, e, lcx),
+                None => Operand::Const(Const::Error),
+            };
+            let cmp_local = b.alloc_local(LocalDecl { ty: Ty::Bool, span });
+            b.push_stmt(MirStmt::Assign {
+                dst: cmp_local,
+                value: Rvalue::BinOp {
+                    op: BinOp::Eq,
+                    ty: scrut_ty,
+                    lhs: scrut_op.clone(),
+                    rhs: pat_val_op,
+                },
+            });
+            b.set_terminator(
+                b.cur,
+                Terminator::Branch {
+                    cond: Operand::Local(cmp_local),
+                    then_bb: body_bb,
+                    else_bb: next_bb,
+                },
+            );
+            b.cur = next_bb;
+        }
+        Pattern::Range(rp) => {
+            // Inclusive range `lo..=hi` lowers as two short-circuit
+            // tests: `scrut >= lo` then `scrut <= hi`. Both must
+            // succeed to reach body_bb; either failure short-circuits
+            // to next_bb. Mirrors the && shape used by 12b but with
+            // distinct comparisons rather than a generic boolean
+            // predicate.
+            let hi_test_bb = b.alloc_block();
+            let lo_op = match rp.lo() {
+                Some(e) => lower_expr(b, e, lcx),
+                None => Operand::Const(Const::Error),
+            };
+            let cmp_lo_local = b.alloc_local(LocalDecl { ty: Ty::Bool, span });
+            b.push_stmt(MirStmt::Assign {
+                dst: cmp_lo_local,
+                value: Rvalue::BinOp {
+                    op: BinOp::Ge,
+                    ty: scrut_ty,
+                    lhs: scrut_op.clone(),
+                    rhs: lo_op,
+                },
+            });
+            b.set_terminator(
+                b.cur,
+                Terminator::Branch {
+                    cond: Operand::Local(cmp_lo_local),
+                    then_bb: hi_test_bb,
+                    else_bb: next_bb,
+                },
+            );
+            b.cur = hi_test_bb;
+            let hi_op = match rp.hi() {
+                Some(e) => lower_expr(b, e, lcx),
+                None => Operand::Const(Const::Error),
+            };
+            let cmp_hi_local = b.alloc_local(LocalDecl { ty: Ty::Bool, span });
+            b.push_stmt(MirStmt::Assign {
+                dst: cmp_hi_local,
+                value: Rvalue::BinOp {
+                    op: BinOp::Le,
+                    ty: scrut_ty,
+                    lhs: scrut_op.clone(),
+                    rhs: hi_op,
+                },
+            });
+            b.set_terminator(
+                b.cur,
+                Terminator::Branch {
+                    cond: Operand::Local(cmp_hi_local),
+                    then_bb: body_bb,
+                    else_bb: next_bb,
+                },
+            );
+            b.cur = next_bb;
+        }
+        Pattern::Or(op) => {
+            // Each alternative ai gets its own test, branching to
+            // body_bb on match. Misses chain through fresh blocks
+            // until the last alternative, whose miss flows to
+            // `next_bb`. After the loop b.cur == next_bb (set by the
+            // last recursive `lower_pattern_test` call).
+            let alts: Vec<_> = op.alternatives().collect();
+            for (i, alt) in alts.iter().enumerate() {
+                let is_last = i + 1 == alts.len();
+                let alt_next = if is_last { next_bb } else { b.alloc_block() };
+                lower_pattern_test(b, *alt, scrut_op, scrut_ty, span, body_bb, alt_next, lcx);
+            }
+            // If the alts vec is empty (parser shouldn't produce that
+            // shape), terminate the current block to keep the CFG
+            // well-formed.
+            if alts.is_empty() {
+                b.set_terminator(b.cur, Terminator::Goto(next_bb));
+                b.cur = next_bb;
+            }
+        }
+        Pattern::Ident(_) | Pattern::Stub(_) | Pattern::Error(_) => {
+            // Already diagnosed by typeck; treat as no-match so the
+            // arm doesn't silently catch every value.
+            b.set_terminator(b.cur, Terminator::Goto(next_bb));
+            b.cur = next_bb;
+        }
     }
 }
 

@@ -1397,9 +1397,13 @@ pub enum Pattern<'a> {
     Ident(IdentPat<'a>),
     /// Wildcard: `_`.
     Wildcard(WildcardPat<'a>),
-    /// Literal value pattern: `0`, `-1`, `'a'` (Phase 2 increment M.1
-    /// only realises int literals — bare or `Unary(Minus, IntLit)`).
+    /// Literal value pattern: `0`, `-1`, `true`, `false` (Phase 2 M.1 / M.2).
     Literal(LiteralPat<'a>),
+    /// Inclusive range pattern: `lo..=hi` (Phase 2 increment M.3).
+    Range(RangePat<'a>),
+    /// Or-pattern: `a | b | c` (Phase 2 increment M.3). Top-level only
+    /// in M.3 — sub-pattern alternation is a later widening.
+    Or(OrPat<'a>),
     /// Recognised but not yet typed (struct patterns, tuple patterns, …).
     Stub(&'a SyntaxNode<'a>),
     /// Parser-recovery node.
@@ -1414,7 +1418,9 @@ impl<'a> Pattern<'a> {
             IdentPat => Self::Ident(self::IdentPat(n)),
             WildcardPat => Self::Wildcard(self::WildcardPat(n)),
             LiteralPat => Self::Literal(self::LiteralPat(n)),
-            StructPat | TuplePat | OrPat | BindPat => Self::Stub(n),
+            RangePat => Self::Range(self::RangePat(n)),
+            OrPat => Self::Or(self::OrPat(n)),
+            StructPat | TuplePat | BindPat => Self::Stub(n),
             ErrorNode => Self::Error(n),
             _ => return None,
         })
@@ -1476,6 +1482,58 @@ impl<'a> LiteralPat<'a> {
     /// anything else diagnoses with UNSUPPORTED_CONSTRUCT.
     pub fn value(self) -> Option<Expr<'a>> {
         self.0.child_nodes().find_map(Expr::cast)
+    }
+}
+
+/// Inclusive range pattern: `lo..=hi` (Phase 2 increment M.3). Both
+/// bounds are typed against the scrutinee's integer type via the same
+/// bidirectional narrowing path used by literal patterns. Phase 2
+/// only realises `..=`; half-open `..` rides a later widening.
+#[derive(Copy, Clone)]
+pub struct RangePat<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for RangePat<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::RangePat).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> RangePat<'a> {
+    /// Lower bound — first `Expr` child.
+    pub fn lo(self) -> Option<Expr<'a>> {
+        self.0.child_nodes().find_map(Expr::cast)
+    }
+
+    /// Upper bound — second `Expr` child.
+    pub fn hi(self) -> Option<Expr<'a>> {
+        let mut iter = self.0.child_nodes().filter_map(Expr::cast);
+        iter.next();
+        iter.next()
+    }
+}
+
+/// Or-pattern: `a | b | c` (Phase 2 increment M.3). Holds two or more
+/// `Pattern` alternatives. Top-level only in M.3 — sub-pattern
+/// alternation (e.g. `Some(x | y)`) is a later widening.
+#[derive(Copy, Clone)]
+pub struct OrPat<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for OrPat<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::OrPat).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> OrPat<'a> {
+    /// Pattern alternatives in source order.
+    pub fn alternatives(self) -> impl Iterator<Item = Pattern<'a>> + 'a {
+        self.0.child_nodes().filter_map(Pattern::cast)
     }
 }
 

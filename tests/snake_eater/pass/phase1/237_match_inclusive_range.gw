@@ -1,0 +1,16 @@
+fn bucket(x: i32) -> i32 {
+    return match x {
+        0..=9 => 1,
+        10..=99 => 2,
+        100..=999 => 3,
+        _ => 0,
+    };
+}
+
+fn main() -> i32 {
+    let a: i32 = bucket(7);
+    let b: i32 = bucket(42);
+    let c: i32 = bucket(500);
+    let d: i32 = bucket(9999);
+    return a + b + c + d;
+}
