@@ -192,6 +192,16 @@ impl DiagBag {
     pub fn into_vec(self) -> Vec<Diagnostic> {
         self.diags
     }
+
+    /// Drain all diagnostics from `other` into `self`, preserving
+    /// insertion order and accumulating the error count. Used by the
+    /// driver in Phase 2 increment F.1 to fold per-file parse
+    /// diagnostics into the build's primary bag.
+    pub fn merge(&mut self, mut other: DiagBag) {
+        for d in other.diags.drain(..) {
+            self.push(d);
+        }
+    }
 }
 
 /// Render a diagnostic as a single line for snapshot tests and minimal CLI

@@ -24,6 +24,10 @@ pub mod ec {
     /// Top-level statements appear alongside an explicit `fn main`.
     /// Both would lower to the same `main` symbol.
     pub const TOP_LEVEL_STMTS_WITH_EXPLICIT_MAIN: ErrorCode = ErrorCode(202);
+    /// Top-level statements appeared in a sibling `.gw` file (Phase 2
+    /// increment F.1). Only the build-target file may carry top-level
+    /// statements that synthesise the implicit `main`.
+    pub const TOP_LEVEL_STMTS_IN_LIBRARY: ErrorCode = ErrorCode(203);
 }
 
 /// Stable identifier for a top-level definition within a module.
@@ -90,8 +94,24 @@ pub fn resolve_module<'a>(
     sm: &SourceMap,
     diags: &mut DiagBag,
 ) -> ResolvedModule<'a> {
+    resolve_modules(module_node, &[], sm, diags)
+}
+
+/// Resolve a parsed primary [`Module`] together with zero or more
+/// secondary modules (Phase 2 increment F.1). All items from every
+/// module land in a single flat namespace; duplicate names diagnose
+/// regardless of which file the second definition came from. Only
+/// the primary module may carry top-level statements (the synthetic
+/// `main`); top-level statements in secondary modules diagnose with
+/// `TOP_LEVEL_STMTS_IN_LIBRARY`.
+pub fn resolve_modules<'a>(
+    primary_node: &'a SyntaxNode<'a>,
+    extra_nodes: &[&'a SyntaxNode<'a>],
+    sm: &SourceMap,
+    diags: &mut DiagBag,
+) -> ResolvedModule<'a> {
     let module =
-        Module::cast(module_node).expect("resolve_module called on non-Module syntax node");
+        Module::cast(primary_node).expect("resolve_modules called on non-Module syntax node");
     let mut defs: Vec<Def<'a>> = Vec::new();
     let mut by_name: FxHashMap<String, DefId> = FxHashMap::default();
 
@@ -103,6 +123,32 @@ pub fn resolve_module<'a>(
                 // Phase 0 parser already produced diagnostics for items
                 // it couldn't classify; the resolver doesn't add more.
             }
+        }
+    }
+    // Items from each secondary file (sibling .gw files in the same
+    // directory). Same dedup story — `register_fn` / `register_class`
+    // diagnose duplicates against `by_name`.
+    for &extra_node in extra_nodes {
+        let Some(extra_module) = Module::cast(extra_node) else {
+            continue;
+        };
+        for item in extra_module.items() {
+            match item {
+                Item::Fn(f) => register_fn(f, sm, &mut defs, &mut by_name, diags),
+                Item::Class(c) => register_class(c, sm, &mut defs, &mut by_name, diags),
+                _ => {}
+            }
+        }
+        // Top-level statements in a sibling file have no obvious
+        // semantics — we already synthesise one `main` from the primary
+        // module's stmts. Diagnose so the user knows their stmts are
+        // being ignored.
+        if extra_module.stmts().next().is_some() {
+            diags.push(Diagnostic::error(
+                ec::TOP_LEVEL_STMTS_IN_LIBRARY,
+                Label::new(extra_node.span, ""),
+                "top-level statements are only allowed in the build target file; sibling `.gw` files must contain only items",
+            ));
         }
     }
 
@@ -132,7 +178,7 @@ pub fn resolve_module<'a>(
                 kind: DefKind::SyntheticMain,
                 name: "main".to_string(),
                 name_span: Span::synthetic(),
-                syntax: module_node,
+                syntax: primary_node,
             });
         }
     }
@@ -370,5 +416,61 @@ mod tests {
                 ("main".to_string(), DefKind::SyntheticMain),
             ]
         );
+    }
+
+    // ─── Phase 2 increment F.1: cross-file resolve ─────────────────────────
+
+    fn run_multi_resolver(primary: &str, extras: &[&str]) -> (Vec<String>, u32) {
+        let mut sm = SourceMap::new();
+        let bump = Bump::new();
+
+        let primary_file = sm.add_file("primary.gw", primary);
+        let primary_bytes = sm.get(primary_file).unwrap().contents.as_bytes();
+        let primary_arena = FileArena::new(&bump, primary_file);
+        let (primary_root, mut diags) = parse(primary_file, primary_bytes, &primary_arena);
+
+        let mut extra_roots = Vec::with_capacity(extras.len());
+        for (i, src) in extras.iter().enumerate() {
+            let f = sm.add_file(format!("extra{i}.gw"), *src);
+            let bytes = sm.get(f).unwrap().contents.as_bytes();
+            let arena = FileArena::new(&bump, f);
+            let (root, sib_diags) = parse(f, bytes, &arena);
+            diags.merge(sib_diags);
+            extra_roots.push(root);
+        }
+
+        let resolved = resolve_modules(primary_root, &extra_roots, &sm, &mut diags);
+        let names: Vec<_> = resolved.defs.iter().map(|d| d.name.clone()).collect();
+        (names, diags.error_count())
+    }
+
+    #[test]
+    fn multi_file_register_fns_from_each_module() {
+        // `add` lives in the extra module; `main` in the primary.
+        let (names, errs) = run_multi_resolver(
+            "fn main() -> i32 { return add(2, 3); }",
+            &["fn add(a: i32, b: i32) -> i32 { return a + b; }"],
+        );
+        assert_eq!(errs, 0);
+        // Primary's `main` registers first, then the extra's `add`.
+        assert_eq!(names, vec!["main", "add"]);
+    }
+
+    #[test]
+    fn multi_file_duplicate_across_files_diagnoses() {
+        let (_, errs) = run_multi_resolver(
+            "fn add() -> i32 { return 1; } fn main() -> i32 { return add(); }",
+            &["fn add() -> i32 { return 2; }"],
+        );
+        assert!(errs >= 1);
+    }
+
+    #[test]
+    fn multi_file_top_level_stmts_in_extra_diagnose() {
+        // Sibling files must contain only items; top-level stmts in
+        // a sibling diagnose with TOP_LEVEL_STMTS_IN_LIBRARY.
+        let (_, errs) =
+            run_multi_resolver("fn main() -> i32 { return 0; }", &["let global: i32 = 7;"]);
+        assert!(errs >= 1);
     }
 }

@@ -2,14 +2,16 @@
 //! to MIR, codegen via Cranelift, and link with the system C compiler
 //! to produce an executable next to the source file.
 //!
-//! Phase 1 increment 1: single-file builds only. Cross-file projects
-//! land once we have a frequency-graph builder.
+//! Phase 2 increment F.1: multi-file builds. The build target's
+//! sibling `.gw` files in the same directory are auto-discovered and
+//! folded into one resolved module / typed module / MIR program.
+//! Manifest-driven (`MotherBase.gw`) builds remain a separate path.
 
 use arsenal_ast::FileArena;
 use arsenal_lex::{render_simple, SourceMap};
 use arsenal_mir::lower;
 use arsenal_parse::parse;
-use arsenal_resolve::resolve_module;
+use arsenal_resolve::resolve_modules;
 use arsenal_typeck::type_check;
 use bumpalo::Bump;
 use std::ffi::OsString;
@@ -87,17 +89,69 @@ pub fn run(args: &[OsString]) -> ExitCode {
 }
 
 fn build_one(src_path: &Path, backend: Backend) -> Result<PathBuf, String> {
-    let contents = fs::read_to_string(src_path)
-        .map_err(|e| format!("failed to read `{}`: {e}", src_path.display()))?;
-    let mut sm = SourceMap::new();
-    let display_name = src_path.display().to_string();
-    let file = sm.add_file(display_name.clone(), contents);
-    let bytes = sm.get(file).expect("just inserted").contents.as_bytes();
+    // Phase 2 increment F.1: auto-discover sibling `.gw` files in the
+    // same directory and fold them into the build alongside the
+    // primary file. Sort by filename so the def order is reproducible
+    // regardless of `read_dir`'s OS-dependent traversal order.
+    let dir = src_path.parent().unwrap_or_else(|| Path::new("."));
+    let canon_target = src_path
+        .canonicalize()
+        .unwrap_or_else(|_| src_path.to_path_buf());
+    let mut sibling_paths: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            if p.extension().and_then(|e| e.to_str()) != Some("gw") {
+                continue;
+            }
+            let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+            if canon == canon_target {
+                continue;
+            }
+            sibling_paths.push(p);
+        }
+    }
+    sibling_paths.sort();
 
+    let mut sm = SourceMap::new();
     let bump = Bump::new();
-    let arena = FileArena::new(&bump, file);
-    let (root, mut diags) = parse(file, bytes, &arena);
-    let resolved = resolve_module(root, &sm, &mut diags);
+
+    let primary_contents = fs::read_to_string(src_path)
+        .map_err(|e| format!("failed to read `{}`: {e}", src_path.display()))?;
+    let primary_display = src_path.display().to_string();
+    let primary_file = sm.add_file(primary_display.clone(), primary_contents);
+
+    // Read + add each sibling to the source map up-front so the
+    // contents byte-slice references stay valid for the whole build.
+    let mut sibling_files = Vec::with_capacity(sibling_paths.len());
+    for p in &sibling_paths {
+        let contents =
+            fs::read_to_string(p).map_err(|e| format!("failed to read `{}`: {e}", p.display()))?;
+        let file = sm.add_file(p.display().to_string(), contents);
+        sibling_files.push(file);
+    }
+
+    let primary_arena = FileArena::new(&bump, primary_file);
+    let primary_bytes = sm
+        .get(primary_file)
+        .expect("just inserted")
+        .contents
+        .as_bytes();
+    let (primary_root, mut diags) = parse(primary_file, primary_bytes, &primary_arena);
+
+    let mut sibling_roots = Vec::with_capacity(sibling_files.len());
+    for &fid in &sibling_files {
+        let arena = FileArena::new(&bump, fid);
+        let bytes = sm.get(fid).expect("just inserted").contents.as_bytes();
+        let (root, sib_diags) = parse(fid, bytes, &arena);
+        diags.merge(sib_diags);
+        sibling_roots.push(root);
+    }
+
+    let resolved = resolve_modules(primary_root, &sibling_roots, &sm, &mut diags);
     let typed = type_check(&resolved, &sm, &mut diags);
 
     if diags.has_errors() {
@@ -106,7 +160,7 @@ fn build_one(src_path: &Path, backend: Backend) -> Result<PathBuf, String> {
         }
         return Err(format!(
             "{n} error(s) in `{}`",
-            display_name,
+            primary_display,
             n = diags.error_count()
         ));
     }
