@@ -405,6 +405,17 @@ fn parse_type(p: &mut Parser<'_, '_, '_>) {
             let end = p.cur_byte_start();
             p.builder.finish_node(end);
         }
+        TokenKind::Bang => {
+            // `!T` — error union (Phase 2 increment O.3). Phase-2
+            // minimum realises an anonymous-error union over
+            // primitive `T`; richer payload types and named errors
+            // ride later sub-bundles.
+            p.builder.start_node(SyntaxKind::ErrorUnionType, start);
+            p.bump_any(); // !
+            parse_type(p);
+            let end = p.cur_byte_start();
+            p.builder.finish_node(end);
+        }
         TokenKind::LBracket => {
             // `[]T` (slice), `[*:S]T` (sentinel many-pointer, Phase 2
             // C.2), or `[N]T` (array). Decide by peeking past the
@@ -658,6 +669,19 @@ fn parse_expr_bp(p: &mut Parser<'_, '_, '_>, min_bp: u8) {
                 .start_node_at(cp, SyntaxKind::FieldExpr, lhs_start);
             p.bump_any(); // .
             p.expect(TokenKind::Ident);
+            let end = p.cur_byte_start();
+            p.builder.finish_node(end);
+            continue;
+        }
+
+        // Postfix: `expr!` "must-be-ok" assert (Phase 2 increment
+        // O.3). Distinct from prefix `!bool` (logical not, handled
+        // in `parse_atom`). The lexer collapses `!=` into a single
+        // `BangEq` token, so a bare `Bang` here unambiguously means
+        // postfix-assert.
+        if p.at(TokenKind::Bang) {
+            p.builder.start_node_at(cp, SyntaxKind::MustExpr, lhs_start);
+            p.bump_any(); // !
             let end = p.cur_byte_start();
             p.builder.finish_node(end);
             continue;

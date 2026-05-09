@@ -253,7 +253,10 @@ struct LoweringCx<'ctx, 'a> {
 /// Mirrors `arsenal_codegen_fast::is_aggregate_ty` — same rule on both
 /// backends so the MIR-level ABI invariants stay aligned.
 fn is_aggregate_ty(ty: Ty) -> bool {
-    matches!(ty, Ty::Class(_) | Ty::Slice(_) | Ty::Optional(_))
+    matches!(
+        ty,
+        Ty::Class(_) | Ty::Slice(_) | Ty::Optional(_) | Ty::ErrorUnion(_)
+    )
 }
 
 /// Computed layout for a class or slice: total byte size, max-field
@@ -328,7 +331,9 @@ fn aggregate_layout(ty: Ty, prog: &MirProgram, ptr_bytes: u32) -> Option<Resolve
             align: ptr_bytes,
             offsets: vec![0, ptr_bytes],
         }),
-        Ty::Optional(inner) => Some(optional_layout(inner.to_ty(), ptr_bytes)),
+        Ty::Optional(inner) | Ty::ErrorUnion(inner) => {
+            Some(optional_layout(inner.to_ty(), ptr_bytes))
+        }
         _ => None,
     }
 }
@@ -367,7 +372,7 @@ fn aggregate_field_ty(ty: Ty, field_idx: u32, prog: &MirProgram) -> Ty {
             .map(|f| f.ty)
             .unwrap_or(Ty::Error),
         Ty::Slice(_) => Ty::Int(IntTy::USize),
-        Ty::Optional(inner) => match field_idx {
+        Ty::Optional(inner) | Ty::ErrorUnion(inner) => match field_idx {
             0 => Ty::Int(IntTy::U8),
             1 => inner.to_ty(),
             _ => Ty::Error,
@@ -1315,10 +1320,13 @@ fn make_fn_type<'ctx>(
         })?;
         params.push(lty.into());
     }
+    // Aggregate returns flow through the hidden out-pointer; the
+    // LLVM-level fn returns void. Goes through `is_aggregate_ty` so
+    // future variants (`?T`, `!T`, sum types) auto-route correctly.
+    if is_aggregate_ty(f.return_ty) {
+        return Ok(context.void_type().fn_type(&params, false));
+    }
     Ok(match f.return_ty {
-        // Aggregate returns flow through the hidden out-pointer; the
-        // LLVM-level fn returns void.
-        Ty::Class(_) | Ty::Slice(_) => context.void_type().fn_type(&params, false),
         Ty::U0 => context.void_type().fn_type(&params, false),
         Ty::Int(int_ty) => llvm_int_type(context, int_ty).fn_type(&params, false),
         Ty::Bool => context.bool_type().fn_type(&params, false),

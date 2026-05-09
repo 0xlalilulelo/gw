@@ -453,6 +453,10 @@ pub enum Expr<'a> {
     /// M.1). Phase-2 minimum surface accepts int-literal patterns and
     /// wildcards; richer pattern shapes ride additional sub-bundles.
     Match(MatchExpr<'a>),
+    /// `expr!` — postfix "must-be-ok" assert (Phase 2 increment O.3).
+    /// Reads the LHS error-union's tag and traps on err; returns the
+    /// payload on ok.
+    Must(MustExpr<'a>),
     /// Recognised expression kind without a typed view yet.
     Stub(&'a SyntaxNode<'a>),
     /// Parser-recovery node.
@@ -481,10 +485,11 @@ impl<'a> Expr<'a> {
             FieldExpr => Self::Field(self::FieldExpr(n)),
             CastExpr => Self::Cast(self::CastExpr(n)),
             MatchExpr => Self::Match(self::MatchExpr(n)),
+            MustExpr => Self::Must(self::MustExpr(n)),
             // Hooks
             LoopExpr | IndexExpr | RefExpr | DerefExpr | RangeExpr | OptionalChainExpr
-            | NilCoalesceExpr | MustExpr | FoxdieExpr | CatchExpr | TryExpr | AwaitExpr
-            | YieldExpr | ChannelSendExpr | ChannelRecvExpr | LockExpr | NakedExpr | RexBlock
+            | NilCoalesceExpr | FoxdieExpr | CatchExpr | TryExpr | AwaitExpr | YieldExpr
+            | ChannelSendExpr | ChannelRecvExpr | LockExpr | NakedExpr | RexBlock
             | ComptimeExpr | IntrinsicCallExpr | AnonAggregateExpr | ArrayLitExpr => Self::Stub(n),
             ErrorNode => Self::Error(n),
             _ => return None,
@@ -511,6 +516,7 @@ impl<'a> Expr<'a> {
             Self::Field(e) => e.syntax(),
             Self::Cast(e) => e.syntax(),
             Self::Match(e) => e.syntax(),
+            Self::Must(e) => e.syntax(),
             Self::Stub(n) | Self::Error(n) => n,
         }
     }
@@ -793,6 +799,30 @@ impl<'a> MatchArm<'a> {
 
     /// Body expression on the right of `=>`.
     pub fn body(self) -> Option<Expr<'a>> {
+        self.0.child_nodes().find_map(Expr::cast)
+    }
+}
+
+/// `expr!` — postfix "must-be-ok" assert (Phase 2 increment O.3).
+/// Reads the LHS error-union's tag byte and traps on err; returns
+/// the payload field on ok. Phase-2 minimum only realises this on
+/// `!T` LHS types; richer LHS shapes (raw `*T` null-derefs, etc.)
+/// stay rejected.
+#[derive(Copy, Clone)]
+pub struct MustExpr<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for MustExpr<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::MustExpr).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> MustExpr<'a> {
+    /// The expression being asserted — the LHS of postfix `!`.
+    pub fn expr(self) -> Option<Expr<'a>> {
         self.0.child_nodes().find_map(Expr::cast)
     }
 }
@@ -1197,6 +1227,11 @@ pub enum Type<'a> {
     /// the AST view exposes both the element and sentinel sub-nodes
     /// so a future widening doesn't have to reshape the view.
     SentinelPtr(SentinelPtrType<'a>),
+    /// `!T` — error union (Phase 2 increment O.3). Phase-2 minimum
+    /// realises an anonymous-error union with a 2-field aggregate
+    /// `{tag: u8, payload: T}` shape parallel to `?T`. Named-error
+    /// types ride a later sub-bundle.
+    ErrorUnion(ErrorUnionType<'a>),
     /// Recognised but not yet typed.
     Stub(&'a SyntaxNode<'a>),
     /// Parser-recovery node.
@@ -1215,10 +1250,9 @@ impl<'a> Type<'a> {
             ArrayType => Self::Array(self::ArrayType(n)),
             PtrType => Self::Ptr(self::PtrType(n)),
             SentinelPtrType => Self::SentinelPtr(self::SentinelPtrType(n)),
+            ErrorUnionType => Self::ErrorUnion(self::ErrorUnionType(n)),
             // Hooks
-            ManyPtrType | ErrorUnionType | TupleType | FnType | DynArrayType | GenericArgs => {
-                Self::Stub(n)
-            }
+            ManyPtrType | TupleType | FnType | DynArrayType | GenericArgs => Self::Stub(n),
             ErrorNode => Self::Error(n),
             _ => return None,
         })
@@ -1360,6 +1394,29 @@ impl<'a> SentinelPtrType<'a> {
     /// accepts a literal `0`; richer sentinel values land later.
     pub fn sentinel(self) -> Option<Expr<'a>> {
         self.0.child_nodes().find_map(Expr::cast)
+    }
+}
+
+/// Error union type: `!T` (Phase 2 increment O.3). Phase-2 minimum
+/// realises an anonymous-error union (no named error type yet); the
+/// inner `T` carries the success payload, while the err side is
+/// represented purely by a tag-byte distinction at runtime.
+#[derive(Copy, Clone)]
+pub struct ErrorUnionType<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for ErrorUnionType<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::ErrorUnionType).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> ErrorUnionType<'a> {
+    /// Success payload type — the `T` in `!T`.
+    pub fn inner(self) -> Option<Type<'a>> {
+        self.0.child_nodes().find_map(Type::cast)
     }
 }
 

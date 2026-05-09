@@ -14,8 +14,8 @@
 
 use arsenal_ast::{
     AstNode, BinaryExpr, Block, CallExpr, CastExpr, Expr, ExprStmt, FieldExpr, FnDecl, ForExpr,
-    IfExpr, LetStmt, LiteralExpr, MatchExpr, Module, ParenExpr, PathExpr, Pattern, ReturnExpr,
-    Stmt, StructLitExpr, SyntaxKind, UnaryExpr, WhileExpr,
+    IfExpr, LetStmt, LiteralExpr, MatchExpr, Module, MustExpr, ParenExpr, PathExpr, Pattern,
+    ReturnExpr, Stmt, StructLitExpr, SyntaxKind, UnaryExpr, WhileExpr,
 };
 use arsenal_lex::{SourceMap, Span};
 use arsenal_resolve::{DefId, DefKind, ResolvedModule};
@@ -566,6 +566,7 @@ fn lower_synthetic_main<'a>(
         string_literals,
         cstring_literals,
         print_write_fnidx,
+        fn_return_ty: Ty::Int(IntTy::I32),
     };
     for stmt in module.stmts() {
         lower_stmt(&mut b, stmt, &mut lcx);
@@ -651,6 +652,7 @@ fn lower_fn<'a>(
                 string_literals,
                 cstring_literals,
                 print_write_fnidx,
+                fn_return_ty: sig.ret,
             };
             let _ = lower_block(&mut b, body, &mut lcx);
         }
@@ -786,6 +788,11 @@ struct LowerCx<'a, 'tm, 'sm, 'm, 'sl> {
     /// implicit Print desugaring. `None` if the program contains no
     /// statement-position string literals (so `write` was not injected).
     print_write_fnidx: Option<FnIdx>,
+    /// Phase 2 increments O.1 / O.3: the current fn's declared
+    /// return type. `lower_return` consults this to apply the
+    /// implicit `T → ?T` / `T → !T` wrap when the expression's
+    /// type is the inner of the declared return.
+    fn_return_ty: Ty,
 }
 
 fn lower_block<'a>(
@@ -994,6 +1001,7 @@ fn lower_expr<'a>(
         Expr::Field(fe) => lower_field(b, fe, lcx),
         Expr::Cast(c) => lower_cast(b, c, lcx),
         Expr::Match(m) => lower_match(b, m, lcx),
+        Expr::Must(m) => lower_must(b, m, lcx),
         Expr::Stub(_) | Expr::Error(_) => Operand::Const(Const::Error),
     }
 }
@@ -1449,6 +1457,98 @@ fn lower_coalesce<'a>(
         dst: result_local,
         value: Rvalue::Field {
             base: lhs_local,
+            field_idx: 1,
+            field_ty: inner_ty,
+        },
+    });
+    b.set_terminator(b.cur, Terminator::Goto(join_bb));
+
+    b.cur = join_bb;
+    Operand::Local(result_local)
+}
+
+/// Phase 2 increment O.3: lower `expr!` (must-be-ok assert). Reads
+/// the LHS error-union's tag byte, branches on `tag == 0` (err) into
+/// an `Unreachable`-terminated trap block, and reads the payload
+/// field on the success branch. Codegen lowers
+/// `Terminator::Unreachable` as a hardware trap on both backends
+/// (`fb.ins().trap(...)` on Cranelift, `unreachable` IR on LLVM —
+/// both abort the program), so a runtime err on `!T` produces a
+/// loud failure instead of UB.
+fn lower_must<'a>(
+    b: &mut Builder,
+    m: MustExpr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
+) -> Operand {
+    let Some(inner_expr) = m.expr() else {
+        return Operand::Const(Const::Error);
+    };
+    let val_op = lower_expr(b, inner_expr, lcx);
+    let val_ty = lcx
+        .typed
+        .expr_types
+        .get(&NodePtr(inner_expr.syntax()))
+        .copied()
+        .unwrap_or(Ty::Error);
+    let inner_ty = match val_ty {
+        Ty::ErrorUnion(inner) => inner.to_ty(),
+        _ => return Operand::Const(Const::Error),
+    };
+    let span = m.syntax().span;
+
+    let val_local = ensure_scrut_local(b, &val_op, val_ty, span);
+    let tag_local = b.alloc_local(LocalDecl {
+        ty: Ty::Int(IntTy::U8),
+        span,
+    });
+    b.push_stmt(MirStmt::Assign {
+        dst: tag_local,
+        value: Rvalue::Field {
+            base: val_local,
+            field_idx: 0,
+            field_ty: Ty::Int(IntTy::U8),
+        },
+    });
+    let cmp_local = b.alloc_local(LocalDecl { ty: Ty::Bool, span });
+    b.push_stmt(MirStmt::Assign {
+        dst: cmp_local,
+        value: Rvalue::BinOp {
+            op: BinOp::Eq,
+            ty: Ty::Int(IntTy::U8),
+            lhs: Operand::Local(tag_local),
+            rhs: Operand::Const(Const::Int {
+                value: 0,
+                ty: IntTy::U8,
+            }),
+        },
+    });
+
+    let result_local = b.alloc_local(LocalDecl { ty: inner_ty, span });
+    let trap_bb = b.alloc_block();
+    let ok_bb = b.alloc_block();
+    let join_bb = b.alloc_block();
+    b.set_terminator(
+        b.cur,
+        Terminator::Branch {
+            cond: Operand::Local(cmp_local),
+            then_bb: trap_bb,
+            else_bb: ok_bb,
+        },
+    );
+
+    // err branch: `Unreachable` lowers as a hardware trap on both
+    // backends. Phase 2 doesn't carry payload metadata for the
+    // trap; later sub-bundles can add a runtime hook (panic message
+    // / unwind).
+    b.cur = trap_bb;
+    b.set_terminator(b.cur, Terminator::Unreachable);
+
+    // ok branch: read the payload field directly into the result.
+    b.cur = ok_bb;
+    b.push_stmt(MirStmt::Assign {
+        dst: result_local,
+        value: Rvalue::Field {
+            base: val_local,
             field_idx: 1,
             field_ty: inner_ty,
         },
@@ -2232,10 +2332,26 @@ fn lower_return<'a>(
     r: ReturnExpr<'a>,
     lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
 ) -> Operand {
-    let val = match r.value() {
-        Some(e) => lower_expr(b, e, lcx),
-        None => Operand::Const(Const::Unit),
+    let (val, val_ty) = match r.value() {
+        Some(e) => {
+            let op = lower_expr(b, e, lcx);
+            let ty = lcx
+                .typed
+                .expr_types
+                .get(&NodePtr(e.syntax()))
+                .copied()
+                .unwrap_or(Ty::Error);
+            (op, ty)
+        }
+        None => (Operand::Const(Const::Unit), Ty::U0),
     };
+    // Phase 2 O.1 / O.3: apply the implicit `T → ?T` / `T → !T`
+    // wrap when the fn's declared return type is an Optional or
+    // ErrorUnion and the expression's type is the inner. Without
+    // this wrap, returning a bare `T` from a `?T`/`!T`-returning fn
+    // would `Terminator::Return` a primitive Operand into an
+    // aggregate-typed return slot — silently miscompiles.
+    let val = wrap_to_optional_if_needed(b, val, val_ty, lcx.fn_return_ty, r.syntax().span);
     b.set_terminator(b.cur, Terminator::Return(val));
     // Subsequent code in this block is unreachable; allocate a fresh
     // block for it so any further appends don't clobber the terminator.
@@ -2255,10 +2371,35 @@ fn lower_call<'a>(
     let Some(fn_idx) = lcx.def_to_fn.get(&target).copied() else {
         return Operand::Const(Const::Error);
     };
+    // Phase 2 O.1 / O.3: at each arg position, apply the implicit
+    // `T → ?T` / `T → !T` wrap when the callee expects an Optional /
+    // ErrorUnion and the arg's type is the inner. Same bug class as
+    // `lower_let` and `lower_return`; without this, calls would
+    // silently pass un-wrapped primitives into aggregate slots.
+    let callee_param_tys: Vec<Ty> = lcx
+        .typed
+        .sigs
+        .get(&target)
+        .map(|sig| sig.params.iter().map(|p| p.ty).collect())
+        .unwrap_or_default();
     let mut args = Vec::new();
     if let Some(arg_list) = c.args() {
-        for a in arg_list.args() {
-            args.push(lower_expr(b, a, lcx));
+        for (i, a) in arg_list.args().enumerate() {
+            let arg_op = lower_expr(b, a, lcx);
+            let arg_ty = lcx
+                .typed
+                .expr_types
+                .get(&NodePtr(a.syntax()))
+                .copied()
+                .unwrap_or(Ty::Error);
+            let expected = callee_param_tys.get(i).copied().unwrap_or(arg_ty);
+            args.push(wrap_to_optional_if_needed(
+                b,
+                arg_op,
+                arg_ty,
+                expected,
+                a.syntax().span,
+            ));
         }
     }
     let result_ty = lcx
@@ -2401,13 +2542,16 @@ fn syntax_kind_to_binop(k: SyntaxKind) -> Option<BinOp> {
     })
 }
 
-/// Phase 2 increment O.1: materialise the implicit `T → ?T` coercion
-/// at MIR-lowering time. When `val_ty` is the inner of `dst_ty`'s
-/// Optional, allocate a fresh aggregate local, set tag = 1, write
+/// Phase 2 increments O.1 / O.3: materialise the implicit
+/// `T → ?T` (O.1) and `T → !T` (O.3) coercions at MIR-lowering
+/// time. When `val_ty` is the inner of `dst_ty`'s Optional or
+/// ErrorUnion, allocate a fresh aggregate local, set tag = 1, write
 /// the payload, and return the aggregate's `Operand::Local`.
 /// Otherwise return `val` unchanged. The coercion direction is
 /// already guarded by typeck's `ty_assignable`; this helper just
 /// emits the value-level wrap that typeck assumed would happen.
+/// Both Optional and ErrorUnion share the same `{tag, payload}`
+/// layout via `optional_layout`, so the wrap shape is identical.
 fn wrap_to_optional_if_needed(
     b: &mut Builder,
     val: Operand,
@@ -2415,8 +2559,9 @@ fn wrap_to_optional_if_needed(
     dst_ty: Ty,
     span: Span,
 ) -> Operand {
-    let Ty::Optional(inner) = dst_ty else {
-        return val;
+    let inner = match dst_ty {
+        Ty::Optional(i) | Ty::ErrorUnion(i) => i,
+        _ => return val,
     };
     if val_ty != inner.to_ty() {
         return val;
@@ -2441,7 +2586,8 @@ fn wrap_to_optional_if_needed(
 /// Resolve a `let`-binding's declared type to a [`Ty`]. Phase-1 paths
 /// reach this via [`primitive_from_ast`]; Phase 2 increment O.1 adds
 /// `Type::Opt(inner)` → [`Ty::Optional`] when the inner is a
-/// supported primitive.
+/// supported primitive; Phase 2 increment O.3 adds `Type::ErrorUnion
+/// (inner)` → [`Ty::ErrorUnion`] on the same primitive constraint.
 fn let_ty_from_ast(ty: arsenal_ast::Type<'_>, sm: &SourceMap) -> Option<Ty> {
     if let Some(prim) = primitive_from_ast(ty, sm) {
         return Some(prim);
@@ -2450,6 +2596,11 @@ fn let_ty_from_ast(ty: arsenal_ast::Type<'_>, sm: &SourceMap) -> Option<Ty> {
         let inner = opt.inner()?;
         let inner_ty = primitive_from_ast(inner, sm)?;
         return OptInner::from_ty(inner_ty).map(Ty::Optional);
+    }
+    if let arsenal_ast::Type::ErrorUnion(eu) = ty {
+        let inner = eu.inner()?;
+        let inner_ty = primitive_from_ast(inner, sm)?;
+        return OptInner::from_ty(inner_ty).map(Ty::ErrorUnion);
     }
     None
 }

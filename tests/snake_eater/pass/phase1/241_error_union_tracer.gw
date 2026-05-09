@@ -1,0 +1,8 @@
+fn safe_compute(seed: i32) -> !i32 {
+    return seed * 3;
+}
+
+fn main() -> i32 {
+    let r: !i32 = safe_compute(7);
+    return r!;
+}

@@ -28,7 +28,7 @@
 use arsenal_ast::{
     AstNode, BinaryExpr, Block, BreakExpr, CallExpr, CastExpr, ClassDecl, ContinueExpr, Expr,
     ExprStmt, FieldExpr, FnDecl, ForExpr, IfExpr, LetStmt, LiteralExpr, MatchExpr, Module,
-    ParenExpr, PathExpr, PathType, Pattern, ReturnExpr, Stmt, StructLitExpr, SyntaxKind,
+    MustExpr, ParenExpr, PathExpr, PathType, Pattern, ReturnExpr, Stmt, StructLitExpr, SyntaxKind,
     SyntaxNode, Type, UnaryExpr, WhileExpr,
 };
 use arsenal_lex::{DiagBag, Diagnostic, Label, SourceMap, Span};
@@ -120,6 +120,15 @@ pub enum Ty {
     /// realises `?Int(IntTy)` and `?Bool` only — wider inner types
     /// (classes, slices, pointers) ride later sub-bundles.
     Optional(OptInner),
+    /// `!T` — error union (Phase 2 increment O.3). Same 2-field
+    /// aggregate shape as `Ty::Optional`: tag = 0 means err, tag =
+    /// 1 means a populated success payload. Reuses [`OptInner`] for
+    /// the inner because Phase-2 minimum supports the same inner
+    /// kinds (integer + bool primitives). Distinguished from
+    /// `Optional` at the type level: typeck rejects the exchange
+    /// (`?T` doesn't coerce to `!T` and vice versa), and the `!`
+    /// postfix asserts on `!T` only.
+    ErrorUnion(OptInner),
     /// Synthetic placeholder when type checking failed for an
     /// expression. Treated as compatible with any expected type so a
     /// single failure does not cascade.
@@ -261,6 +270,7 @@ impl std::fmt::Display for Ty {
                 write!(f, "[*:{sentinel}]{}", Self::Int(*elem))
             }
             Self::Optional(inner) => write!(f, "?{}", inner),
+            Self::ErrorUnion(inner) => write!(f, "!{}", inner),
             Self::Error => f.write_str("<error>"),
         }
     }
@@ -650,6 +660,31 @@ fn resolve_type(
                 }
             };
         }
+        Type::ErrorUnion(eu) => {
+            // Phase 2 increment O.3: `!T` for primitive T only,
+            // mirroring O.1's `?T` constraint. Wider inner types
+            // (classes, slices, pointers, nested error-unions) need
+            // the same nested-aggregate work as `?T` and ride later
+            // sub-bundles.
+            let inner_ty = eu
+                .inner()
+                .map(|t| resolve_type(t, resolved, sm, diags))
+                .unwrap_or(Ty::Error);
+            return match OptInner::from_ty(inner_ty) {
+                Some(oi) => Ty::ErrorUnion(oi),
+                None if inner_ty == Ty::Error => Ty::Error,
+                None => {
+                    diags.push(Diagnostic::error(
+                        ec::UNSUPPORTED_CONSTRUCT,
+                        Label::new(eu.syntax().span, ""),
+                        format!(
+                            "Phase 2 only supports `!T` for primitive integer or `bool` inner types; `!{inner_ty}` is not yet supported"
+                        ),
+                    ));
+                    Ty::Error
+                }
+            };
+        }
         Type::SentinelPtr(s) => {
             // Phase 2 increment C.2: the corpus only needs `[*:0]u8`
             // (the c-string type). Any other element type or sentinel
@@ -738,6 +773,7 @@ fn ty_span(t: &Type<'_>) -> Span {
         Type::Array(p) => p.syntax().span,
         Type::Ptr(p) => p.syntax().span,
         Type::SentinelPtr(p) => p.syntax().span,
+        Type::ErrorUnion(p) => p.syntax().span,
         Type::Stub(n) | Type::Error(n) => n.span,
     }
 }
@@ -1109,6 +1145,7 @@ fn synth_expr<'a>(expr: Expr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
         Expr::Field(f) => synth_field(f, cx),
         Expr::Cast(c) => synth_cast(c, cx),
         Expr::Match(m) => synth_match(m, cx),
+        Expr::Must(m) => synth_must(m, cx),
         Expr::Stub(n) | Expr::Error(n) => {
             cx.diags.push(Diagnostic::error(
                 ec::UNSUPPORTED_CONSTRUCT,
@@ -1322,6 +1359,26 @@ fn is_free_numeric_literal(e: Expr<'_>) -> bool {
 /// `x = expr` where `x` is a path to a local. The Phase-1 model
 /// treats every let-bound local as mutable; `let` vs `var` is a
 /// borrow-checker concern and lands in Phase 3.
+/// Phase 2 increment O.3: type-check `expr!` (must-be-ok assert).
+/// LHS must be `Ty::ErrorUnion(_)`; result type is the unwrapped
+/// inner. The runtime trap on err is emitted by MIR
+/// (`lower_must`).
+fn synth_must<'a>(m: MustExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
+    let inner_ty = m.expr().map(|e| synth_expr(e, cx)).unwrap_or(Ty::Error);
+    match inner_ty {
+        Ty::ErrorUnion(oi) => oi.to_ty(),
+        Ty::Error => Ty::Error,
+        other => {
+            cx.diags.push(Diagnostic::error(
+                ec::BAD_OPERAND,
+                Label::new(m.syntax().span, ""),
+                format!("`!` postfix requires an error-union left-hand side, found `{other}`"),
+            ));
+            Ty::Error
+        }
+    }
+}
+
 /// Phase 2 increment O.1: type-check a `lhs ?? rhs` coalesce
 /// expression. The LHS must be a `Ty::Optional`; the RHS is checked
 /// against the unwrapped inner type; the result type is the inner
@@ -2049,6 +2106,17 @@ fn ty_assignable(actual: Ty, expected: Ty) -> bool {
             return true;
         }
     }
+    // Phase 2 O.3: `T → !T` coercion (Ok wrap). Same shape as the
+    // Optional rule above; bare `T` materialises as a tag-1 success
+    // payload at MIR-lowering time. There's no err-side coercion in
+    // Phase 2 minimum (no err-value type yet); the err side can only
+    // appear after a propagation operator that this sub-bundle
+    // doesn't yet ship.
+    if let Ty::ErrorUnion(inner) = expected {
+        if actual == inner.to_ty() {
+            return true;
+        }
+    }
     false
 }
 
@@ -2189,6 +2257,7 @@ fn expr_span(e: Expr<'_>) -> Span {
         Expr::Field(x) => x.syntax().span,
         Expr::Cast(x) => x.syntax().span,
         Expr::Match(x) => x.syntax().span,
+        Expr::Must(x) => x.syntax().span,
         Expr::Stub(n) | Expr::Error(n) => n.span,
     }
 }
@@ -2593,6 +2662,65 @@ mod tests {
         // `nil` pattern only makes sense against `?T` scrutinees.
         let src = "fn main() -> i32 { return match 5 { nil => 1, _ => 0 }; }";
         assert!(check(src) >= 1);
+    }
+
+    // ─── Phase 2 increment O.3: !T error union + !-assert ────────────────
+
+    #[test]
+    fn error_union_let_init_with_value_typechecks() {
+        // Bare T coerces to !T at let-init position (same shape as
+        // ?T's coercion; tag = 1 = ok).
+        let src = "fn main() -> i32 { let x: !i32 = 7; return 0; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn error_union_returned_from_fn_typechecks() {
+        // `return T` from `-> !T` triggers the implicit `T → !T`
+        // wrap at MIR-lowering time.
+        let src = "fn safe(seed: i32) -> !i32 { return seed * 3; }\n\
+                   fn main() -> i32 { return safe(1)!; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn must_postfix_extracts_inner_type() {
+        let src = "fn main() -> i32 { let x: !i32 = 42; return x!; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn must_postfix_rejects_non_error_union_lhs() {
+        let src = "fn main() -> i32 { let x: i32 = 7; return x!; }";
+        assert!(check(src) >= 1);
+    }
+
+    #[test]
+    fn error_union_does_not_coerce_to_optional() {
+        // `?T` and `!T` are type-distinct at the source level even
+        // though they share the runtime layout.
+        let src = "fn main() -> i32 {\n\
+                       let x: !i32 = 7;\n\
+                       let y: ?i32 = x;\n\
+                       return 0;\n\
+                   }";
+        assert!(check(src) >= 1);
+    }
+
+    #[test]
+    fn error_union_displays_with_bang_prefix() {
+        let ty = Ty::ErrorUnion(OptInner::Int(IntTy::I32));
+        assert_eq!(format!("{}", ty), "!i32");
+        let bool_eu = Ty::ErrorUnion(OptInner::Bool);
+        assert_eq!(format!("{}", bool_eu), "!bool");
+    }
+
+    #[test]
+    fn must_postfix_works_in_call_chain() {
+        // Call-arg wrap path: `T → !T` at each call site.
+        let src = "fn add(a: !i32, b: !i32) -> i32 { return a! + b!; }\n\
+                   fn main() -> i32 { return add(7, 14); }";
+        assert_eq!(check(src), 0);
     }
 
     /// Pre-A.4 a `[]u8` parameter rejected with UNSUPPORTED_CONSTRUCT.
