@@ -285,7 +285,7 @@ fn make_signature(module: &ObjectModule, f: &MirFn) -> ir::Signature {
 /// Classes and slices share the by-pointer ABI; primitive types are
 /// passed in registers.
 fn is_aggregate_ty(ty: Ty) -> bool {
-    matches!(ty, Ty::Class(_) | Ty::Slice(_))
+    matches!(ty, Ty::Class(_) | Ty::Slice(_) | Ty::Optional(_))
 }
 
 fn pointer_clif_ty(module: &ObjectModule) -> ir::Type {
@@ -393,31 +393,28 @@ fn define_fn(
     let mut local_slot: FxHashMap<Local, StackSlot> = FxHashMap::default();
     for (i, decl) in f.locals.iter().enumerate() {
         let local = Local(i as u32);
-        match decl.ty {
-            Ty::Class(_) | Ty::Slice(_) => {
-                let layout =
-                    aggregate_layout(decl.ty, prog, ptr_bytes).unwrap_or(ResolvedClassLayout {
-                        size: ptr_bytes,
-                        align: ptr_bytes,
-                        offsets: Vec::new(),
-                    });
-                let slot = builder.create_sized_stack_slot(ir::StackSlotData::new(
-                    ir::StackSlotKind::ExplicitSlot,
-                    layout.size.max(1),
-                    layout.align.trailing_zeros() as u8,
-                ));
-                local_slot.insert(local, slot);
+        if is_aggregate_ty(decl.ty) {
+            let layout =
+                aggregate_layout(decl.ty, prog, ptr_bytes).unwrap_or(ResolvedClassLayout {
+                    size: ptr_bytes,
+                    align: ptr_bytes,
+                    offsets: Vec::new(),
+                });
+            let slot = builder.create_sized_stack_slot(ir::StackSlotData::new(
+                ir::StackSlotKind::ExplicitSlot,
+                layout.size.max(1),
+                layout.align.trailing_zeros() as u8,
+            ));
+            local_slot.insert(local, slot);
+        } else {
+            let var = Variable::from_u32(i as u32);
+            if let Some(clt) = clif_ty(decl.ty, module) {
+                builder.declare_var(var, clt);
+            } else {
+                // Placeholder for unit-typed locals so indices align.
+                builder.declare_var(var, ir::types::I8);
             }
-            _ => {
-                let var = Variable::from_u32(i as u32);
-                if let Some(clt) = clif_ty(decl.ty, module) {
-                    builder.declare_var(var, clt);
-                } else {
-                    // Placeholder for unit-typed locals so indices align.
-                    builder.declare_var(var, ir::types::I8);
-                }
-                local_var.insert(local, var);
-            }
+            local_var.insert(local, var);
         }
     }
 
@@ -578,7 +575,24 @@ fn aggregate_layout(ty: Ty, prog: &MirProgram, ptr_bytes: u32) -> Option<Resolve
             align: ptr_bytes,
             offsets: vec![0, ptr_bytes],
         }),
+        Ty::Optional(inner) => Some(optional_layout(inner.to_ty(), ptr_bytes)),
         _ => None,
+    }
+}
+
+/// Phase 2 increment O.1: layout for `?T`. Tag at offset 0 (1 byte),
+/// payload at the inner's natural alignment, total size aligned to the
+/// inner's alignment. Mirrors Rust's `Option<T>` layout for primitive
+/// inners.
+fn optional_layout(inner: Ty, ptr_bytes: u32) -> ResolvedClassLayout {
+    let (inner_size, inner_align) = primitive_size_align(inner, ptr_bytes);
+    let align = inner_align.max(1);
+    let payload_offset = align;
+    let size = align_up(payload_offset + inner_size, align);
+    ResolvedClassLayout {
+        size,
+        align,
+        offsets: vec![0, payload_offset],
     }
 }
 
@@ -596,6 +610,11 @@ fn aggregate_field_ty(ty: Ty, field_idx: u32, prog: &MirProgram) -> Ty {
             .map(|f| f.ty)
             .unwrap_or(Ty::Error),
         Ty::Slice(_) => Ty::Int(IntTy::USize),
+        Ty::Optional(inner) => match field_idx {
+            0 => Ty::Int(IntTy::U8),
+            1 => inner.to_ty(),
+            _ => Ty::Error,
+        },
         _ => Ty::Error,
     }
 }
@@ -746,12 +765,11 @@ fn lower_assign_stmt(
     cx: &LoweringCx<'_>,
 ) {
     let dst_ty = f.locals[dst.0 as usize].ty;
-    if matches!(dst_ty, Ty::Class(_) | Ty::Slice(_)) {
-        // Aggregate-typed destination. Phase 1 only produces such
-        // Assigns via let-init shadowing of a struct/string literal
-        // temp: `let p = Foo {...};` or `let s: []u8 = "...";` allocates
-        // a temp inside the lit lowering, emits per-field AssignFields,
-        // and then Assigns the temp into the let's local. Lower as
+    if is_aggregate_ty(dst_ty) {
+        // Aggregate-typed destination. Phase 1 produces such Assigns
+        // via let-init shadowing of a struct / string / c-string
+        // literal temp; Phase 2 increment O.1 adds Optional aggregates
+        // that flow through the same `T → ?T` wrap path. Lower as
         // field-by-field memcpy from src slot to dst slot.
         let Rvalue::Use(Operand::Local(src)) = value else {
             // Other rvalue kinds for aggregate dst are unreachable in

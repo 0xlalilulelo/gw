@@ -592,6 +592,10 @@ fn infix_bp(op: TokenKind) -> Option<(u8, u8)> {
         TokenKind::AmpAmp => (5, 6),
         TokenKind::EqEq | TokenKind::BangEq => (7, 8),
         TokenKind::Lt | TokenKind::LtEq | TokenKind::Gt | TokenKind::GtEq => (7, 8),
+        // `??` (Phase 2 increment O.1) — right-associative, tighter
+        // than logical / comparison / bitwise, looser than arithmetic.
+        // Right-assoc so `a ?? b ?? c` chains as `a ?? (b ?? c)`.
+        TokenKind::QuestionQ => (16, 15),
         TokenKind::Pipe => (9, 10),
         TokenKind::Caret => (11, 12),
         TokenKind::Amp => (13, 14),

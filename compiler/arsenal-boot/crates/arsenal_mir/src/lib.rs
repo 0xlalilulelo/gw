@@ -19,7 +19,9 @@ use arsenal_ast::{
 };
 use arsenal_lex::{SourceMap, Span};
 use arsenal_resolve::{DefId, DefKind, ResolvedModule};
-use arsenal_typeck::{BindingId, ClassLayout, FloatTy, FnSig, IntTy, NodePtr, Ty, TypedModule};
+use arsenal_typeck::{
+    BindingId, ClassLayout, FloatTy, FnSig, IntTy, NodePtr, OptInner, Ty, TypedModule,
+};
 use rustc_hash::FxHashMap;
 
 /// The whole Phase-1 program: a flat list of functions, the class
@@ -816,7 +818,7 @@ fn lower_let<'a>(b: &mut Builder, let_stmt: LetStmt<'a>, lcx: &mut LowerCx<'a, '
         .unwrap_or(Ty::Error);
     let ty = let_stmt
         .ty()
-        .and_then(|t| primitive_from_ast(t, lcx.sm))
+        .and_then(|t| let_ty_from_ast(t, lcx.sm))
         .unwrap_or(init_ty);
 
     match let_stmt.pattern() {
@@ -839,6 +841,7 @@ fn lower_let<'a>(b: &mut Builder, let_stmt: LetStmt<'a>, lcx: &mut LowerCx<'a, '
             lcx.binding_to_local.insert(binding_id, local);
             if let Some(init) = let_stmt.init() {
                 let val = lower_expr(b, init, lcx);
+                let val = wrap_to_optional_if_needed(b, val, init_ty, ty, span);
                 b.push_stmt(MirStmt::Assign {
                     dst: local,
                     value: Rvalue::Use(val),
@@ -975,6 +978,7 @@ fn lower_expr<'a>(
         Expr::Binary(bin) => match bin.op_kind() {
             Some(SyntaxKind::Eq) => lower_assign(b, bin, lcx),
             Some(SyntaxKind::AmpAmp | SyntaxKind::PipePipe) => lower_short_circuit(b, bin, lcx),
+            Some(SyntaxKind::QuestionQ) => lower_coalesce(b, bin, lcx),
             _ => lower_binary(b, bin, lcx),
         },
         Expr::Unary(u) => lower_unary(b, u, lcx),
@@ -1039,9 +1043,36 @@ fn lower_literal<'a>(
             lower_string_literal(b, l, raw, lcx)
         }
         Some(SyntaxKind::CStringLit) => lower_cstring_literal(raw, lcx),
+        Some(SyntaxKind::KwNil) => lower_nil_literal(b, l, ty),
         // Runes, byte chars — Phase 1 doesn't yet handle.
         _ => Operand::Const(Const::Error),
     }
+}
+
+/// Phase 2 increment O.1: lower a `nil` literal at expression
+/// position. typeck records `expr_types[nil] = Ty::Optional(_)` only
+/// when the surrounding context expects an optional; otherwise the
+/// recorded type is `Ty::Error` and lowering falls back to
+/// `Const::Error` so we don't materialise an aggregate of unknown
+/// shape. The "real" lowering allocates an aggregate local of the
+/// expected `?T` type and writes tag = 0; the payload field is left
+/// uninitialised (the tag-byte branch in `??` / future unwrap paths
+/// never reads it when tag = 0).
+fn lower_nil_literal<'a>(b: &mut Builder, l: LiteralExpr<'a>, ty: Ty) -> Operand {
+    let span = l.syntax().span;
+    if !matches!(ty, Ty::Optional(_)) {
+        return Operand::Const(Const::Error);
+    }
+    let agg = b.alloc_local(LocalDecl { ty, span });
+    b.push_stmt(MirStmt::AssignField {
+        dst: agg,
+        field_idx: 0,
+        value: Rvalue::Use(Operand::Const(Const::Int {
+            value: 0,
+            ty: IntTy::U8,
+        })),
+    });
+    Operand::Local(agg)
 }
 
 /// Lower a `"..."` string literal to a `[]u8` slice value. Allocates a
@@ -1317,6 +1348,117 @@ fn lower_binary<'a>(
 ///     short_bb: result = false; goto join
 ///     join: continue with `Operand::Local(result)`
 /// ```
+/// Phase 2 increment O.1: lower `lhs ?? rhs` (coalesce). Reads the
+/// LHS optional's tag byte and branches: `tag == 0` (nil) goes to a
+/// block that lowers the RHS (default) and writes it into the result
+/// local; otherwise the payload field is read straight into the
+/// result. Both arms `Goto` a shared join block. The result type is
+/// the inner of the LHS optional; RHS is lowered lazily (only on the
+/// nil branch), matching the short-circuit shape of `&&` / `||`.
+fn lower_coalesce<'a>(
+    b: &mut Builder,
+    bin: BinaryExpr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
+) -> Operand {
+    let Some(lhs_expr) = bin.lhs() else {
+        return Operand::Const(Const::Error);
+    };
+    let Some(rhs_expr) = bin.rhs() else {
+        return Operand::Const(Const::Error);
+    };
+    let lhs_op = lower_expr(b, lhs_expr, lcx);
+    let lhs_ty = lcx
+        .typed
+        .expr_types
+        .get(&NodePtr(lhs_expr.syntax()))
+        .copied()
+        .unwrap_or(Ty::Error);
+    let inner_ty = match lhs_ty {
+        Ty::Optional(inner) => inner.to_ty(),
+        _ => return Operand::Const(Const::Error),
+    };
+    let span = bin.syntax().span;
+
+    // The Field rvalue takes a `Local` base; if the LHS lowered to a
+    // const operand (parser/recovery edge case), materialise it as a
+    // temp aggregate first so the field reads are well-formed.
+    let lhs_local = match lhs_op {
+        Operand::Local(l) => l,
+        other => {
+            let tmp = b.alloc_local(LocalDecl { ty: lhs_ty, span });
+            b.push_stmt(MirStmt::Assign {
+                dst: tmp,
+                value: Rvalue::Use(other),
+            });
+            tmp
+        }
+    };
+
+    let tag_local = b.alloc_local(LocalDecl {
+        ty: Ty::Int(IntTy::U8),
+        span,
+    });
+    b.push_stmt(MirStmt::Assign {
+        dst: tag_local,
+        value: Rvalue::Field {
+            base: lhs_local,
+            field_idx: 0,
+            field_ty: Ty::Int(IntTy::U8),
+        },
+    });
+    let cmp_local = b.alloc_local(LocalDecl { ty: Ty::Bool, span });
+    b.push_stmt(MirStmt::Assign {
+        dst: cmp_local,
+        value: Rvalue::BinOp {
+            op: BinOp::Eq,
+            ty: Ty::Int(IntTy::U8),
+            lhs: Operand::Local(tag_local),
+            rhs: Operand::Const(Const::Int {
+                value: 0,
+                ty: IntTy::U8,
+            }),
+        },
+    });
+
+    let result_local = b.alloc_local(LocalDecl { ty: inner_ty, span });
+    let nil_bb = b.alloc_block();
+    let some_bb = b.alloc_block();
+    let join_bb = b.alloc_block();
+    b.set_terminator(
+        b.cur,
+        Terminator::Branch {
+            cond: Operand::Local(cmp_local),
+            then_bb: nil_bb,
+            else_bb: some_bb,
+        },
+    );
+
+    // nil branch: evaluate the user-supplied default lazily, copy
+    // into result.
+    b.cur = nil_bb;
+    let default_val = lower_expr(b, rhs_expr, lcx);
+    b.push_stmt(MirStmt::Assign {
+        dst: result_local,
+        value: Rvalue::Use(default_val),
+    });
+    b.set_terminator(b.cur, Terminator::Goto(join_bb));
+
+    // some branch: read the LHS's payload field directly into result.
+    b.cur = some_bb;
+    b.push_stmt(MirStmt::Assign {
+        dst: result_local,
+        value: Rvalue::Field {
+            base: lhs_local,
+            field_idx: 1,
+            field_ty: inner_ty,
+        },
+    });
+    b.set_terminator(b.cur, Terminator::Goto(join_bb));
+
+    b.cur = join_bb;
+    Operand::Local(result_local)
+}
+
 fn lower_short_circuit<'a>(
     b: &mut Builder,
     bin: BinaryExpr<'a>,
@@ -2191,6 +2333,59 @@ fn syntax_kind_to_binop(k: SyntaxKind) -> Option<BinOp> {
     })
 }
 
+/// Phase 2 increment O.1: materialise the implicit `T → ?T` coercion
+/// at MIR-lowering time. When `val_ty` is the inner of `dst_ty`'s
+/// Optional, allocate a fresh aggregate local, set tag = 1, write
+/// the payload, and return the aggregate's `Operand::Local`.
+/// Otherwise return `val` unchanged. The coercion direction is
+/// already guarded by typeck's `ty_assignable`; this helper just
+/// emits the value-level wrap that typeck assumed would happen.
+fn wrap_to_optional_if_needed(
+    b: &mut Builder,
+    val: Operand,
+    val_ty: Ty,
+    dst_ty: Ty,
+    span: Span,
+) -> Operand {
+    let Ty::Optional(inner) = dst_ty else {
+        return val;
+    };
+    if val_ty != inner.to_ty() {
+        return val;
+    }
+    let agg = b.alloc_local(LocalDecl { ty: dst_ty, span });
+    b.push_stmt(MirStmt::AssignField {
+        dst: agg,
+        field_idx: 0,
+        value: Rvalue::Use(Operand::Const(Const::Int {
+            value: 1,
+            ty: IntTy::U8,
+        })),
+    });
+    b.push_stmt(MirStmt::AssignField {
+        dst: agg,
+        field_idx: 1,
+        value: Rvalue::Use(val),
+    });
+    Operand::Local(agg)
+}
+
+/// Resolve a `let`-binding's declared type to a [`Ty`]. Phase-1 paths
+/// reach this via [`primitive_from_ast`]; Phase 2 increment O.1 adds
+/// `Type::Opt(inner)` → [`Ty::Optional`] when the inner is a
+/// supported primitive.
+fn let_ty_from_ast(ty: arsenal_ast::Type<'_>, sm: &SourceMap) -> Option<Ty> {
+    if let Some(prim) = primitive_from_ast(ty, sm) {
+        return Some(prim);
+    }
+    if let arsenal_ast::Type::Opt(opt) = ty {
+        let inner = opt.inner()?;
+        let inner_ty = primitive_from_ast(inner, sm)?;
+        return OptInner::from_ty(inner_ty).map(Ty::Optional);
+    }
+    None
+}
+
 fn primitive_from_ast(ty: arsenal_ast::Type<'_>, sm: &SourceMap) -> Option<Ty> {
     let path = match ty {
         arsenal_ast::Type::Path(p) => p,
@@ -2704,6 +2899,142 @@ mod tests {
     }
 
     // ─── Phase 2 increment M.1: match lowering ────────────────────────────
+
+    // ─── Phase 2 increment O.1: ?T tracer ────────────────────────────────
+
+    /// `let x: ?i32 = 7` lowers to a fresh aggregate temp (tag = 1,
+    /// payload = 7) followed by an aggregate-to-aggregate Assign into
+    /// the user's binding local. Pins both the wrap-on-assign rule
+    /// and the layout decision (tag at field 0, payload at field 1).
+    #[test]
+    fn optional_let_init_wraps_value_with_tag_one() {
+        let prog = lower_src("fn main() -> i32 { let x: ?i32 = 7; return 0; }");
+        let main = prog
+            .functions
+            .iter()
+            .find(|f| f.name == "main")
+            .expect("main lowered");
+        // The function should contain at least one local of
+        // `Ty::Optional(Int(I32))` — the user's `x` binding.
+        assert!(main
+            .locals
+            .iter()
+            .any(|l| matches!(l.ty, Ty::Optional(OptInner::Int(IntTy::I32)))));
+        // The wrap helper emits `AssignField` with field_idx 0 (tag)
+        // assigned a `Const::Int { value: 1, ty: U8 }`.
+        let writes_tag_one = main
+            .blocks
+            .iter()
+            .flat_map(|b| b.statements.iter())
+            .any(|s| {
+                matches!(
+                    s,
+                    MirStmt::AssignField {
+                        field_idx: 0,
+                        value: Rvalue::Use(Operand::Const(Const::Int {
+                            value: 1,
+                            ty: IntTy::U8,
+                        })),
+                        ..
+                    }
+                )
+            });
+        assert!(
+            writes_tag_one,
+            "expected tag = 1 write for `let x: ?i32 = 7`"
+        );
+    }
+
+    /// `let x: ?i32 = nil` lowers to a fresh aggregate with tag = 0
+    /// and no payload write — the payload bytes stay uninitialised
+    /// since the tag distinguishes the empty case.
+    #[test]
+    fn optional_let_init_with_nil_writes_only_tag_zero() {
+        let prog = lower_src("fn main() -> i32 { let x: ?i32 = nil; return 0; }");
+        let main = prog.functions.iter().find(|f| f.name == "main").unwrap();
+        let writes_tag_zero = main
+            .blocks
+            .iter()
+            .flat_map(|b| b.statements.iter())
+            .any(|s| {
+                matches!(
+                    s,
+                    MirStmt::AssignField {
+                        field_idx: 0,
+                        value: Rvalue::Use(Operand::Const(Const::Int {
+                            value: 0,
+                            ty: IntTy::U8,
+                        })),
+                        ..
+                    }
+                )
+            });
+        assert!(writes_tag_zero, "expected tag = 0 write for `nil`");
+        // No payload (field 1) write should happen for nil.
+        let writes_field_one = main
+            .blocks
+            .iter()
+            .flat_map(|b| b.statements.iter())
+            .any(|s| matches!(s, MirStmt::AssignField { field_idx: 1, .. }));
+        assert!(!writes_field_one, "nil shouldn't write the payload field");
+    }
+
+    /// `??` lowers as: read tag, compare tag == 0, branch into a
+    /// nil-default block or a payload-read block. Both arms `Goto` a
+    /// shared join. Pins the chain-of-Branch shape so a future
+    /// refactor doesn't silently break the tag-zero/nonzero contract.
+    #[test]
+    fn coalesce_emits_tag_compare_and_branch() {
+        let prog = lower_src("fn main() -> i32 { let x: ?i32 = 7; return x ?? 0; }");
+        let main = prog.functions.iter().find(|f| f.name == "main").unwrap();
+        // Should contain a Field rvalue reading field_idx 0 (tag).
+        let reads_tag = main
+            .blocks
+            .iter()
+            .flat_map(|b| b.statements.iter())
+            .any(|s| {
+                matches!(
+                    s,
+                    MirStmt::Assign {
+                        value: Rvalue::Field {
+                            field_idx: 0,
+                            field_ty: Ty::Int(IntTy::U8),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            });
+        assert!(reads_tag, "expected tag-byte read in `??` lowering");
+        // ...and a Field read of field_idx 1 (payload).
+        let reads_payload = main
+            .blocks
+            .iter()
+            .flat_map(|b| b.statements.iter())
+            .any(|s| {
+                matches!(
+                    s,
+                    MirStmt::Assign {
+                        value: Rvalue::Field {
+                            field_idx: 1,
+                            field_ty: Ty::Int(IntTy::I32),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            });
+        assert!(
+            reads_payload,
+            "expected payload-field read in `??` lowering"
+        );
+        // ...and at least one Branch terminator (the tag == 0 test).
+        let has_branch = main
+            .blocks
+            .iter()
+            .any(|b| matches!(b.terminator, Terminator::Branch { .. }));
+        assert!(has_branch, "expected Branch in `??` decision");
+    }
 
     /// `match` lowers as a chain of equality compares: each
     /// non-wildcard arm contributes one `BinOp::Eq` + `Branch`,

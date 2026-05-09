@@ -113,10 +113,58 @@ pub enum Ty {
         /// Phase 2 only realises `0`.
         sentinel: u64,
     },
+    /// `?T` — optional value (Phase 2 increment O.1). Lowers as a
+    /// 2-field aggregate `{ tag: u8, payload: T }`; tag = 0 means
+    /// nil, tag = 1 means a populated payload. The closed
+    /// [`OptInner`] keeps `Ty` Copy + non-Box; Phase 2 minimum
+    /// realises `?Int(IntTy)` and `?Bool` only — wider inner types
+    /// (classes, slices, pointers) ride later sub-bundles.
+    Optional(OptInner),
     /// Synthetic placeholder when type checking failed for an
     /// expression. Treated as compatible with any expected type so a
     /// single failure does not cascade.
     Error,
+}
+
+/// The inner of a [`Ty::Optional`]. Closed enum to keep `Ty` Copy.
+/// Phase 2 minimum realises only the integer and bool primitives —
+/// wider inner types (classes, slices, pointers) need additional
+/// codegen layout work and ride later sub-bundles.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum OptInner {
+    /// `?i32`, `?u64`, etc.
+    Int(IntTy),
+    /// `?bool`.
+    Bool,
+}
+
+impl OptInner {
+    /// Promote the closed inner to a full [`Ty`] for paths that need
+    /// the wider form (codegen layout, MIR field types, etc.).
+    pub fn to_ty(self) -> Ty {
+        match self {
+            Self::Int(t) => Ty::Int(t),
+            Self::Bool => Ty::Bool,
+        }
+    }
+
+    /// Try to demote a [`Ty`] to its [`OptInner`] form. Returns `None`
+    /// for any non-supported inner (the typeck rejects those at
+    /// `resolve_type` time, but the helper is convenient for MIR /
+    /// codegen).
+    pub fn from_ty(ty: Ty) -> Option<Self> {
+        match ty {
+            Ty::Int(t) => Some(Self::Int(t)),
+            Ty::Bool => Some(Self::Bool),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for OptInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_ty().fmt(f)
+    }
 }
 
 /// Integer primitives.
@@ -212,6 +260,7 @@ impl std::fmt::Display for Ty {
             Self::SentinelPtr { elem, sentinel } => {
                 write!(f, "[*:{sentinel}]{}", Self::Int(*elem))
             }
+            Self::Optional(inner) => write!(f, "?{}", inner),
             Self::Error => f.write_str("<error>"),
         }
     }
@@ -575,6 +624,32 @@ fn resolve_type(
                 }
             };
         }
+        Type::Opt(opt) => {
+            // Phase 2 increment O.1: `?T` for primitive T (`Ty::Int(_)`
+            // or `Ty::Bool`). Wider inner types (classes, slices,
+            // pointers, sentinel-pointers, nested Optionals) need
+            // additional codegen layout work; reject them here so
+            // bigger inner-type plumbing can ride a separate
+            // sub-bundle.
+            let inner_ty = opt
+                .inner()
+                .map(|t| resolve_type(t, resolved, sm, diags))
+                .unwrap_or(Ty::Error);
+            return match OptInner::from_ty(inner_ty) {
+                Some(oi) => Ty::Optional(oi),
+                None if inner_ty == Ty::Error => Ty::Error,
+                None => {
+                    diags.push(Diagnostic::error(
+                        ec::UNSUPPORTED_CONSTRUCT,
+                        Label::new(opt.syntax().span, ""),
+                        format!(
+                            "Phase 2 only supports `?T` for primitive integer or `bool` inner types; `?{inner_ty}` is not yet supported"
+                        ),
+                    ));
+                    Ty::Error
+                }
+            };
+        }
         Type::SentinelPtr(s) => {
             // Phase 2 increment C.2: the corpus only needs `[*:0]u8`
             // (the c-string type). Any other element type or sentinel
@@ -893,6 +968,18 @@ fn try_narrow_literal<'a>(expr: Expr<'a>, expected: Ty, cx: &mut Cx<'a, '_, '_, 
     if expected == Ty::Error {
         return None;
     }
+    // Phase 2 O.1: bare `nil` adopts `?T` whenever a `?T` context is
+    // expected. Outside a `?T` context `nil` synthesises as
+    // `Ty::Error` (the existing fallback in `synth_literal`); typeck
+    // diagnoses `nil` in any non-Optional slot.
+    if let Expr::Literal(l) = expr {
+        if matches!(l.token_kind(), Some(SyntaxKind::KwNil)) {
+            if let Ty::Optional(_) = expected {
+                cx.tm.expr_types.insert(NodePtr(l.syntax()), expected);
+                return Some(expected);
+            }
+        }
+    }
     // Recognise both bare `Literal` and `Unary(Minus, Literal)` shapes.
     // Paren wrappers also pass through so `(-7)` narrows like `-7`.
     let (lit, negate, outer_span) = match expr {
@@ -1035,14 +1122,25 @@ fn synth_expr<'a>(expr: Expr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     ty
 }
 
-fn synth_literal(l: LiteralExpr<'_>, _cx: &mut Cx<'_, '_, '_, '_>) -> Ty {
+fn synth_literal(l: LiteralExpr<'_>, cx: &mut Cx<'_, '_, '_, '_>) -> Ty {
     match l.token_kind() {
         // Phase 1 literal-to-type mapping. Fancier inference (e.g.
         // ComptimeInt fitting any integer type) is a Phase 2 concern.
         Some(SyntaxKind::IntLit) => Ty::Int(IntTy::I32),
         Some(SyntaxKind::FloatLit) => Ty::Float(FloatTy::F64),
         Some(SyntaxKind::KwTrue) | Some(SyntaxKind::KwFalse) => Ty::Bool,
-        Some(SyntaxKind::KwNil) => Ty::Error, // requires `?T` context
+        Some(SyntaxKind::KwNil) => {
+            // `nil` requires an `?T` context — `try_narrow_literal`
+            // adopts the expected Optional and never reaches here.
+            // If we're in synth mode (no context) or the expected
+            // type wasn't an Optional, diagnose.
+            cx.diags.push(Diagnostic::error(
+                ec::TYPE_MISMATCH,
+                Label::new(l.syntax().span, ""),
+                "`nil` literal requires an optional context (`?T`); none was inferred here",
+            ));
+            Ty::Error
+        }
         Some(SyntaxKind::RuneLit) => Ty::Rune,
         Some(SyntaxKind::ByteCharLit) => Ty::Int(IntTy::U8),
         Some(SyntaxKind::StringLit | SyntaxKind::RawStringLit) => Ty::Slice(IntTy::U8),
@@ -1116,6 +1214,9 @@ fn synth_binary<'a>(b: BinaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     // be written, not read.
     if matches!(b.op_kind(), Some(SyntaxKind::Eq)) {
         return synth_assign(b, cx);
+    }
+    if matches!(b.op_kind(), Some(SyntaxKind::QuestionQ)) {
+        return synth_coalesce(b, cx);
     }
     // Narrow free numeric literals to the other side's type when one
     // side has a concrete numeric type and the other is just a bare
@@ -1221,6 +1322,31 @@ fn is_free_numeric_literal(e: Expr<'_>) -> bool {
 /// `x = expr` where `x` is a path to a local. The Phase-1 model
 /// treats every let-bound local as mutable; `let` vs `var` is a
 /// borrow-checker concern and lands in Phase 3.
+/// Phase 2 increment O.1: type-check a `lhs ?? rhs` coalesce
+/// expression. The LHS must be a `Ty::Optional`; the RHS is checked
+/// against the unwrapped inner type; the result type is the inner
+/// type. Bypasses `synth_binop_operands` because the operands are
+/// asymmetric (one is an Optional aggregate, the other a primitive).
+fn synth_coalesce<'a>(b: BinaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
+    let lhs_ty = b.lhs().map(|e| synth_expr(e, cx)).unwrap_or(Ty::Error);
+    let inner = match lhs_ty {
+        Ty::Optional(oi) => oi.to_ty(),
+        Ty::Error => Ty::Error,
+        other => {
+            cx.diags.push(Diagnostic::error(
+                ec::BAD_OPERAND,
+                Label::new(b.syntax().span, ""),
+                format!("`??` requires an optional left-hand side, found `{other}`"),
+            ));
+            Ty::Error
+        }
+    };
+    if let Some(rhs) = b.rhs() {
+        check_expr(rhs, inner, cx);
+    }
+    inner
+}
+
 fn synth_assign<'a>(b: BinaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     let lhs_ty = match b.lhs() {
         Some(Expr::Path(p)) => synth_path(p, cx),
@@ -1864,10 +1990,22 @@ fn ty_assignable(actual: Ty, expected: Ty) -> bool {
     // pointer at MIR/codegen — so accepting the implicit form here
     // costs nothing at runtime and avoids forcing every c-string user
     // to write an `as *u8` that doesn't yet parse.
-    matches!(
-        (actual, expected),
-        (Ty::SentinelPtr { elem: e1, .. }, Ty::Ptr(e2)) if e1 == e2,
-    )
+    if let (Ty::SentinelPtr { elem: e1, .. }, Ty::Ptr(e2)) = (actual, expected) {
+        if e1 == e2 {
+            return true;
+        }
+    }
+    // Phase 2 O.1: `T → ?T` coercion. The inner type must match the
+    // Optional's inner exactly; this is the value-level wrap (tag = 1
+    // + payload = T) materialised at MIR-lowering time. Reverse
+    // direction (`?T → T`) is rejected — the user must unwrap via
+    // `??` (or later `!` / `match`).
+    if let Ty::Optional(inner) = expected {
+        if actual == inner.to_ty() {
+            return true;
+        }
+    }
+    false
 }
 
 fn require_same_numeric(lhs: Ty, rhs: Ty, span: Span, op: &str, cx: &mut Cx<'_, '_, '_, '_>) -> Ty {
@@ -2310,6 +2448,67 @@ mod tests {
         // narrowing path widens both bounds to i64.
         let src = "fn f(x: i64) -> i32 { return match x { 100..=200 => 1, _ => 0 }; }";
         assert_eq!(check(src), 0);
+    }
+
+    // ─── Phase 2 increment O.1: ?T optional + nil + ?? ─────────────────────
+
+    #[test]
+    fn optional_let_init_with_value_typechecks() {
+        // Bare `T` coerces to `?T` at let-init position.
+        let src = "fn main() -> i32 { let x: ?i32 = 7; return 0; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn optional_let_init_with_nil_typechecks() {
+        // `nil` adopts `?T` from the let annotation.
+        let src = "fn main() -> i32 { let x: ?i32 = nil; return 0; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn nil_outside_optional_context_diagnoses() {
+        // Without a `?T` context, `nil` synthesises as Ty::Error and
+        // the surrounding check fires.
+        let src = "fn main() -> i32 { let x: i32 = nil; return x; }";
+        assert!(check(src) >= 1);
+    }
+
+    #[test]
+    fn coalesce_extracts_inner_type() {
+        // `(x ?? 0): i32` when `x: ?i32`.
+        let src = "fn main() -> i32 { let x: ?i32 = 7; return x ?? 0; }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn coalesce_rejects_non_optional_lhs() {
+        // `??` requires `?T` LHS.
+        let src = "fn main() -> i32 { let x: i32 = 7; return x ?? 0; }";
+        assert!(check(src) >= 1);
+    }
+
+    #[test]
+    fn coalesce_default_must_match_inner_type() {
+        // `?i32 ?? bool` rejects.
+        let src = "fn main() -> i32 { let x: ?i32 = nil; return x ?? true; }";
+        assert!(check(src) >= 1);
+    }
+
+    #[test]
+    fn optional_ty_displays_with_question_prefix() {
+        let ty = Ty::Optional(OptInner::Int(IntTy::I32));
+        assert_eq!(format!("{}", ty), "?i32");
+        let bool_opt = Ty::Optional(OptInner::Bool);
+        assert_eq!(format!("{}", bool_opt), "?bool");
+    }
+
+    #[test]
+    fn optional_does_not_coerce_to_inner_implicitly() {
+        // The reverse direction (`?T → T`) is rejected; the user must
+        // unwrap via `??` (or later `!` / `match`).
+        let src = "fn main() -> i32 { let x: ?i32 = 7; let y: i32 = x; return y; }";
+        assert!(check(src) >= 1);
     }
 
     /// Pre-A.4 a `[]u8` parameter rejected with UNSUPPORTED_CONSTRUCT.

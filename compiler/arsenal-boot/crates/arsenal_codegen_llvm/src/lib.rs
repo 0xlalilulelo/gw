@@ -253,7 +253,7 @@ struct LoweringCx<'ctx, 'a> {
 /// Mirrors `arsenal_codegen_fast::is_aggregate_ty` — same rule on both
 /// backends so the MIR-level ABI invariants stay aligned.
 fn is_aggregate_ty(ty: Ty) -> bool {
-    matches!(ty, Ty::Class(_) | Ty::Slice(_))
+    matches!(ty, Ty::Class(_) | Ty::Slice(_) | Ty::Optional(_))
 }
 
 /// Computed layout for a class or slice: total byte size, max-field
@@ -328,7 +328,27 @@ fn aggregate_layout(ty: Ty, prog: &MirProgram, ptr_bytes: u32) -> Option<Resolve
             align: ptr_bytes,
             offsets: vec![0, ptr_bytes],
         }),
+        Ty::Optional(inner) => Some(optional_layout(inner.to_ty(), ptr_bytes)),
         _ => None,
+    }
+}
+
+/// Phase 2 increment O.1: layout for `?T`. Tag at offset 0 (1 byte),
+/// payload at the inner's natural alignment, total size aligned to
+/// the inner's alignment. Matches the Cranelift backend exactly so
+/// the by-pointer ABI agrees byte-for-byte across backends.
+fn optional_layout(inner: Ty, ptr_bytes: u32) -> ResolvedClassLayout {
+    let (inner_size, inner_align) = primitive_size_align(inner, ptr_bytes);
+    let align = inner_align.max(1);
+    let payload_offset = align;
+    // Round size up to the alignment so two consecutive ?T values stack cleanly.
+    let raw_size = payload_offset + inner_size;
+    let mask = align.saturating_sub(1);
+    let size = (raw_size + mask) & !mask;
+    ResolvedClassLayout {
+        size,
+        align,
+        offsets: vec![0, payload_offset],
     }
 }
 
@@ -347,6 +367,11 @@ fn aggregate_field_ty(ty: Ty, field_idx: u32, prog: &MirProgram) -> Ty {
             .map(|f| f.ty)
             .unwrap_or(Ty::Error),
         Ty::Slice(_) => Ty::Int(IntTy::USize),
+        Ty::Optional(inner) => match field_idx {
+            0 => Ty::Int(IntTy::U8),
+            1 => inner.to_ty(),
+            _ => Ty::Error,
+        },
         _ => Ty::Error,
     }
 }
