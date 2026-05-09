@@ -1815,6 +1815,17 @@ fn synth_match<'a>(m: MatchExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     result_ty.unwrap_or(Ty::Error)
 }
 
+/// Recognise a bare `nil` literal expression (Phase 2 increment O.2).
+/// Used by `check_match_pattern`'s Optional-scrutinee arm. Recurses
+/// through parens for symmetry with `bool_literal_value`.
+fn is_nil_literal(expr: Expr<'_>) -> bool {
+    match expr {
+        Expr::Literal(l) => matches!(l.token_kind(), Some(SyntaxKind::KwNil)),
+        Expr::Paren(p) => p.inner().is_some_and(is_nil_literal),
+        _ => false,
+    }
+}
+
 /// Recognise a `true`/`false` literal expression. Used by `synth_match`'s
 /// bool-exhaustiveness check. Returns `None` for anything else (other
 /// literal kinds, parens, paths, …).
@@ -1850,6 +1861,39 @@ fn check_match_pattern<'a>(pat: Pattern<'a>, scrut_ty: Ty, cx: &mut Cx<'a, '_, '
             let Some(value) = lp.value() else {
                 return;
             };
+            // Phase 2 O.2: `nil` pattern against an `?T` scrutinee.
+            // Other literal kinds against `?T` reject (the user must
+            // wildcard-match the some side; binding patterns ride a
+            // later sub-bundle).
+            if matches!(scrut_ty, Ty::Optional(_)) {
+                if is_nil_literal(value) {
+                    cx.tm.expr_types.insert(NodePtr(value.syntax()), scrut_ty);
+                    return;
+                }
+                cx.diags.push(Diagnostic::error(
+                    ec::TYPE_MISMATCH,
+                    Label::new(lp.syntax().span, ""),
+                    format!(
+                        "only `nil` can match a `{scrut_ty}` scrutinee in Phase 2 (use `_` to match the some side)"
+                    ),
+                ));
+                return;
+            }
+            // `nil` outside an `?T` scrutinee makes no sense as a
+            // pattern; surface a TYPE_MISMATCH explicitly here so the
+            // diagnostic doesn't bubble through `synth_literal`'s
+            // "requires optional context" message in match-arm
+            // position.
+            if is_nil_literal(value) && scrut_ty != Ty::Error {
+                cx.diags.push(Diagnostic::error(
+                    ec::TYPE_MISMATCH,
+                    Label::new(lp.syntax().span, ""),
+                    format!(
+                        "`nil` pattern can't match scrutinee of type `{scrut_ty}` (only `?T` scrutinees accept `nil` patterns)"
+                    ),
+                ));
+                return;
+            }
             if matches!(scrut_ty, Ty::Int(_)) {
                 // Bidirectional narrowing handles bare `IntLit` and
                 // `Unary(Minus, IntLit)` shapes against the scrutinee
@@ -2508,6 +2552,46 @@ mod tests {
         // The reverse direction (`?T → T`) is rejected; the user must
         // unwrap via `??` (or later `!` / `match`).
         let src = "fn main() -> i32 { let x: ?i32 = 7; let y: i32 = x; return y; }";
+        assert!(check(src) >= 1);
+    }
+
+    // ─── Phase 2 increment O.2: ?T match patterns + nil arm ────────────────
+
+    #[test]
+    fn match_optional_with_nil_and_wildcard_typechecks() {
+        let src = "fn main() -> i32 {\n\
+                       let opt: ?i32 = nil;\n\
+                       return match opt { nil => 1, _ => 2 };\n\
+                   }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn match_optional_without_wildcard_diagnoses() {
+        // Optional scrutinee with only `nil` arm doesn't cover the
+        // some side; exhaustiveness rule fires.
+        let src = "fn main() -> i32 {\n\
+                       let opt: ?i32 = nil;\n\
+                       return match opt { nil => 1 };\n\
+                   }";
+        assert!(check(src) >= 1);
+    }
+
+    #[test]
+    fn match_optional_rejects_non_nil_literal_pattern() {
+        // `?i32` scrutinee + integer literal pattern: Phase 2 doesn't
+        // unwrap implicitly; user must wildcard the some side.
+        let src = "fn main() -> i32 {\n\
+                       let opt: ?i32 = 7;\n\
+                       return match opt { 7 => 1, _ => 2 };\n\
+                   }";
+        assert!(check(src) >= 1);
+    }
+
+    #[test]
+    fn nil_pattern_rejects_non_optional_scrutinee() {
+        // `nil` pattern only makes sense against `?T` scrutinees.
+        let src = "fn main() -> i32 { return match 5 { nil => 1, _ => 0 }; }";
         assert!(check(src) >= 1);
     }
 

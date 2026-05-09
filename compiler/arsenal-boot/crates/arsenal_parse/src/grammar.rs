@@ -965,14 +965,14 @@ fn parse_pattern_literal_value(p: &mut Parser<'_, '_, '_>) {
         p.builder.finish_node(end);
     } else if matches!(
         p.current(),
-        TokenKind::IntLit | TokenKind::KwTrue | TokenKind::KwFalse
+        TokenKind::IntLit | TokenKind::KwTrue | TokenKind::KwFalse | TokenKind::KwNil
     ) {
         p.builder.start_node(SyntaxKind::LiteralExpr, start);
         p.bump_any();
         let end = p.cur_byte_start();
         p.builder.finish_node(end);
     } else {
-        p.unexpected("integer literal, `true`, `false`, or `-IntLit` in pattern");
+        p.unexpected("integer literal, `true`, `false`, `nil`, or `-IntLit` in pattern");
     }
 }
 
@@ -997,7 +997,11 @@ fn parse_match_pattern_atom(p: &mut Parser<'_, '_, '_>) {
             let end = p.cur_byte_start();
             p.builder.finish_node(end);
         }
-        TokenKind::IntLit | TokenKind::Minus | TokenKind::KwTrue | TokenKind::KwFalse => {
+        TokenKind::IntLit
+        | TokenKind::Minus
+        | TokenKind::KwTrue
+        | TokenKind::KwFalse
+        | TokenKind::KwNil => {
             // Parse the literal value as a *literal-only* expression
             // — `parse_expr` here would consume `|` as bitwise OR
             // (binding power 9), stealing the alternation token from
@@ -1006,6 +1010,9 @@ fn parse_match_pattern_atom(p: &mut Parser<'_, '_, '_>) {
             // After the literal, if `..=` follows, the whole atom is
             // a `RangePat` (the literal is its lower bound); else
             // wrap as `LiteralPat`.
+            //
+            // O.2: `nil` joins `KwTrue` / `KwFalse` as a literal-only
+            // shape (the typeck accepts it only against `?T` scrutinees).
             let cp = p.builder.checkpoint();
             parse_pattern_literal_value(p);
             if p.at(TokenKind::DotDotEq) {

@@ -1,0 +1,13 @@
+fn main() -> i32 {
+    let some_val: ?i32 = 42;
+    let none_val: ?i32 = nil;
+    let a: i32 = match some_val {
+        nil => 1,
+        _ => 2,
+    };
+    let b: i32 = match none_val {
+        nil => 1,
+        _ => 2,
+    };
+    return a * 10 + b;
+}

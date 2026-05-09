@@ -1817,6 +1817,32 @@ fn lower_match<'a>(
     }
 }
 
+/// Phase 2 increment O.2: recognise a `nil` pattern value. Mirrors
+/// typeck's `is_nil_literal` helper.
+fn pattern_value_is_nil(expr: Expr<'_>) -> bool {
+    match expr {
+        Expr::Literal(l) => matches!(l.token_kind(), Some(SyntaxKind::KwNil)),
+        Expr::Paren(p) => p.inner().is_some_and(pattern_value_is_nil),
+        _ => false,
+    }
+}
+
+/// Phase 2 increment O.2: ensure `scrut_op` references a `Local` so
+/// `Rvalue::Field` can read the tag byte. For non-Local operands
+/// (rare — typeck-rejected paths), allocate an aggregate temp and
+/// copy the operand into it via the existing aggregate-Assign path.
+fn ensure_scrut_local(b: &mut Builder, scrut_op: &Operand, scrut_ty: Ty, span: Span) -> Local {
+    if let Operand::Local(l) = scrut_op {
+        return *l;
+    }
+    let tmp = b.alloc_local(LocalDecl { ty: scrut_ty, span });
+    b.push_stmt(MirStmt::Assign {
+        dst: tmp,
+        value: Rvalue::Use(scrut_op.clone()),
+    });
+    tmp
+}
+
 /// Phase 2 increments M.1 / M.3: lower one match-arm pattern test.
 /// Emits whatever comparison/branch sequence is needed; the cursor
 /// ends at `next_bb` (the no-match continuation), and a successful
@@ -1838,6 +1864,48 @@ fn lower_pattern_test<'a>(
             b.cur = next_bb;
         }
         Pattern::Literal(lp) => {
+            // Phase 2 O.2: `nil` pattern on `?T` scrutinee reads the
+            // tag byte and tests `tag == 0`. Lowering the value via
+            // `lower_expr` would build a fresh nil-aggregate and try
+            // to compare aggregates, which has no MIR/codegen op.
+            if matches!(scrut_ty, Ty::Optional(_)) && lp.value().is_some_and(pattern_value_is_nil) {
+                let scrut_local = ensure_scrut_local(b, scrut_op, scrut_ty, span);
+                let tag_local = b.alloc_local(LocalDecl {
+                    ty: Ty::Int(IntTy::U8),
+                    span,
+                });
+                b.push_stmt(MirStmt::Assign {
+                    dst: tag_local,
+                    value: Rvalue::Field {
+                        base: scrut_local,
+                        field_idx: 0,
+                        field_ty: Ty::Int(IntTy::U8),
+                    },
+                });
+                let cmp_local = b.alloc_local(LocalDecl { ty: Ty::Bool, span });
+                b.push_stmt(MirStmt::Assign {
+                    dst: cmp_local,
+                    value: Rvalue::BinOp {
+                        op: BinOp::Eq,
+                        ty: Ty::Int(IntTy::U8),
+                        lhs: Operand::Local(tag_local),
+                        rhs: Operand::Const(Const::Int {
+                            value: 0,
+                            ty: IntTy::U8,
+                        }),
+                    },
+                });
+                b.set_terminator(
+                    b.cur,
+                    Terminator::Branch {
+                        cond: Operand::Local(cmp_local),
+                        then_bb: body_bb,
+                        else_bb: next_bb,
+                    },
+                );
+                b.cur = next_bb;
+                return;
+            }
             let pat_val_op = match lp.value() {
                 Some(e) => lower_expr(b, e, lcx),
                 None => Operand::Const(Const::Error),
