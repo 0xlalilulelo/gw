@@ -2,24 +2,26 @@
 
 This document is the entry point for the next development session. Read it first.
 
-> **Last updated:** after Phase-2 increments cleanup #1 / C.1 / C.2 (the
-> first c-strings surface lands; `[*:0]u8` is now the spec-correct type
-> for `c"..."` literals and decays to `*u8` at extern call sites).
+> **Last updated:** after Phase-2 increments M.1 / M.2 / M.3 (the
+> match sub-bundle: literal-int + wildcard, then bool exhaustive +
+> statement-position, then inclusive ranges + or-patterns).
 > **Repo root:** `/Users/silmaril/Documents/GitHub/gw`
-> **Workspace test count:** 159 unit + integration tests, all green.
-> **Corpus size:** 61 Phase-0 lex+parse snapshots + 230 Phase-1 / Phase-2 run-tests.
+> **Workspace test count:** 174 unit + integration tests, all green.
+> **Corpus size:** 61 Phase-0 lex+parse snapshots + 238 Phase-1 / Phase-2 run-tests.
 > **Phase 1 exit gate met** (200-program target hit at 12h; the post-exit
 > follow-up A.1–A.4 added 26 more, for 226 total).
 > **Phase 13 (LLVM backend) complete** — `arsenal build --backend=llvm`
 > compiles and runs every program in the corpus, matching Cranelift exit
 > codes and stdout bit-exactly. Both backends ship in the same workspace;
 > `--backend=fast` (Cranelift) remains the default.
-> **Phase 2 entry started** — c-strings sub-bundle (C.1 + C.2) shipped.
-> Three c-string corpus programs run through both backends; `c"..."`
-> literals type as `[*:0]u8`, lower via a new `Const::CStrAddr` MIR
-> variant against a parallel `cstring_literals` table, and decay to
-> `*u8` at extern fn boundaries. Cleanup #1 (default `-> u0` on missing
-> return type) shipped alongside.
+> **Phase 2 entry in progress** — c-strings sub-bundle (C.1 + C.2)
+> closed first; the match sub-bundle (M.1 + M.2 + M.3) closed
+> next. `match scrutinee { lit => ..., true => ..., false => ...,
+> 0..=9 => ..., 1 | 2 | 3 => ..., _ => ... }` lowers through a
+> recursive `lower_pattern_test` decision-tree helper, agrees
+> bit-exactly across both backends, and exercises eight new corpus
+> programs. Cleanup #1 (default `-> u0` on missing return type)
+> shipped alongside C.1.
 
 ---
 
@@ -64,20 +66,28 @@ Bug yield across the bundle: zero — neither backend disagreed about
 saturating fcvt, ordered float comparisons, sign-aware integer ops,
 or the System V "memory class" aggregate ABI.
 
-The Phase-2 entry (C.1 + C.2) brings c-strings end-to-end. `c"..."`
-literals lex / parse / typeck / MIR / Cranelift / LLVM; `[*:0]u8` is
-a parsed-and-type-system-distinct sentinel pointer that decays to
-`*u8` at extern call sites and at `let` annotations. Three corpus
-programs exercise the full surface (helper-fn taking `[*:0]u8`,
-escapes round-trip, sentinel-ptr-typed local). Cleanup #1 dropped
-the explicit-return-type requirement so unit-returning helpers
-(`fn greet(s: [*:0]u8) { puts(s); }`) can elide `-> u0`.
+The Phase-2 entry brings c-strings (C.1 + C.2) and `match` (M.1 +
+M.2 + M.3) end-to-end. `c"..."` literals lex / parse / typeck / MIR
+/ Cranelift / LLVM; `[*:0]u8` is a parsed-and-type-system-distinct
+sentinel pointer that decays to `*u8` at extern call sites and at
+`let` annotations. `match` accepts integer-literal, bool-literal,
+inclusive-range (`lo..=hi`), or-pattern (`a | b | c`), and wildcard
+forms; arms unify against a single result type, exhaustiveness
+requires either a `_` arm or (for bool) both `true` + `false` arms.
+The MIR-side decision-tree helper `lower_pattern_test` recurses for
+or-patterns and emits short-circuit pairs for ranges. Eleven new
+corpus programs exercise the full Phase-2-entry surface across both
+backends. Cleanup #1 dropped the explicit-return-type requirement so
+unit-returning helpers (`fn greet(s: [*:0]u8) { puts(s); }`) can
+elide `-> u0`.
 
 **Phase 0 is complete. Phase 1 is functionally complete. Phase 13 is
-complete. Phase 2 is in progress** (c-strings sub-bundle landed; the
-remaining sub-bundles are `match`, error unions / optionals, and
-comptime / modules — see the [After Phase 1](#after-phase-1) section
-below). The tactical-cleanup list under [What doesn't work yet](#what-doesnt-work-yet-phase-1-deferred-or-incomplete)
+complete. Phase 2 is in progress** (c-strings + match sub-bundles
+landed; the remaining sub-bundles are error unions / optionals
+(`!T` / `?T`) and comptime / modules — see the
+[After Phase 1](#after-phase-1) section below). The tactical-cleanup
+list under
+[What doesn't work yet](#what-doesnt-work-yet-phase-1-deferred-or-incomplete)
 shrinks accordingly.
 
 ---
@@ -132,16 +142,16 @@ gw/
 └── .github/workflows/ci.yml      (Linux/macOS/Windows matrix)
 ```
 
-### Active crate roles (≈6 700 LoC of compiler logic)
+### Active crate roles (≈7 000 LoC of compiler logic)
 
 | Crate | Phase | Role |
 |---|---|---|
 | `arsenal_lex` | 0 | UTF-8 lexer state machine. 108-variant `TokenKind`, phf keyword table, `Span`/`SourceMap`/`Diagnostic`/`DiagBag` types. |
-| `arsenal_ast` | 0 | Hand-rolled rowan-style CST + typed AST. Single unified `SyntaxKind` enum (188 variants). Typed views for ~34 Phase-1 / Phase-2 node kinds; `Stub` variants for the rest. `Module::stmts()` exposes top-level stmts (11a). `CastExpr` typed view added in A.1. **`SentinelPtrType` typed view (C.2)** with `element()` + `sentinel()` accessors. Bumpalo arena per file. Pretty-printer for `arsenal dump`. |
-| `arsenal_parse` | 0 | Recursive-descent + Pratt expression precedence. Error-recovering. Produces both CST and AST. No parser generator. `parse_module` forks on `peek_item_keyword` between item and stmt (11a). `parse_type` handles `*T` / `[]T` / `&T` / `?T` / `[N]T` / **`[*:S]T` (C.2 — sentinel many-pointer; peek-at-1 of `Star` distinguishes from slice / array)**. **Postfix `as Type` (A.1)** at left binding power 22 — between `*`/`/`/`%` (19/20) and prefix unary (23), matching Rust precedence so `-1 as u32` parses as `(-1) as u32`. |
+| `arsenal_ast` | 0 | Hand-rolled rowan-style CST + typed AST. Single unified `SyntaxKind` enum (189 variants — `RangePat` added in M.3). Typed views for ~38 Phase-1 / Phase-2 node kinds; `Stub` variants for the rest. `Module::stmts()` exposes top-level stmts (11a). `CastExpr` typed view added in A.1. **`SentinelPtrType` typed view (C.2)** with `element()` + `sentinel()` accessors. **`Expr::Match` (M.1)** + `MatchExpr::scrutinee()` / `arms()`, `MatchArmList::arms()`, `MatchArm::pattern()` / `body()`. **`Pattern::Literal` (M.1) / `Range` (M.3) / `Or` (M.3)** promoted from `Stub`; views expose `value()` / `lo()` + `hi()` / `alternatives()` respectively. Bumpalo arena per file. Pretty-printer for `arsenal dump`. |
+| `arsenal_parse` | 0 | Recursive-descent + Pratt expression precedence. Error-recovering. Produces both CST and AST. No parser generator. `parse_module` forks on `peek_item_keyword` between item and stmt (11a). `parse_type` handles `*T` / `[]T` / `&T` / `?T` / `[N]T` / **`[*:S]T` (C.2 — sentinel many-pointer; peek-at-1 of `Star` distinguishes from slice / array)**. **Postfix `as Type` (A.1)** at left binding power 22 — between `*`/`/`/`%` (19/20) and prefix unary (23), matching Rust precedence so `-1 as u32` parses as `(-1) as u32`. **Match (M.1–M.3)**: `parse_match_expr` invoked from `parse_primary` on `KwMatch`; scrutinee parsed with `struct_literals_allowed = false`. New `parse_match_pattern` separate from `parse_pattern` (used by `let` / `for in`) — match-arm patterns accept `_` / `Ident` / `IntLit` / `Minus IntLit` / `KwTrue` / `KwFalse` / `lo..=hi` / `a \| b \| c` chains; the literal-side parsing uses a custom `parse_pattern_literal_value` instead of `parse_expr` so `\|` (bp 9, bitwise OR) and `..=` stay available for the pattern grammar. Or-pattern wrapping uses `start_node_at` checkpoint; range-pattern wrapping uses the same trick. |
 | `arsenal_resolve` | 1 | Walks the AST, registers top-level fn + class defs, exports `primitive_type_name()`. `DefKind::SyntheticMain` is registered when top-level stmts coexist without explicit `fn main` (11a). |
-| `arsenal_typeck` | 1 / 2 | Bidirectional checker. `Ty` enum: `U0`/`Bool`/`Int(IntTy)`/`Float(FloatTy)`/`Rune`/`Class(DefId)`/`Slice(IntTy)`/`Ptr(IntTy)`/**`SentinelPtr { elem: IntTy, sentinel: u64 }` (C.2)**/`Error`. Emits a `TypedModule` with per-CST-node `expr_types`, `path_bindings`, `pat_bindings`, `call_targets`, `sigs`, `classes`. Slice + raw-pointer surface (11b/11c) are FFI-restricted; sentinel-pointer surface (C.2) is *not* — `[*:0]u8` flows through non-extern fn signatures because the producer-side sentinel guarantee gives the safety raw `*T` lacks. **Bidirectional literal narrowing (12d/12h)**: `check_expr` calls `try_narrow_literal` first — bare `IntLit`/`FloatLit`, `Unary(Minus, Literal)`, and `Paren(...)` shapes adopt the expected width when the value fits; out-of-range diagnoses against the literal span. `synth_binop_operands` extends the same rule across binary operators so `n < 2` (with `n: i64`) types cleanly. **`synth_cast` (A.1/A.2)** accepts the full numeric matrix `(Int\|Float, Int\|Float)`; non-numeric pairs reject with `UNSUPPORTED_CONSTRUCT`. **Class-/slice-typed fn params and returns (A.3/A.4)** are accepted via the by-pointer ABI; the `UNSUPPORTED_CONSTRUCT` rejections in `check_fn_signature` were dropped. **C.1 / C.2**: `synth_literal` types `c"..."` as `Ty::SentinelPtr { U8, 0 }`; `ty_assignable` adds the lone coercion `[*:S]T → *T` so the C.1 tracer's `puts(c"hi")` shape works without an explicit cast; missing return type defaults to `Ty::U0` (cleanup #1) instead of diagnosing — error code 307 is retired. |
-| `arsenal_mir` | 1 / 2 | CFG of basic blocks; primitive locals + aggregate stack-slot locals (class + slice); `Assign`/`AssignField` statements; `Use`/`BinOp`/`UnOp`/`Field`/`Cast` rvalues; `Goto`/`Branch`/`Return`/`Call`/`Unreachable` terminators. Loop-target stack for break/continue. `lower_for` desugar. `Const::DataAddr` + program-level `string_literals` table for `.rodata` payloads (11b). Implicit Print at stmt-position string lits desugars to `write(1, slice.data, slice.len)`; auto-injects `extern fn write` if user didn't declare one (11c). **Short-circuit `&&` / `\|\|` (12b)**: `lower_short_circuit` emits a 3-block control-flow shape (rhs-eval / short-circuit / join) and bypasses `lower_binary` so the RHS is only evaluated when the LHS doesn't determine the result. **`Rvalue::Cast` (A.1/A.2)** carries `kind: CastKind`, `operand`, `src_ty`, `dst_ty`; the closed `CastKind` enum has 7 variants, each maps to one Cranelift op. `select_cast_kind` factors the kind selection out of `lower_cast`. **`def_to_fn` fix (A.3)**: pre-A.3 the map stored each def's position in `resolved.defs` (including class defs); A.3 only counts `Fn`/`SyntheticMain` defs when assigning indices, matching the order `functions` is populated. **C.1 / C.2**: `Const::CStrAddr(CStrLitId)` + program-level `cstring_literals` table parallel to `string_literals` (no shared dedup keys — slice payloads and c-string payloads carry different semantics). `lower_cstring_literal` interns the decoded bytes (no NUL terminator stored — codegen appends it) and returns the operand directly without materialising a slice aggregate. |
+| `arsenal_typeck` | 1 / 2 | Bidirectional checker. `Ty` enum: `U0`/`Bool`/`Int(IntTy)`/`Float(FloatTy)`/`Rune`/`Class(DefId)`/`Slice(IntTy)`/`Ptr(IntTy)`/**`SentinelPtr { elem: IntTy, sentinel: u64 }` (C.2)**/`Error`. Emits a `TypedModule` with per-CST-node `expr_types`, `path_bindings`, `pat_bindings`, `call_targets`, `sigs`, `classes`. Slice + raw-pointer surface (11b/11c) are FFI-restricted; sentinel-pointer surface (C.2) is *not* — `[*:0]u8` flows through non-extern fn signatures because the producer-side sentinel guarantee gives the safety raw `*T` lacks. **Bidirectional literal narrowing (12d/12h)**: `check_expr` calls `try_narrow_literal` first — bare `IntLit`/`FloatLit`, `Unary(Minus, Literal)`, and `Paren(...)` shapes adopt the expected width when the value fits; out-of-range diagnoses against the literal span. `synth_binop_operands` extends the same rule across binary operators so `n < 2` (with `n: i64`) types cleanly. **`synth_cast` (A.1/A.2)** accepts the full numeric matrix `(Int\|Float, Int\|Float)`; non-numeric pairs reject with `UNSUPPORTED_CONSTRUCT`. **Class-/slice-typed fn params and returns (A.3/A.4)** are accepted via the by-pointer ABI; the `UNSUPPORTED_CONSTRUCT` rejections in `check_fn_signature` were dropped. **C.1 / C.2**: `synth_literal` types `c"..."` as `Ty::SentinelPtr { U8, 0 }`; `ty_assignable` adds the lone coercion `[*:S]T → *T` so the C.1 tracer's `puts(c"hi")` shape works without an explicit cast; missing return type defaults to `Ty::U0` (cleanup #1) instead of diagnosing — error code 307 is retired. **Match (M.1–M.3)**: `synth_match` synthesises the scrutinee, validates each arm's pattern via `check_match_pattern`, unifies arm bodies (first non-Error arm sets the result type, subsequent arms are checked against it). `check_match_pattern` accepts wildcards everywhere, integer-typed literal patterns + integer ranges (`Range`) when scrutinee is `Ty::Int(_)` (re-using the bidirectional narrowing for both bounds), `true`/`false` patterns when scrutinee is `Ty::Bool`, and `Or` patterns by recursing on each alternative. Exhaustiveness rule: every `match` requires either a `_` arm or — for bool scrutinees — both `true` and `false` literal patterns at top-level arms. Identifier patterns and other shapes still diagnose with UNSUPPORTED_CONSTRUCT until later widenings. |
+| `arsenal_mir` | 1 / 2 | CFG of basic blocks; primitive locals + aggregate stack-slot locals (class + slice); `Assign`/`AssignField` statements; `Use`/`BinOp`/`UnOp`/`Field`/`Cast` rvalues; `Goto`/`Branch`/`Return`/`Call`/`Unreachable` terminators. Loop-target stack for break/continue. `lower_for` desugar. `Const::DataAddr` + program-level `string_literals` table for `.rodata` payloads (11b). Implicit Print at stmt-position string lits desugars to `write(1, slice.data, slice.len)`; auto-injects `extern fn write` if user didn't declare one (11c). **Short-circuit `&&` / `\|\|` (12b)**: `lower_short_circuit` emits a 3-block control-flow shape (rhs-eval / short-circuit / join) and bypasses `lower_binary` so the RHS is only evaluated when the LHS doesn't determine the result. **`Rvalue::Cast` (A.1/A.2)** carries `kind: CastKind`, `operand`, `src_ty`, `dst_ty`; the closed `CastKind` enum has 7 variants, each maps to one Cranelift op. `select_cast_kind` factors the kind selection out of `lower_cast`. **`def_to_fn` fix (A.3)**: pre-A.3 the map stored each def's position in `resolved.defs` (including class defs); A.3 only counts `Fn`/`SyntheticMain` defs when assigning indices, matching the order `functions` is populated. **C.1 / C.2**: `Const::CStrAddr(CStrLitId)` + program-level `cstring_literals` table parallel to `string_literals` (no shared dedup keys — slice payloads and c-string payloads carry different semantics). `lower_cstring_literal` interns the decoded bytes (no NUL terminator stored — codegen appends it) and returns the operand directly without materialising a slice aggregate. **Match (M.1–M.3)**: `lower_match` allocates `body_bb` + `next_bb` per arm, calls the recursive `lower_pattern_test` helper, lowers the body in `body_bb`, restores cursor to `next_bb` for the next arm. `lower_pattern_test` emits `Goto(body_bb)` for wildcards, `cmp = Eq; Branch` for literals, two short-circuit `Ge` / `Le` tests for inclusive ranges, and recursive chains (each alternative threads through a fresh `alt_next_bb`) for or-patterns. The chain-of-Branch shape is the same control flow already used by short-circuit `&&` / `\|\|`, so codegen needs zero new arms across the entire match sub-bundle. |
 | `arsenal_codegen_fast` | 1 / 2 | Cranelift-backed (placeholder until Phase 7 TPDE port). Aggregate (class + slice) layouts → stack slots; field reads/writes → stack_load/stack_store; aggregate-aggregate assigns → field-by-field copy. String literals materialised via `module.declare_data` + `define_data_object` under `__gw_str_<i>` symbols (11b). `*T` raw pointers lower as pointer-sized scalars (11c). **Float comparisons (12a)**: `lower_binop` branches on `ty.is_float()` for `Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge` — floats use `fcmp` with the matching `FloatCC`, ints keep `icmp`. **Cast lowering (A.1/A.2)**: `Rvalue::Cast` arm reads operand at `clif_ty(src_ty)` and applies one Cranelift op per `CastKind` — `sextend`/`uextend`/`ireduce` for ints, `fcvt_from_sint`/`fcvt_from_uint` and saturating `fcvt_to_*_sat` for int↔float, `fpromote`/`fdemote` for floats. Same-width `*Bitcast` variants need no instruction. **Aggregate-by-pointer ABI (A.3/A.4)**: `make_signature` prepends a hidden out-pointer for aggregate returns and substitutes pointer-typed `AbiParam` for aggregate params. `define_fn` defers the entry-block switch until the lower-block loop's first iteration to keep Cranelift's "fill before switching" rule satisfied; aggregate params copy in via `copy_aggregate_from_ptr`, and `Terminator::Return` for an aggregate-returning fn copies out through `copy_aggregate_to_ptr`. `Terminator::Call` prepends `stack_addr(dst_slot)` for aggregate returns and substitutes `stack_addr` for aggregate args. **C.1**: parallel `__gw_cstr_<i>` rodata pass — payload is `bytes ++ "\0"`; `Const::CStrAddr` lowers via `module.declare_data_in_func` + `ins.global_value` exactly like `Const::DataAddr`. **C.2**: explicit `Ty::SentinelPtr { .. }` arms in `clif_ty` / `primitive_size_align` route to pointer-width — same shape as `Ty::Ptr`. |
 | `arsenal_codegen_llvm` | 13 / 2 | LLVM-18-backed via `inkwell` (B.1–B.5). Same `MirProgram → object bytes` contract as `arsenal_codegen_fast` — driver picks at `--backend=fast\|llvm`. Storage: alloca-per-local in the entry block (clang `-O0` style), `[N x i8]` allocas for aggregates with alignment bumped to the layout's max-field align via `InstructionValue::set_alignment`. Field addressing via byte-offset GEP through `i8` (opaque pointers; no struct types declared to LLVM). Bool stays at LLVM `i1` end-to-end (no i8 storage adapter). Float comparisons use ordered predicates (`OEQ`/`OLT`/etc.); float-→int casts route through the saturating `llvm.fpto{si,ui}.sat` intrinsics for Rust ≥ 1.45 / Cranelift parity. `Const::Float` lowers via `build_bit_cast(int_const, float_ty)` to preserve NaN payloads (a `const_float(f64)` round-trip would lose them on the F32 path). String literals materialise as one private `__gw_str_<i>` global per `MirProgram::string_literals` entry; `Const::DataAddr(id)` returns the global's address as `ptr`. Aggregate ABI: hidden out-pointer for aggregate returns; by-pointer for aggregate user params. `sret`/`byval` attributes intentionally omitted — corpus aggregates flow only between GW fns, plain-`ptr` agrees with Cranelift's manual `stack_addr` convention end-to-end. A small `build.rs` adds Homebrew's `lib` prefix to the linker search path on macOS so LLVM-18's system-libs (zstd, ffi, xml2, curses) resolve without `RUSTFLAGS` rituals. **C.1**: parallel pass for c-string globals — one private `__gw_cstr_<i>` per `MirProgram::cstring_literals` entry, payload `bytes ++ "\0"`; `Const::CStrAddr` returns the global's `as_pointer_value()`. **C.2**: explicit `Ty::SentinelPtr { .. }` arm in `llvm_basic_type` routes to opaque `ptr` — agrees with Cranelift's bit-exact output across all three c-string corpus programs. |
 | `arsenal_driver` | 0/1 | Subcommands: `arsenal new <name>`, `arsenal build [--backend=fast\|llvm] <file.gw>`, `arsenal dump <path>`, `arsenal --version`. Build pipeline: lex → parse → resolve → typeck → MIR → (Cranelift OR LLVM) → object → `cc` link → executable. `--backend=fast` is the default; both backends emit the same `Vec<u8>` object-bytes shape so the linker invocation is shared. |
@@ -186,6 +196,9 @@ Each increment shipped one or more corpus programs and a single commit.
 | cleanup #1 | default `-> u0` on missing return type | `e394571` | (no corpus add) | typeck `check_fn_signature` defaults the return type to `Ty::U0` instead of emitting MISSING_RETURN_TYPE (error code 307 retired); +2 typeck unit tests | 0 |
 | C.1 | c-string tracer bullet | `1e8752c` | +1 (227) | typeck `synth_literal` for `CStringLit` returns `Ty::Ptr(IntTy::U8)` (provisional, retyped in C.2); MIR `Const::CStrAddr(CStrLitId)` + `MirProgram::cstring_literals` parallel table; `lower_cstring_literal` / `decode_cstring_literal` (delegates escape handling to the existing `decode_string_literal`); both backends gain a `__gw_cstr_<i>` rodata pass with `bytes ++ "\0"` payload; `Const::CStrAddr` lowers identically to `Const::DataAddr`; +2 typeck and +2 MIR unit tests | 0 |
 | C.2 | `[*:0]u8` sentinel pointer type | `bd3cf5d` | +3 (228–230) | parser `[*:S]T` arm (peek-at-1 of `Star` distinguishes from slice / array); AST `Type::SentinelPtr(SentinelPtrType)` view promoted from `Stub`; `Ty::SentinelPtr { elem, sentinel }` (Phase 2 only realises `[*:0]u8`); `synth_literal` retypes `c"..."` from `*u8` to `[*:0]u8`; `ty_assignable` adds the lone coercion `[*:S]T → *T` so the C.1 tracer's `puts(c"hi")` shape works without explicit cast; both backends gain explicit `Ty::SentinelPtr { .. }` arms routing to pointer-width; +5 typeck unit tests | 0 |
+| M.1 | match (literal int + wildcard) | `183e5b8` | +3 (231–233) | parser `parse_match_expr` invoked from `parse_primary` on `KwMatch`, scrutinee parsed with `struct_literals_allowed = false`; new `parse_match_pattern` separate from `parse_pattern` to keep `let 5 = …` rejected; `Expr::Match` + `Pattern::Literal` AST views promoted from `Stub`; typeck `synth_match` + `check_match_pattern` (integer-literal patterns + wildcard, exhaustiveness rule); MIR `lower_match` as chain of equality compares (one Eq + Branch per non-wildcard arm; wildcard contributes only a Goto); +5 typeck and +1 MIR unit tests | 0 |
+| M.2 | bool match + statement-position match | `7d9c04d` | +2 (234–235) | parser `parse_match_pattern` accepts `KwTrue` / `KwFalse` as start tokens for `LiteralPat`; typeck `check_match_pattern` adds bool-scrutinee arm; `synth_match` tracks `has_true` / `has_false` so `match b { true => ..., false => ... }` is exhaustive without `_`; statement-position match works without further plumbing (existing `lower_expr_stmt → lower_expr → lower_match` path; `result_local` already short-circuits on `Ty::U0`); +4 typeck unit tests | 0 |
+| M.3 | match range + or-patterns | `2d85e65` | +3 (236–238) | new `RangePat` SyntaxKind; AST `Pattern::Range(RangePat)` + `Pattern::Or(OrPat)` promoted from `Stub`; parser `parse_match_pattern` reads atoms separated by `\|` (wraps in `OrPat` via checkpoint), retroactively wraps a literal in `RangePat` if `..=` follows; new `parse_pattern_literal_value` helper avoids `parse_expr`'s Pratt operators stealing `\|` / `..=` from the pattern grammar; typeck `check_match_pattern` adds `Range` (integer scrutinee, both bounds narrow via `check_expr`) and `Or` (recurses on each alternative); MIR refactors into recursive `lower_pattern_test` helper — `Range` emits two short-circuit `Ge` + `Le` tests, `Or` chains alternatives through fresh `alt_next_bb`s, the helper centralises the "cursor ends at next_bb" invariant so `lower_match` shrinks; +5 typeck unit tests | 0 |
 
 **Key pattern**: each "0 bugs" increment was almost pure corpus growth (the
 plumbing was already in place). Each "≥1 bug" increment caught real
@@ -226,11 +239,24 @@ variants, that there was nowhere for a divergence to live. This
 extends the Phase-13 pattern: when the *value-level* lowering of a
 shape-novel feature is identical to an already-validated one (here:
 `*T` and `[*:0]u8` both lower to opaque `ptr`), bug yield collapses
-toward zero even when the *type-level* shape is new. Weight future
-sub-bundles' predicted yield by how much value-level novelty they
-introduce, not just how much surface novelty.
+toward zero even when the *type-level* shape is new.
 
-### What 230 corpus programs cover
+The match sub-bundle (M.1 + M.2 + M.3) repeats the result. Pre-bundle
+prediction was ~2 across the three sub-bundles (M.1 introduces
+decision-tree lowering; M.3 introduces inclusive-range bounds and
+or-pattern alternation, both shape-novel for MIR). Observed yield:
+zero. Same explanation: the *value-level* lowering reuses the
+chain-of-Branch shape already validated by short-circuit `&&` / `||`
+(12b), so the dual-backend test had nothing new to disagree about.
+
+Phrased as an updated heuristic: weight future sub-bundles' predicted
+bug yield by how much *value-level novelty* they introduce, not just
+how much *surface novelty*. Phase 2's harder remaining sub-bundles
+(`!T`/`?T`, comptime + modules) introduce new value-level shapes —
+tag bytes for tagged unions, comptime evaluator state, multi-file
+build orchestration — and should re-arm the prediction.
+
+### What 238 corpus programs cover
 
 - Phase-0 syntax: every TokenKind variant, every operator precedence
   level, every supported statement form.
@@ -280,6 +306,19 @@ introduce, not just how much surface novelty.
   signature (uses cleanup #1's `-> u0` default to elide the return
   type); escapes round-trip (`\t`, `\\`, `\"`, etc.) decoded via the
   shared `decode_string_literal` after `c"` prefix strip.
+- Phase 2 increment M.1 / M.2 / M.3 surface: `match scrutinee {
+  pattern => expr, ... }` at expression and statement position;
+  pattern shapes accepted are wildcards (`_`), bare integer
+  literals (`0`, `42`), negated integer literals (`-3`), boolean
+  literals (`true` / `false`), inclusive ranges (`0..=9`), and
+  top-level or-patterns chaining the above (`1 | 2 | 3`,
+  `0..=9 | 100..=109`); exhaustiveness rule requires either a
+  wildcard arm or — for bool scrutinees — both `true` and `false`
+  literal patterns at top-level arms. Decision-tree lowering
+  emits `cmp = Eq; Branch` per literal arm, two short-circuit
+  `Ge` / `Le` compares per range arm, and recursive chains for
+  or-patterns (each alternative tested in series, all sharing the
+  same body block).
 - Phase 1 follow-up A.1–A.4 surface: postfix `as Type` at Rust-style
   precedence; the full numeric cast matrix (int↔int with widen / trunc /
   signedness reinterpret; int↔float with signedness-aware fcvt;
@@ -355,6 +394,30 @@ fn main() -> i32 {
 `*u8` at the `puts(s)` call site, the helper fn `greet` elides its
 return type via cleanup #1's `-> u0` default. Both backends compile
 this program to the same `first\nsecond\n` output.
+
+The Phase-2 match surface (M.1 + M.2 + M.3) brings every supported
+pattern shape together:
+
+```gw
+fn classify(x: i32) -> i32 {
+    return match x {
+        0..=9 | 100..=109 => 1,
+        50 | 60 | 70 => 2,
+        -1 => 3,
+        _ => 0,
+    };
+}
+
+fn main() -> i32 {
+    return classify(105);
+}
+```
+
+Exit code: 1. The match desugars to a chain of compare+branch
+sequences — two range tests (each two compares) for the first arm,
+three equality tests for the second, one equality test for `-1`,
+and a final `Goto` for the wildcard. Both backends produce
+bit-exactly the same value across all 238 corpus programs.
 
 ### Driver UX
 
@@ -698,6 +761,41 @@ session start before changing them.
     pointer-width / opaque `ptr` via explicit arms in `clif_ty`
     / `llvm_basic_type` / `primitive_size_align`; MIR sees no
     new shape (the Operand path is just `Const::CStrAddr`).
+32. **Match patterns parse with a custom literal helper, not
+    `parse_expr`** (M.1 / M.3) — `parse_match_pattern_atom` calls a
+    new `parse_pattern_literal_value` that emits exactly one of
+    `IntLit` / `Minus IntLit` / `KwTrue` / `KwFalse`, with no Pratt
+    operators in the middle. Reusing `parse_expr` would let `|`
+    (bp 9, bitwise OR) and `..=` (range op) fall inside the literal
+    expression's parse tree, stealing the alternation token from
+    the pattern grammar (`a | b | c`) and the range token from the
+    range-pattern wrapper (`0..=9`). Two parsers are kept separate
+    for the same reason `parse_match_pattern` is separate from
+    `parse_pattern` (used by `let` / `for in`): widening one
+    surface shouldn't silently widen the other.
+33. **Match exhaustiveness rule** (M.1 / M.2) — every `match`
+    requires either a `_` arm OR (for `Ty::Bool` scrutinees) both
+    `true` and `false` literal patterns at top-level arms. Integer
+    scrutinees always need a wildcard because the domain is too
+    large to enumerate; bool's two-value domain accepts the
+    explicit-coverage form. Or-patterns of literals (`true | false
+    => …` as a single arm) are *not* counted toward bool
+    exhaustiveness in M.3 — the user can write `_ =>` if they want
+    one-arm coverage. Identifier patterns and other non-literal /
+    non-wildcard / non-range / non-or patterns still diagnose
+    UNSUPPORTED_CONSTRUCT until later widenings.
+34. **Match decision-tree lowering via `lower_pattern_test`**
+    (M.1 / M.3) — each arm allocates `body_bb` + `next_bb`; the
+    helper emits whatever comparison/branch shape the pattern
+    needs and leaves the cursor at `next_bb` so the next arm's
+    test starts cleanly. `Wildcard` → `Goto(body_bb)`. `Literal`
+    → `cmp = Eq; Branch`. `Range` → two short-circuit `Ge` / `Le`
+    tests through a fresh `hi_test_bb`. `Or` → recursive: each
+    alternative threads through its own `alt_next_bb`, with the
+    last alternative's miss flowing to the arm's overall
+    `next_bb`. Codegen needs zero new arms across the entire
+    match sub-bundle because the chain-of-Branch shape is what
+    short-circuit `&&` / `||` (12b) already exercised.
 
 ---
 
@@ -707,9 +805,10 @@ session start before changing them.
 The architecture's Phase-1 exit gate (200-program corpus) is met
 **and** the Phase-1 follow-up "Option A" (class/slice ABI + `as` casts)
 landed across A.1–A.4. The "Option B" Phase-13 LLVM backend then
-shipped across B.1–B.5. The "Option C" Phase-2 entry started with
-the c-strings sub-bundle (C.1 + C.2) and cleanup #1; the remaining
-Phase-2 sub-bundles are `match`, `!T`/`?T`, and comptime + modules.
+shipped across B.1–B.5. The "Option C" Phase-2 entry has now landed
+two sub-bundles: c-strings (C.1 + C.2 + cleanup #1) and match
+(M.1 + M.2 + M.3). The remaining Phase-2 sub-bundles are `!T` / `?T`
+(error unions / optionals) and comptime + modules.
 
 ### Option A — DONE
 
@@ -738,52 +837,62 @@ The big jump. Phase 2 brings:
 - `cipher` package manager (workspace's `arsenal_cipher` stub).
 - `frequencies` module imports (`use std::mem::Foo`).
 - `comptime` evaluator (workspace's `arsenal_comptime` stub).
-- `match` expressions, error unions `!T`, optional types `?T`.
+- `match` expressions — **M.1 + M.2 + M.3 DONE** (commits
+  `183e5b8` + `7d9c04d` + `2d85e65`). `match` accepts integer-
+  literal, bool-literal, inclusive-range (`lo..=hi`), or-pattern
+  (`a | b | c`), and wildcard forms; the MIR-side
+  `lower_pattern_test` helper recurses for or-patterns and emits
+  short-circuit pairs for ranges; codegen unchanged.
+- error unions `!T`, optional types `?T`.
 - `c"..."` C-string literals — **C.1 + C.2 DONE** (commits
   `1e8752c` + `bd3cf5d`). `c"..."` types as `[*:0]u8`, lowers via
   `Const::CStrAddr` to a parallel `__gw_cstr_<i>` rodata pass in
   both backends, decays to `*u8` at extern call sites; non-extern
   fn signatures accept `[*:0]u8` directly.
 
-Estimated cost remaining: dozens of hours. Bug yield: untyped —
-Phase 2 is where the parser stops emitting `ErrorNode` for the
-spec's harder features and where the runtime model gets complicated
-(compile-time evaluation, module resolution, async).
+Estimated cost remaining: dozens of hours. Bug yield so far is
+zero across both Phase-2 sub-bundles (C.1+C.2+M.1+M.2+M.3 = 0
+across both backends, against a 12/A.x prediction of ~3). The
+remaining sub-bundles introduce *value-level* novelty (tag bytes,
+comptime evaluator state, multi-file build orchestration), so the
+prediction re-arms.
 
 The dual-backend test now in place means any Phase 2 codegen change
 is automatically validated against both Cranelift and LLVM; this
-became useful immediately on C.1 (the dual-backend invariant held
-bit-exactly across all three c-string corpus programs).
+became useful immediately on C.1 and stayed useful through M.3.
 
-#### Recommended next sub-bundle: `match`
+#### Recommended next sub-bundle: `!T` / `?T`
 
-After C.1 + C.2 the remaining Phase-2 surface in ascending cost order:
+After C.1 + C.2 + M.1 + M.2 + M.3, the remaining Phase-2 surface
+in ascending cost order:
 
-- **`match` expressions** — extends typeck (exhaustiveness rule,
-  pattern types) + MIR (n-way branch lowering or chained `Branch`
-  fall-through) + small parser additions. Stays inside the
-  Phase-1-shaped single-file surface, exercises shape-novel
-  control flow on both backends. **Recommended next.**
-- **`!T` / `?T`** (error unions / optionals) — typeck-heavy, touches
-  the type-system foundation, requires unwrapping syntax. Larger
-  blast radius than `match`; weight ~2 bugs by the 12/A.x heuristic.
+- **`!T` / `?T`** (error unions / optionals) — typeck-heavy,
+  touches the type-system foundation, requires unwrapping syntax
+  (`expr!`, `expr?`, `expr ?? default`). New `Ty` variants for
+  both, both with payload + tag-byte layout reaching MIR / both
+  backends. **Recommended next.** This is the first Phase-2
+  sub-bundle that introduces *value-level novelty* (tag bytes
+  for the discriminator), so the dual-backend test should
+  re-arm and the 12/A.x heuristic predicts ~2 bugs across the
+  bundle.
 - **comptime + frequencies (modules)** — the architectural heavy
   lift. New `arsenal_comptime` crate, multi-file builds, module
   resolution. Should land in a session that can be devoted entirely
   to it; gates `cipher` / `frequencies` so blocks the manifest-
   driven driver UX.
 
-The argument for `match` first:
-- It's the largest standalone piece that still fits in a single
-  session.
-- Pattern-matching control flow is shape-novel for both backends
-  — the dual-backend test starts paying for itself again, having
-  collapsed to "no bugs" through the c-strings sub-bundle.
-- Doesn't depend on `!T`/`?T`/comptime, so it can land before any
-  of them.
-- The exhaustiveness rule is a typeck-only feature (no codegen
-  lowering); the hard part is the MIR decision-tree, which we'd
-  have to build anyway.
+The argument for `!T`/`?T` next:
+- Both are spec-mandated for many idiomatic GW programs, including
+  the I/O surface that comptime + modules will lean on.
+- The type-system foundation work (tagged union layout, payload
+  access, exhaustive unwrap rules) is reused later by sum types in
+  general.
+- Both can ship within a single session as separate sub-bundles
+  (e.g. `O.1 ?T tracer (single payload, ?value access)`,
+  `O.2 !T tracer (error variant + default)`, `O.3 ?? default
+  operator + chained patterns`).
+- Doesn't depend on comptime / modules and doesn't gate them; can
+  land in any order relative to that bundle.
 
 ### Tactical cleanup (any session)
 
@@ -873,12 +982,14 @@ state this doc describes:
 ```bash
 cd /Users/silmaril/Documents/GitHub/gw
 git log --oneline | head -10
-# expect tip: HANDOFF refresh after C.1/C.2 + cleanup #1 (this commit),
-#             bd3cf5d (C.2 sentinel ptr), 1e8752c (C.1 c-string tracer),
-#             e394571 (cleanup #1 default -> u0), 53f7e5f (HANDOFF after
-#             tactical cleanup #6), b99b0fa (CI native LLVM installs),
-#             29f6d81 (CI first attempt), cf1e8e1 (HANDOFF after Option B),
-#             8c2a6df (B.5), 1129232 (B.4) at the bottom of head -10.
+# expect tip: HANDOFF refresh after match sub-bundle (this commit),
+#             2d85e65 (M.3 range + or-patterns), 7d9c04d (M.2 bool +
+#             stmt-position), 183e5b8 (M.1 match tracer), d8a217e
+#             (HANDOFF after C.1/C.2 + cleanup #1), bd3cf5d (C.2
+#             sentinel ptr), 1e8752c (C.1 c-string tracer), e394571
+#             (cleanup #1 default -> u0), 53f7e5f (HANDOFF after
+#             tactical cleanup #6), b99b0fa (CI native LLVM installs)
+#             at the bottom of head -10.
 
 git status
 # expect: clean working tree (no .DS_Store, no .probe leftovers)
@@ -894,10 +1005,10 @@ export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
 
 . "$HOME/.cargo/env"
 cargo test --manifest-path compiler/arsenal-boot/Cargo.toml --workspace 2>&1 | grep "test result" | awk '{p+=$4;f+=$6}END{print p,f}'
-# expect: "159 0"
+# expect: "174 0"
 
 ls tests/snake_eater/pass/phase1/*.gw | wc -l
-# expect: 230
+# expect: 238
 
 ls compiler/arsenal-boot/crates/ | wc -l
 # expect: 17
@@ -994,5 +1105,15 @@ the `[*:S]T` arm (C.2), AST promoted `SentinelPtrType` from `Stub`
 + the default `-> u0` (C.2 / cleanup #1), MIR added `Const::CStrAddr`
 + the parallel `cstring_literals` table (C.1), both backends added
 the `__gw_cstr_<i>` rodata pass (C.1) and explicit `Ty::SentinelPtr`
-arms (C.2). The 230-program corpus is the direct test surface for
-every one of those arrows, exercised through both backends in CI.
+arms (C.2). The match sub-bundle (M.1 + M.2 + M.3) extended the
+same arrows again: parser added `parse_match_expr` /
+`parse_match_pattern` / `parse_pattern_literal_value` and the
+`RangePat` SyntaxKind (M.3); AST promoted `Expr::Match`,
+`Pattern::Literal`, `Pattern::Range`, `Pattern::Or` from `Stub`;
+typeck added `synth_match` + `check_match_pattern` with the
+exhaustiveness rule; MIR added `lower_match` + the recursive
+`lower_pattern_test` helper. Both backends still gain zero
+new arms across the entire match sub-bundle (the chain-of-Branch
+shape was already validated by 12b). The 238-program corpus is
+the direct test surface for every one of those arrows, exercised
+through both backends in CI.
