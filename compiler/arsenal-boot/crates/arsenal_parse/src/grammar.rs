@@ -99,12 +99,15 @@ fn parse_item_or_recover(p: &mut Parser<'_, '_, '_>) {
     match kw {
         TokenKind::KwFn => parse_fn_decl(p, item_start),
         TokenKind::KwClass => parse_class_decl(p, item_start),
+        // Phase 2 increment F.2: `liberty <ident>;` declares the file
+        // as a module; `use <ident>;` imports a module's items into
+        // the current file's namespace.
+        TokenKind::KwLiberty => parse_liberty_decl(p, item_start),
+        TokenKind::KwUse => parse_use_decl(p, item_start),
         // Recognised but not supported in Phase 0.
-        TokenKind::KwLiberty
-        | TokenKind::KwCipher
+        TokenKind::KwCipher
         | TokenKind::KwConst
         | TokenKind::KwMod
-        | TokenKind::KwUse
         | TokenKind::KwEnum
         | TokenKind::KwUnion
         | TokenKind::Hash
@@ -293,6 +296,35 @@ fn parse_ret_type(p: &mut Parser<'_, '_, '_>) {
     p.builder.start_node(SyntaxKind::RetType, start);
     p.expect(TokenKind::Arrow);
     parse_type(p);
+    let end = p.cur_byte_start();
+    p.builder.finish_node(end);
+}
+
+// ─── liberty + use (Phase 2 increment F.2) ────────────────────────────
+
+/// `liberty <ident>;` — declares the file as a named module. Items
+/// in a liberty-declared file are *not* added to the global flat
+/// namespace; another file must `use <ident>;` to bring them into
+/// scope.
+fn parse_liberty_decl(p: &mut Parser<'_, '_, '_>, start: u32) {
+    p.builder.start_node(SyntaxKind::LibertyDecl, start);
+    p.skip_trivia_into_node();
+    p.expect(TokenKind::KwLiberty);
+    p.expect(TokenKind::Ident);
+    p.expect(TokenKind::Semi);
+    let end = p.cur_byte_start();
+    p.builder.finish_node(end);
+}
+
+/// `use <ident>;` — imports a module's items into the current file's
+/// scope. Phase-2 minimum accepts single-segment paths only;
+/// multi-segment (`use foo::bar;`) lands later.
+fn parse_use_decl(p: &mut Parser<'_, '_, '_>, start: u32) {
+    p.builder.start_node(SyntaxKind::UseDecl, start);
+    p.skip_trivia_into_node();
+    p.expect(TokenKind::KwUse);
+    p.expect(TokenKind::Ident);
+    p.expect(TokenKind::Semi);
     let end = p.cur_byte_start();
     p.builder.finish_node(end);
 }

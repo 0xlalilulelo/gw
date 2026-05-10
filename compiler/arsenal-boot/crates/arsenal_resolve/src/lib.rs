@@ -10,7 +10,7 @@
 //! Output: a [`ResolvedModule`] containing a flat map from names to
 //! [`DefId`]s plus the underlying CST root for downstream consumers.
 
-use arsenal_ast::{AstNode, ClassDecl, FnDecl, Item, Module, SyntaxNode};
+use arsenal_ast::{AstNode, ClassDecl, FnDecl, Item, LibertyDecl, Module, SyntaxNode, UseDecl};
 use arsenal_lex::{DiagBag, Diagnostic, Label, SourceMap, Span};
 use rustc_hash::FxHashMap;
 
@@ -28,6 +28,12 @@ pub mod ec {
     /// increment F.1). Only the build-target file may carry top-level
     /// statements that synthesise the implicit `main`.
     pub const TOP_LEVEL_STMTS_IN_LIBRARY: ErrorCode = ErrorCode(203);
+    /// `use <name>;` referenced a module that no file declared via
+    /// `liberty <name>;` (Phase 2 increment F.2).
+    pub const UNKNOWN_MODULE: ErrorCode = ErrorCode(204);
+    /// A file declared more than one `liberty <name>;` (Phase 2
+    /// increment F.2). Each file is a single module.
+    pub const DUPLICATE_LIBERTY: ErrorCode = ErrorCode(205);
 }
 
 /// Stable identifier for a top-level definition within a module.
@@ -114,41 +120,79 @@ pub fn resolve_modules<'a>(
         Module::cast(primary_node).expect("resolve_modules called on non-Module syntax node");
     let mut defs: Vec<Def<'a>> = Vec::new();
     let mut by_name: FxHashMap<String, DefId> = FxHashMap::default();
+    // Phase 2 increment F.2: each file with a `liberty foo;` declaration
+    // contributes to `module_tables[foo]` instead of the global flat
+    // `by_name`. `use foo;` decls in any file (collected below) copy
+    // those entries into `by_name`.
+    let mut module_tables: FxHashMap<String, FxHashMap<String, DefId>> = FxHashMap::default();
+    // Pending `use foo;` decls — processed after all modules have been
+    // walked so the use-target lookup sees every liberty regardless of
+    // file order.
+    let mut pending_uses: Vec<(String, Span)> = Vec::new();
 
-    for item in module.items() {
-        match item {
-            Item::Fn(f) => register_fn(f, sm, &mut defs, &mut by_name, diags),
-            Item::Class(c) => register_class(c, sm, &mut defs, &mut by_name, diags),
-            _ => {
-                // Phase 0 parser already produced diagnostics for items
-                // it couldn't classify; the resolver doesn't add more.
-            }
-        }
-    }
-    // Items from each secondary file (sibling .gw files in the same
-    // directory). Same dedup story — `register_fn` / `register_class`
-    // diagnose duplicates against `by_name`.
+    process_module(
+        module,
+        primary_node,
+        sm,
+        &mut defs,
+        &mut by_name,
+        &mut module_tables,
+        &mut pending_uses,
+        /* is_primary */ true,
+        diags,
+    );
+
     for &extra_node in extra_nodes {
         let Some(extra_module) = Module::cast(extra_node) else {
             continue;
         };
-        for item in extra_module.items() {
-            match item {
-                Item::Fn(f) => register_fn(f, sm, &mut defs, &mut by_name, diags),
-                Item::Class(c) => register_class(c, sm, &mut defs, &mut by_name, diags),
-                _ => {}
-            }
-        }
-        // Top-level statements in a sibling file have no obvious
-        // semantics — we already synthesise one `main` from the primary
-        // module's stmts. Diagnose so the user knows their stmts are
-        // being ignored.
-        if extra_module.stmts().next().is_some() {
+        process_module(
+            extra_module,
+            extra_node,
+            sm,
+            &mut defs,
+            &mut by_name,
+            &mut module_tables,
+            &mut pending_uses,
+            /* is_primary */ false,
+            diags,
+        );
+    }
+
+    // Phase 2 F.2: process collected `use` declarations now that
+    // every module has been walked. Each `use foo;` flattens
+    // `module_tables[foo]`'s entries into `by_name`. This is a global
+    // import (visible to every file), not per-file scoped — F.3
+    // refines that. Conflicts diagnose as DUPLICATE_DEFINITION.
+    for (used_name, span) in &pending_uses {
+        let Some(table) = module_tables.get(used_name) else {
             diags.push(Diagnostic::error(
-                ec::TOP_LEVEL_STMTS_IN_LIBRARY,
-                Label::new(extra_node.span, ""),
-                "top-level statements are only allowed in the build target file; sibling `.gw` files must contain only items",
+                ec::UNKNOWN_MODULE,
+                Label::new(*span, ""),
+                format!("`use {used_name};` references a module not declared by any `liberty {used_name};`"),
             ));
+            continue;
+        };
+        // Iterate by stable key order so the diagnostic the user sees is
+        // deterministic regardless of HashMap traversal.
+        let mut entries: Vec<(&String, &DefId)> = table.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, &id) in entries {
+            if let Some(&prev_id) = by_name.get(name) {
+                let prev = &defs[prev_id.0 as usize];
+                diags.push(
+                    Diagnostic::error(
+                        ec::DUPLICATE_DEFINITION,
+                        Label::new(*span, ""),
+                        format!(
+                            "`use {used_name};` brings `{name}` into scope, but `{name}` was already defined"
+                        ),
+                    )
+                    .with_secondary(Label::new(prev.name_span, "previous definition")),
+                );
+                continue;
+            }
+            by_name.insert(name.clone(), id);
         }
     }
 
@@ -188,6 +232,103 @@ pub fn resolve_modules<'a>(
         defs,
         by_name,
     }
+}
+
+/// Walk one module's items, route each fn/class into either the
+/// global flat namespace or the module's own table (when the file
+/// declares `liberty <name>;`). Collect any `use <name>;` decls into
+/// `pending_uses` for processing after all modules are seen. Phase 2
+/// increment F.2.
+#[allow(clippy::too_many_arguments)]
+fn process_module<'a>(
+    module: Module<'a>,
+    module_node: &'a SyntaxNode<'a>,
+    sm: &SourceMap,
+    defs: &mut Vec<Def<'a>>,
+    by_name: &mut FxHashMap<String, DefId>,
+    module_tables: &mut FxHashMap<String, FxHashMap<String, DefId>>,
+    pending_uses: &mut Vec<(String, Span)>,
+    is_primary: bool,
+    diags: &mut DiagBag,
+) {
+    // Find the file's `liberty <name>;` declaration, if any. Multiple
+    // libertys per file diagnose; only the first wins.
+    let mut liberty: Option<String> = None;
+    for item in module.items() {
+        if let Item::Liberty(decl) = item {
+            if let Some(name) = liberty_name(decl, sm) {
+                if liberty.is_some() {
+                    diags.push(Diagnostic::error(
+                        ec::DUPLICATE_LIBERTY,
+                        Label::new(decl.syntax().span, ""),
+                        "file already declared `liberty`; only one per file",
+                    ));
+                } else {
+                    liberty = Some(name);
+                }
+            }
+        }
+    }
+
+    // Items go either to the global flat namespace or the file's own
+    // module table. We pick the right scope per file up front.
+    for item in module.items() {
+        match item {
+            Item::Fn(f) => match liberty.as_deref() {
+                Some(modname) => register_fn(
+                    f,
+                    sm,
+                    defs,
+                    module_tables.entry(modname.to_string()).or_default(),
+                    diags,
+                ),
+                None => register_fn(f, sm, defs, by_name, diags),
+            },
+            Item::Class(c) => match liberty.as_deref() {
+                Some(modname) => register_class(
+                    c,
+                    sm,
+                    defs,
+                    module_tables.entry(modname.to_string()).or_default(),
+                    diags,
+                ),
+                None => register_class(c, sm, defs, by_name, diags),
+            },
+            Item::Use(u) => {
+                if let Some(name) = use_name(u, sm) {
+                    pending_uses.push((name, u.syntax().span));
+                }
+            }
+            Item::Liberty(_) | Item::Stub(_) | Item::Error(_) => {
+                // Liberty already handled above; Stub/Error already
+                // diagnosed by the parser.
+            }
+        }
+    }
+
+    // Top-level statements: only the primary file may have them
+    // (synthetic `main`). Sibling files' top-level stmts diagnose,
+    // even if the file is liberty-declared (the synthetic-main
+    // semantics don't extend to libraries).
+    if !is_primary && module.stmts().next().is_some() {
+        diags.push(Diagnostic::error(
+            ec::TOP_LEVEL_STMTS_IN_LIBRARY,
+            Label::new(module_node.span, ""),
+            "top-level statements are only allowed in the build target file; sibling `.gw` files must contain only items",
+        ));
+    }
+}
+
+/// Recover the name from a `liberty <name>;` declaration.
+fn liberty_name(decl: LibertyDecl<'_>, sm: &SourceMap) -> Option<String> {
+    let span = decl.name()?;
+    sm.slice(span).map(str::to_string)
+}
+
+/// Recover the name from a `use <name>;` declaration.
+fn use_name(decl: UseDecl<'_>, sm: &SourceMap) -> Option<String> {
+    let span = decl.name()?;
+    sm.slice(span).map(str::to_string)
 }
 
 fn register_fn<'a>(
@@ -471,6 +612,62 @@ mod tests {
         // a sibling diagnose with TOP_LEVEL_STMTS_IN_LIBRARY.
         let (_, errs) =
             run_multi_resolver("fn main() -> i32 { return 0; }", &["let global: i32 = 7;"]);
+        assert!(errs >= 1);
+    }
+
+    // ─── Phase 2 increment F.2: liberty + use ─────────────────────────────
+
+    #[test]
+    fn liberty_items_invisible_without_use() {
+        // `add` lives in a `liberty math;` file; main doesn't `use
+        // math;`. The resolver itself stays diag-free (typeck flags
+        // the missing call name); but `add` is in the module table,
+        // not the flat namespace.
+        let (names, errs) = run_multi_resolver(
+            "fn main() -> i32 { return add(2, 3); }",
+            &["liberty math; fn add(a: i32, b: i32) -> i32 { return a + b; }"],
+        );
+        assert!(names.contains(&"main".to_string()));
+        assert!(names.contains(&"add".to_string()));
+        assert_eq!(errs, 0);
+    }
+
+    #[test]
+    fn use_brings_liberty_items_into_scope() {
+        let (_, errs) = run_multi_resolver(
+            "use math; fn main() -> i32 { return add(2, 3); }",
+            &["liberty math; fn add(a: i32, b: i32) -> i32 { return a + b; }"],
+        );
+        assert_eq!(errs, 0);
+    }
+
+    #[test]
+    fn use_of_unknown_module_diagnoses() {
+        let (_, errs) = run_multi_resolver("use missing; fn main() -> i32 { return 0; }", &[]);
+        assert!(errs >= 1);
+    }
+
+    #[test]
+    fn duplicate_liberty_in_same_file_diagnoses() {
+        let (_, errs) = run_multi_resolver(
+            "fn main() -> i32 { return 0; }",
+            &["liberty math; liberty algebra; fn add() -> i32 { return 1; }"],
+        );
+        assert!(errs >= 1);
+    }
+
+    #[test]
+    fn use_then_collide_with_local_diagnoses() {
+        // Both files define `add`: primary in flat namespace,
+        // sibling under `liberty math;`. `use math;` brings the
+        // sibling's `add` into the flat namespace and collides with
+        // the local one.
+        let (_, errs) = run_multi_resolver(
+            "use math;\n\
+             fn add() -> i32 { return 99; }\n\
+             fn main() -> i32 { return add(); }",
+            &["liberty math; fn add() -> i32 { return 0; }"],
+        );
         assert!(errs >= 1);
     }
 }

@@ -1,0 +1,5 @@
+use math;
+
+fn main() -> i32 {
+    return add(2, 3) + neg(1);
+}
