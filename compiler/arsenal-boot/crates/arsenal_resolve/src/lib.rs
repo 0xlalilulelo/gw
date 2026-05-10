@@ -11,7 +11,7 @@
 //! [`DefId`]s plus the underlying CST root for downstream consumers.
 
 use arsenal_ast::{AstNode, ClassDecl, FnDecl, Item, LibertyDecl, Module, SyntaxNode, UseDecl};
-use arsenal_lex::{DiagBag, Diagnostic, Label, SourceMap, Span};
+use arsenal_lex::{DiagBag, Diagnostic, FileId, Label, SourceMap, Span};
 use rustc_hash::FxHashMap;
 
 /// Resolver error codes. Reserved range: `E0200..E0299`.
@@ -77,14 +77,42 @@ pub struct ResolvedModule<'a> {
     pub module: Module<'a>,
     /// Definitions in source order.
     pub defs: Vec<Def<'a>>,
-    /// Lookup from source name to [`DefId`].
+    /// Flat-namespace lookup from source name to [`DefId`]. Holds
+    /// items from non-`liberty` files. Phase 2 F.3 keeps this map
+    /// stable (independent of `use` decls in any file); cross-file
+    /// imports flow through [`Self::file_scopes`].
     pub by_name: FxHashMap<String, DefId>,
+    /// Per-file effective name scope (Phase 2 increment F.3). Each
+    /// file's scope = the flat `by_name` pool + the file's own items
+    /// (regardless of liberty) + items from modules the file
+    /// `use`s. Typeck consults this map via
+    /// [`Self::lookup_in_file`] so a `use foo;` in main.gw doesn't
+    /// leak `foo`'s items into lib.gw.
+    pub file_scopes: FxHashMap<FileId, FxHashMap<String, DefId>>,
 }
 
 impl<'a> ResolvedModule<'a> {
-    /// Locate a definition by source name.
+    /// Locate a definition by source name in the flat global pool.
+    /// Backwards-compat entry point for callers that don't have a
+    /// file context (single-file builds, AST tests, …). Phase 2 F.3
+    /// callers with a known call-site file should prefer
+    /// [`Self::lookup_in_file`].
     pub fn lookup(&self, name: &str) -> Option<&Def<'a>> {
         self.by_name.get(name).map(|id| &self.defs[id.0 as usize])
+    }
+
+    /// Locate a definition visible in `file`'s effective scope. Falls
+    /// back to the flat namespace if `file` doesn't have a recorded
+    /// scope (e.g., a default-constructed `FileId::NONE`), so
+    /// existing single-file callers stay sound.
+    pub fn lookup_in_file(&self, file: FileId, name: &str) -> Option<&Def<'a>> {
+        if let Some(scope) = self.file_scopes.get(&file) {
+            if let Some(id) = scope.get(name) {
+                return Some(&self.defs[id.0 as usize]);
+            }
+            return None;
+        }
+        self.lookup(name)
     }
 }
 
@@ -122,13 +150,20 @@ pub fn resolve_modules<'a>(
     let mut by_name: FxHashMap<String, DefId> = FxHashMap::default();
     // Phase 2 increment F.2: each file with a `liberty foo;` declaration
     // contributes to `module_tables[foo]` instead of the global flat
-    // `by_name`. `use foo;` decls in any file (collected below) copy
-    // those entries into `by_name`.
+    // `by_name`. Phase 2 increment F.3: `use foo;` decls populate
+    // per-file scopes (in `file_uses`), not the global by_name.
     let mut module_tables: FxHashMap<String, FxHashMap<String, DefId>> = FxHashMap::default();
-    // Pending `use foo;` decls — processed after all modules have been
-    // walked so the use-target lookup sees every liberty regardless of
-    // file order.
-    let mut pending_uses: Vec<(String, Span)> = Vec::new();
+    // Per-file own-item lists (Phase 2 F.3). Tracks every file's own
+    // items so the post-pass can build effective scopes that include
+    // both the flat pool and the file's own definitions.
+    let mut file_items: FxHashMap<FileId, Vec<(String, DefId)>> = FxHashMap::default();
+    // Per-file `use` decls (Phase 2 F.3). Module-name + the use-decl's
+    // span (for diagnostics).
+    let mut file_uses: FxHashMap<FileId, Vec<(String, Span)>> = FxHashMap::default();
+    // The set of files we've seen at all (so the post-pass knows which
+    // file_scopes entries to build, even for files that only have a
+    // `liberty` decl and no items / uses).
+    let mut all_files: Vec<FileId> = Vec::new();
 
     process_module(
         module,
@@ -137,7 +172,9 @@ pub fn resolve_modules<'a>(
         &mut defs,
         &mut by_name,
         &mut module_tables,
-        &mut pending_uses,
+        &mut file_items,
+        &mut file_uses,
+        &mut all_files,
         /* is_primary */ true,
         diags,
     );
@@ -153,47 +190,12 @@ pub fn resolve_modules<'a>(
             &mut defs,
             &mut by_name,
             &mut module_tables,
-            &mut pending_uses,
+            &mut file_items,
+            &mut file_uses,
+            &mut all_files,
             /* is_primary */ false,
             diags,
         );
-    }
-
-    // Phase 2 F.2: process collected `use` declarations now that
-    // every module has been walked. Each `use foo;` flattens
-    // `module_tables[foo]`'s entries into `by_name`. This is a global
-    // import (visible to every file), not per-file scoped — F.3
-    // refines that. Conflicts diagnose as DUPLICATE_DEFINITION.
-    for (used_name, span) in &pending_uses {
-        let Some(table) = module_tables.get(used_name) else {
-            diags.push(Diagnostic::error(
-                ec::UNKNOWN_MODULE,
-                Label::new(*span, ""),
-                format!("`use {used_name};` references a module not declared by any `liberty {used_name};`"),
-            ));
-            continue;
-        };
-        // Iterate by stable key order so the diagnostic the user sees is
-        // deterministic regardless of HashMap traversal.
-        let mut entries: Vec<(&String, &DefId)> = table.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-        for (name, &id) in entries {
-            if let Some(&prev_id) = by_name.get(name) {
-                let prev = &defs[prev_id.0 as usize];
-                diags.push(
-                    Diagnostic::error(
-                        ec::DUPLICATE_DEFINITION,
-                        Label::new(*span, ""),
-                        format!(
-                            "`use {used_name};` brings `{name}` into scope, but `{name}` was already defined"
-                        ),
-                    )
-                    .with_secondary(Label::new(prev.name_span, "previous definition")),
-                );
-                continue;
-            }
-            by_name.insert(name.clone(), id);
-        }
     }
 
     // Phase 1 increment 11a: top-level statements outside any `fn`
@@ -227,18 +229,75 @@ pub fn resolve_modules<'a>(
         }
     }
 
+    // Phase 2 F.3: build each file's effective scope. The scope is:
+    //   flat by_name pool + the file's own items + the items
+    //   contributed by each `use foo;` declared in that file.
+    // Conflicts within a single file's scope diagnose as
+    // DUPLICATE_DEFINITION (e.g., `use foo;` brings `add` in but the
+    // file already has a local `add`). `use` of an unknown module
+    // diagnoses with UNKNOWN_MODULE. Built after the synthetic-main
+    // step so the primary file's scope includes `main` when the
+    // user wrote top-level statements.
+    let mut file_scopes: FxHashMap<FileId, FxHashMap<String, DefId>> = FxHashMap::default();
+    for &file in &all_files {
+        let mut scope: FxHashMap<String, DefId> = by_name.clone();
+        if let Some(items) = file_items.get(&file) {
+            for (name, id) in items {
+                scope.entry(name.clone()).or_insert(*id);
+            }
+        }
+        if let Some(uses) = file_uses.get(&file) {
+            for (used_name, span) in uses {
+                let Some(table) = module_tables.get(used_name) else {
+                    diags.push(Diagnostic::error(
+                        ec::UNKNOWN_MODULE,
+                        Label::new(*span, ""),
+                        format!("`use {used_name};` references a module not declared by any `liberty {used_name};`"),
+                    ));
+                    continue;
+                };
+                let mut entries: Vec<(&String, &DefId)> = table.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                for (name, &id) in entries {
+                    if let Some(&prev_id) = scope.get(name) {
+                        if prev_id != id {
+                            let prev = &defs[prev_id.0 as usize];
+                            diags.push(
+                                Diagnostic::error(
+                                    ec::DUPLICATE_DEFINITION,
+                                    Label::new(*span, ""),
+                                    format!(
+                                        "`use {used_name};` brings `{name}` into scope, but `{name}` is already visible here"
+                                    ),
+                                )
+                                .with_secondary(Label::new(
+                                    prev.name_span,
+                                    "previous definition",
+                                )),
+                            );
+                        }
+                        continue;
+                    }
+                    scope.insert(name.clone(), id);
+                }
+            }
+        }
+        file_scopes.insert(file, scope);
+    }
+
     ResolvedModule {
         module,
         defs,
         by_name,
+        file_scopes,
     }
 }
 
 /// Walk one module's items, route each fn/class into either the
 /// global flat namespace or the module's own table (when the file
 /// declares `liberty <name>;`). Collect any `use <name>;` decls into
-/// `pending_uses` for processing after all modules are seen. Phase 2
-/// increment F.2.
+/// `file_uses` for the F.3 post-pass to resolve into per-file
+/// scopes. Phase 2 increments F.2 / F.3.
 #[allow(clippy::too_many_arguments)]
 fn process_module<'a>(
     module: Module<'a>,
@@ -247,10 +306,16 @@ fn process_module<'a>(
     defs: &mut Vec<Def<'a>>,
     by_name: &mut FxHashMap<String, DefId>,
     module_tables: &mut FxHashMap<String, FxHashMap<String, DefId>>,
-    pending_uses: &mut Vec<(String, Span)>,
+    file_items: &mut FxHashMap<FileId, Vec<(String, DefId)>>,
+    file_uses: &mut FxHashMap<FileId, Vec<(String, Span)>>,
+    all_files: &mut Vec<FileId>,
     is_primary: bool,
     diags: &mut DiagBag,
 ) {
+    let file = module_node.span.file;
+    if !all_files.contains(&file) {
+        all_files.push(file);
+    }
     // Find the file's `liberty <name>;` declaration, if any. Multiple
     // libertys per file diagnose; only the first wins.
     let mut liberty: Option<String> = None;
@@ -272,31 +337,47 @@ fn process_module<'a>(
 
     // Items go either to the global flat namespace or the file's own
     // module table. We pick the right scope per file up front.
+    // Phase 2 F.3: each registered item is also recorded in
+    // `file_items[file]` so the post-pass can build per-file scopes
+    // that include both the flat pool and the file's own defs.
     for item in module.items() {
         match item {
-            Item::Fn(f) => match liberty.as_deref() {
-                Some(modname) => register_fn(
-                    f,
-                    sm,
-                    defs,
-                    module_tables.entry(modname.to_string()).or_default(),
-                    diags,
-                ),
-                None => register_fn(f, sm, defs, by_name, diags),
-            },
-            Item::Class(c) => match liberty.as_deref() {
-                Some(modname) => register_class(
-                    c,
-                    sm,
-                    defs,
-                    module_tables.entry(modname.to_string()).or_default(),
-                    diags,
-                ),
-                None => register_class(c, sm, defs, by_name, diags),
-            },
+            Item::Fn(f) => {
+                let registered = match liberty.as_deref() {
+                    Some(modname) => register_fn(
+                        f,
+                        sm,
+                        defs,
+                        module_tables.entry(modname.to_string()).or_default(),
+                        diags,
+                    ),
+                    None => register_fn(f, sm, defs, by_name, diags),
+                };
+                if let Some(entry) = registered {
+                    file_items.entry(file).or_default().push(entry);
+                }
+            }
+            Item::Class(c) => {
+                let registered = match liberty.as_deref() {
+                    Some(modname) => register_class(
+                        c,
+                        sm,
+                        defs,
+                        module_tables.entry(modname.to_string()).or_default(),
+                        diags,
+                    ),
+                    None => register_class(c, sm, defs, by_name, diags),
+                };
+                if let Some(entry) = registered {
+                    file_items.entry(file).or_default().push(entry);
+                }
+            }
             Item::Use(u) => {
                 if let Some(name) = use_name(u, sm) {
-                    pending_uses.push((name, u.syntax().span));
+                    file_uses
+                        .entry(file)
+                        .or_default()
+                        .push((name, u.syntax().span));
                 }
             }
             Item::Liberty(_) | Item::Stub(_) | Item::Error(_) => {
@@ -337,14 +418,14 @@ fn register_fn<'a>(
     defs: &mut Vec<Def<'a>>,
     by_name: &mut FxHashMap<String, DefId>,
     diags: &mut DiagBag,
-) {
+) -> Option<(String, DefId)> {
     let Some(name_span) = fn_decl.name() else {
         diags.push(Diagnostic::error(
             ec::MISSING_NAME,
             Label::new(fn_decl.span(), ""),
             "function declaration is missing its name",
         ));
-        return;
+        return None;
     };
     let name = sm.slice(name_span).map(str::to_string).unwrap_or_default();
     let id = DefId(defs.len() as u32);
@@ -368,10 +449,11 @@ fn register_fn<'a>(
     defs.push(Def {
         id,
         kind: DefKind::Fn,
-        name,
+        name: name.clone(),
         name_span,
         syntax: fn_decl.syntax(),
     });
+    Some((name, id))
 }
 
 fn register_class<'a>(
@@ -380,14 +462,14 @@ fn register_class<'a>(
     defs: &mut Vec<Def<'a>>,
     by_name: &mut FxHashMap<String, DefId>,
     diags: &mut DiagBag,
-) {
+) -> Option<(String, DefId)> {
     let Some(name_span) = class_decl.name() else {
         diags.push(Diagnostic::error(
             ec::MISSING_NAME,
             Label::new(class_decl.span(), ""),
             "class declaration is missing its name",
         ));
-        return;
+        return None;
     };
     let name = sm.slice(name_span).map(str::to_string).unwrap_or_default();
     let id = DefId(defs.len() as u32);
@@ -410,10 +492,11 @@ fn register_class<'a>(
     defs.push(Def {
         id,
         kind: DefKind::Class,
-        name,
+        name: name.clone(),
         name_span,
         syntax: class_decl.syntax(),
     });
+    Some((name, id))
 }
 
 /// Built-in primitive type names. Returns `Some` if the identifier
@@ -654,6 +737,55 @@ mod tests {
             &["liberty math; liberty algebra; fn add() -> i32 { return 1; }"],
         );
         assert!(errs >= 1);
+    }
+
+    // ─── Phase 2 increment F.3: per-file `use` scoping ───────────────────
+
+    #[test]
+    fn use_only_visible_in_declaring_file() {
+        // main.gw `use math;`, lib.gw doesn't. Both files have items
+        // (lib.gw is flat-namespace, no liberty). lib.gw's `helper`
+        // refers to `add`, which lives in `liberty math;` and only
+        // main.gw imported it. lib.gw's scope shouldn't include
+        // `add` — typeck (not the resolver) flags the unknown
+        // reference, but the resolver's per-file scope construction
+        // is what enables that.
+        let mut sm = SourceMap::new();
+        let bump = Bump::new();
+
+        let main_file = sm.add_file("main.gw", "use math; fn main() -> i32 { return 0; }");
+        let main_bytes = sm.get(main_file).unwrap().contents.as_bytes();
+        let main_arena = FileArena::new(&bump, main_file);
+        let (main_root, mut diags) = parse(main_file, main_bytes, &main_arena);
+
+        let lib_file = sm.add_file("lib.gw", "fn helper() -> i32 { return 0; }");
+        let lib_bytes = sm.get(lib_file).unwrap().contents.as_bytes();
+        let lib_arena = FileArena::new(&bump, lib_file);
+        let (lib_root, lib_diags) = parse(lib_file, lib_bytes, &lib_arena);
+        diags.merge(lib_diags);
+
+        let math_file = sm.add_file(
+            "math.gw",
+            "liberty math; fn add(a: i32, b: i32) -> i32 { return a + b; }",
+        );
+        let math_bytes = sm.get(math_file).unwrap().contents.as_bytes();
+        let math_arena = FileArena::new(&bump, math_file);
+        let (math_root, math_diags) = parse(math_file, math_bytes, &math_arena);
+        diags.merge(math_diags);
+
+        let resolved = resolve_modules(main_root, &[lib_root, math_root], &sm, &mut diags);
+        assert_eq!(diags.error_count(), 0);
+
+        // main.gw's scope should include `add` (via `use math;`).
+        assert!(resolved.lookup_in_file(main_file, "add").is_some());
+        // lib.gw's scope should NOT include `add` — it didn't `use math;`.
+        assert!(resolved.lookup_in_file(lib_file, "add").is_none());
+        // Both files should see the flat-namespace items (`helper`).
+        assert!(resolved.lookup_in_file(main_file, "helper").is_some());
+        assert!(resolved.lookup_in_file(lib_file, "helper").is_some());
+        // Both files should see the synthetic `main` if it was
+        // synthesised — here it's an explicit fn, not synthetic.
+        assert!(resolved.lookup_in_file(main_file, "main").is_some());
     }
 
     #[test]

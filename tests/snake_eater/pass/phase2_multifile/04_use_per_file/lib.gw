@@ -1,0 +1,5 @@
+use math;
+
+fn helper() -> i32 {
+    return add(2, 3);
+}

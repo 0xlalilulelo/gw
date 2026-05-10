@@ -31,7 +31,7 @@ use arsenal_ast::{
     MustExpr, ParenExpr, PathExpr, PathType, Pattern, ReturnExpr, Stmt, StructLitExpr, SyntaxKind,
     SyntaxNode, Type, UnaryExpr, WhileExpr,
 };
-use arsenal_lex::{DiagBag, Diagnostic, Label, SourceMap, Span};
+use arsenal_lex::{DiagBag, Diagnostic, FileId, Label, SourceMap, Span};
 use arsenal_resolve::{primitive_type_name, DefId, DefKind, ResolvedModule};
 use rustc_hash::FxHashMap;
 
@@ -733,9 +733,12 @@ fn resolve_type(
     if let Some(prim) = primitive_from_path(path, sm) {
         return prim;
     }
-    // Try class lookup.
+    // Try class lookup. Phase 2 F.3 routes the lookup through the
+    // path's source file so a class declared under `liberty foo;`
+    // is only visible to files that `use foo;` themselves.
     if let Some(name) = single_segment_name(path, sm) {
-        if let Some(def) = resolved.lookup(name) {
+        let file = path.syntax().span.file;
+        if let Some(def) = resolved.lookup_in_file(file, name) {
             if def.kind == arsenal_resolve::DefKind::Class {
                 return Ty::Class(def.id);
             }
@@ -828,6 +831,12 @@ struct Cx<'a, 'tm, 'sm, 'd> {
     /// `while` or `for` body; decremented on exit. Used by
     /// `synth_break` / `synth_continue` to reject usage outside a loop.
     loop_depth: u32,
+    /// Phase 2 increment F.3: file the currently-checked fn body
+    /// lives in. Used by name-lookup sites to consult that file's
+    /// effective scope (`resolved.file_scopes[current_file]`)
+    /// rather than the global flat `by_name`. Set by `check_fn_body`
+    /// (or the synthetic-main equivalent) before walking the body.
+    current_file: FileId,
 }
 
 impl<'a, 'tm, 'sm, 'd> Cx<'a, 'tm, 'sm, 'd> {
@@ -865,6 +874,7 @@ fn check_fn_body<'a>(
         locals: Vec::new(),
         next_binding: 0,
         loop_depth: 0,
+        current_file: fn_decl.syntax().span.file,
     };
     // Register parameters as bindings. We zip the FnSig::Param structs
     // (with resolved types) with the AST Param nodes so we can record
@@ -904,6 +914,7 @@ fn check_synthetic_main_body<'a>(
         locals: Vec::new(),
         next_binding: 0,
         loop_depth: 0,
+        current_file: module.syntax().span.file,
     };
     for stmt in module.stmts() {
         check_stmt(stmt, &mut cx);
@@ -1221,7 +1232,12 @@ fn synth_path<'a>(path: PathExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     // Maybe a top-level fn? In Phase 1 we don't yet model first-class
     // function values, but reporting cleanly here is preferable to a
     // generic "unknown name" if the user wrote `foo` instead of `foo()`.
-    if cx.tm.resolved.lookup(name).is_some() {
+    if cx
+        .tm
+        .resolved
+        .lookup_in_file(cx.current_file, name)
+        .is_some()
+    {
         cx.diags.push(Diagnostic::error(
             ec::UNSUPPORTED_CONSTRUCT,
             Label::new(path.syntax().span, ""),
@@ -1603,7 +1619,7 @@ fn synth_struct_lit<'a>(s: StructLitExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty
     let Some(name) = cx.sm.slice(first) else {
         return Ty::Error;
     };
-    let def = match cx.tm.resolved.lookup(name) {
+    let def = match cx.tm.resolved.lookup_in_file(cx.current_file, name) {
         Some(d) if d.kind == DefKind::Class => d.id,
         Some(_) => {
             cx.diags.push(Diagnostic::error(
@@ -2041,7 +2057,7 @@ fn synth_call<'a>(c: CallExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
         return Ty::Error;
     }
     let name = cx.sm.slice(first).unwrap_or("");
-    let def = match cx.tm.resolved.lookup(name) {
+    let def = match cx.tm.resolved.lookup_in_file(cx.current_file, name) {
         Some(d) => d,
         None => {
             cx.diags.push(Diagnostic::error(
