@@ -4,7 +4,7 @@ version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
-description            = "GW comptime engine (#virtuous, #run, #insert, @codec) (Phase 2+ stub). See docs/architecture.md Part B.11, Part E."
+description            = "GW comptime engine (comptime, #run, #insert, @type_info) (Phase 2+ stub). See docs/architecture.md Part B.11, Part E."
 
 [lints.rust]
 missing_docs = "deny"

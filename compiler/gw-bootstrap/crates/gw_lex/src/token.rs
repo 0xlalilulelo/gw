@@ -65,7 +65,7 @@ pub enum TokenKind {
     KwConst,
     KwClass,
     KwMod,
-    KwCipher,
+    KwTrait,
     KwIf,
     KwElse,
     KwMatch,
@@ -79,8 +79,6 @@ pub enum TokenKind {
     KwErrdefer,
     KwTry,
     KwCatch,
-    KwFoxdie,
-    KwNaked,
     KwPub,
     KwUse,
     KwAs,
@@ -89,20 +87,15 @@ pub enum TokenKind {
     KwComptime,
     KwInline,
     KwExtern,
-    KwRex,
+    KwAsm,
     KwLock,
-    KwFox,
+    KwTask,
     KwAwait,
     KwYield,
     KwTrue,
     KwFalse,
     KwNil,
-
-    // Reserved theme aliases — rejected as identifiers so that `mod` ↔
-    // `enum union` aliasing (spec §5.4.3) and `unsafe` ↔ `naked` aliasing
-    // (spec §5.5.1) can be wired up later without source-breaking changes.
     KwEnum,
-    KwUnion,
     KwUnsafe,
 
     // ───────── Brackets ──────────────────────────────────────────────
@@ -173,7 +166,7 @@ pub enum TokenKind {
 
     /// `@` comptime intrinsic prefix (`@codec`, `@field`, `@call`).
     At,
-    /// `#` attribute / directive prefix (`#[..]`, `#virtuous`, `#run`).
+    /// `#` attribute / directive prefix (`#[..]`, `#run`, `#insert`).
     Hash,
 
     // ───────── Synthetic ─────────────────────────────────────────────
@@ -203,7 +196,7 @@ impl TokenKind {
                 | Self::KwConst
                 | Self::KwClass
                 | Self::KwMod
-                | Self::KwCipher
+                | Self::KwTrait
                 | Self::KwIf
                 | Self::KwElse
                 | Self::KwMatch
@@ -217,8 +210,6 @@ impl TokenKind {
                 | Self::KwErrdefer
                 | Self::KwTry
                 | Self::KwCatch
-                | Self::KwFoxdie
-                | Self::KwNaked
                 | Self::KwPub
                 | Self::KwUse
                 | Self::KwAs
@@ -227,16 +218,15 @@ impl TokenKind {
                 | Self::KwComptime
                 | Self::KwInline
                 | Self::KwExtern
-                | Self::KwRex
+                | Self::KwAsm
                 | Self::KwLock
-                | Self::KwFox
+                | Self::KwTask
                 | Self::KwAwait
                 | Self::KwYield
                 | Self::KwTrue
                 | Self::KwFalse
                 | Self::KwNil
                 | Self::KwEnum
-                | Self::KwUnion
                 | Self::KwUnsafe
         )
     }
@@ -269,7 +259,7 @@ impl TokenKind {
             Self::KwConst => "const",
             Self::KwClass => "class",
             Self::KwMod => "mod",
-            Self::KwCipher => "cipher",
+            Self::KwTrait => "trait",
             Self::KwIf => "if",
             Self::KwElse => "else",
             Self::KwMatch => "match",
@@ -283,8 +273,6 @@ impl TokenKind {
             Self::KwErrdefer => "errdefer",
             Self::KwTry => "try",
             Self::KwCatch => "catch",
-            Self::KwFoxdie => "foxdie",
-            Self::KwNaked => "naked",
             Self::KwPub => "pub",
             Self::KwUse => "use",
             Self::KwAs => "as",
@@ -293,16 +281,15 @@ impl TokenKind {
             Self::KwComptime => "comptime",
             Self::KwInline => "inline",
             Self::KwExtern => "extern",
-            Self::KwRex => "rex",
+            Self::KwAsm => "asm",
             Self::KwLock => "lock",
-            Self::KwFox => "fox",
+            Self::KwTask => "task",
             Self::KwAwait => "await",
             Self::KwYield => "yield",
             Self::KwTrue => "true",
             Self::KwFalse => "false",
             Self::KwNil => "nil",
             Self::KwEnum => "enum",
-            Self::KwUnion => "union",
             Self::KwUnsafe => "unsafe",
             // Brackets
             Self::LParen => "(",

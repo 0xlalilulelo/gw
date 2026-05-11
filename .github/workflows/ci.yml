@@ -2,7 +2,7 @@
 # build + fmt --check + clippy -D warnings + test on ubuntu / macos.
 # LLVM 18 is installed via each runner's native package manager
 # (brew on macOS, apt.llvm.org on Linux) and `LLVM_SYS_180_PREFIX`
-# exported so the `arsenal_codegen_llvm` crate (and its transitive
+# exported so the `gw_codegen_llvm` crate (and its transitive
 # `llvm-sys` build script) compile.
 #
 # Windows is intentionally absent from the matrix: `llvm-sys 180`
@@ -11,14 +11,14 @@
 # but lack a usable distribution path on Windows (Choco's `llvm` and
 # the official LLVM project Windows binaries are clang+lld toolchains,
 # not dev installs). Restore Windows when either (a)
-# `arsenal_codegen_llvm` is feature-gated so Windows builds the rest
+# `gw_codegen_llvm` is feature-gated so Windows builds the rest
 # of the workspace without it, or (b) a working Windows install path
 # emerges. The `phase1_run` and `llvm_backend` integration tests are
 # already `cfg(not(windows))` because of the `cc` linker dependency,
 # so losing Windows coverage here is fmt / clippy / build only.
 #
 # Toolchain is the workspace-pinned `stable` channel from
-# `compiler/arsenal-boot/rust-toolchain.toml`. The cargo registry and
+# `compiler/gw-bootstrap/rust-toolchain.toml`. The cargo registry and
 # target dir are cached per-OS via Swatinem/rust-cache.
 
 name: CI
@@ -34,7 +34,7 @@ env:
 
 defaults:
   run:
-    working-directory: compiler/arsenal-boot
+    working-directory: compiler/gw-bootstrap
 
 jobs:
   ci:
@@ -70,7 +70,7 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: compiler/arsenal-boot -> target
+          workspaces: compiler/gw-bootstrap -> target
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check

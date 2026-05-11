@@ -1,10 +1,10 @@
 //! Smoke tests: parse small GW snippets covering the Phase-1-minimal
 //! subset, asserting clean diagnostics + spot-check AST shape.
 
+use bumpalo::Bump;
 use gw_ast::{dump, AstNode, FileArena, Item, Module};
 use gw_lex::SourceMap;
 use gw_parse::parse;
-use bumpalo::Bump;
 
 fn parse_to_dump(src: &str) -> (String, u32) {
     let mut sm = SourceMap::new();

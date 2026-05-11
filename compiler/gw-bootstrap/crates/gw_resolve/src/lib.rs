@@ -550,10 +550,10 @@ pub enum PrimitiveTy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bumpalo::Bump;
     use gw_ast::FileArena;
     use gw_lex::SourceMap;
     use gw_parse::parse;
-    use bumpalo::Bump;
 
     fn run_resolver(src: &str) -> (Vec<String>, u32) {
         let mut sm = SourceMap::new();

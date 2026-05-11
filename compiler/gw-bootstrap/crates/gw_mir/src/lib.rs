@@ -2638,11 +2638,11 @@ fn primitive_from_ast(ty: gw_ast::Type<'_>, sm: &SourceMap) -> Option<Ty> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bumpalo::Bump;
     use gw_ast::FileArena;
     use gw_parse::parse;
     use gw_resolve::resolve_module;
     use gw_typeck::type_check;
-    use bumpalo::Bump;
 
     fn lower_src(src: &str) -> MirProgram {
         let mut sm = SourceMap::new();

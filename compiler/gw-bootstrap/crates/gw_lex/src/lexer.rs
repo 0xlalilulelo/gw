@@ -1041,10 +1041,10 @@ mod tests {
     }
 
     #[test]
-    fn theme_keywords_recognized() {
+    fn extra_keywords_recognized() {
         assert_eq!(
-            nontrivia("mod cipher foxdie naked enum union unsafe"),
-            vec![KwMod, KwCipher, KwFoxdie, KwNaked, KwEnum, KwUnion, KwUnsafe, Eof,]
+            nontrivia("mod trait asm task enum unsafe"),
+            vec![KwMod, KwTrait, KwAsm, KwTask, KwEnum, KwUnsafe, Eof,]
         );
     }
 }

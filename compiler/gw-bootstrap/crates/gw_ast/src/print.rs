@@ -159,8 +159,8 @@ mod tests {
     use super::*;
     use crate::arena::FileArena;
     use crate::cst::CstBuilder;
-    use gw_lex::{SourceMap, Span};
     use bumpalo::Bump;
+    use gw_lex::{SourceMap, Span};
 
     #[test]
     fn dump_simple_tree() {

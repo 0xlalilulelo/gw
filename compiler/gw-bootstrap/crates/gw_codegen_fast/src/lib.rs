@@ -9,17 +9,17 @@
 //!
 //! Public entry point: [`compile_program`].
 
-use gw_mir::{
-    BinOp, BlockId, CastKind, Const, Local, MirBlock, MirFn, MirProgram, MirStmt, Operand, Rvalue,
-    Terminator, UnOp,
-};
-use gw_typeck::{ClassLayout, FloatTy, IntTy, Ty};
 use cranelift_codegen::ir::{self, AbiParam, InstBuilder, MemFlags, StackSlot};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::{isa, Context};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, DataId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
+use gw_mir::{
+    BinOp, BlockId, CastKind, Const, Local, MirBlock, MirFn, MirProgram, MirStmt, Operand, Rvalue,
+    Terminator, UnOp,
+};
+use gw_typeck::{ClassLayout, FloatTy, IntTy, Ty};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use target_lexicon::Triple;

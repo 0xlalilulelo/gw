@@ -49,7 +49,7 @@ pub enum SyntaxKind {
     KwConst,
     KwClass,
     KwMod,
-    KwCipher,
+    KwTrait,
     KwIf,
     KwElse,
     KwMatch,
@@ -63,8 +63,6 @@ pub enum SyntaxKind {
     KwErrdefer,
     KwTry,
     KwCatch,
-    KwFoxdie,
-    KwNaked,
     KwPub,
     KwUse,
     KwAs,
@@ -73,16 +71,15 @@ pub enum SyntaxKind {
     KwComptime,
     KwInline,
     KwExtern,
-    KwRex,
+    KwAsm,
     KwLock,
-    KwFox,
+    KwTask,
     KwAwait,
     KwYield,
     KwTrue,
     KwFalse,
     KwNil,
     KwEnum,
-    KwUnion,
     KwUnsafe,
 
     // Brackets
@@ -163,7 +160,7 @@ pub enum SyntaxKind {
     UseDecl,
 
     // Item hooks (Phase 2+; parser produces `ErrorNode` for now)
-    CipherDecl,
+    TraitDecl,
     ImplBlock,
     AttrItem,
     DirectiveItem,
@@ -301,7 +298,7 @@ impl SyntaxKind {
                 | KwConst
                 | KwClass
                 | KwMod
-                | KwCipher
+                | KwTrait
                 | KwIf
                 | KwElse
                 | KwMatch
@@ -315,8 +312,6 @@ impl SyntaxKind {
                 | KwErrdefer
                 | KwTry
                 | KwCatch
-                | KwFoxdie
-                | KwNaked
                 | KwPub
                 | KwUse
                 | KwAs
@@ -325,16 +320,15 @@ impl SyntaxKind {
                 | KwComptime
                 | KwInline
                 | KwExtern
-                | KwRex
+                | KwAsm
                 | KwLock
-                | KwFox
+                | KwTask
                 | KwAwait
                 | KwYield
                 | KwTrue
                 | KwFalse
                 | KwNil
                 | KwEnum
-                | KwUnion
                 | KwUnsafe
                 | LParen
                 | RParen
@@ -432,7 +426,7 @@ impl From<TokenKind> for SyntaxKind {
             TokenKind::KwConst => Self::KwConst,
             TokenKind::KwClass => Self::KwClass,
             TokenKind::KwMod => Self::KwMod,
-            TokenKind::KwCipher => Self::KwCipher,
+            TokenKind::KwTrait => Self::KwTrait,
             TokenKind::KwIf => Self::KwIf,
             TokenKind::KwElse => Self::KwElse,
             TokenKind::KwMatch => Self::KwMatch,
@@ -446,8 +440,6 @@ impl From<TokenKind> for SyntaxKind {
             TokenKind::KwErrdefer => Self::KwErrdefer,
             TokenKind::KwTry => Self::KwTry,
             TokenKind::KwCatch => Self::KwCatch,
-            TokenKind::KwFoxdie => Self::KwFoxdie,
-            TokenKind::KwNaked => Self::KwNaked,
             TokenKind::KwPub => Self::KwPub,
             TokenKind::KwUse => Self::KwUse,
             TokenKind::KwAs => Self::KwAs,
@@ -456,16 +448,15 @@ impl From<TokenKind> for SyntaxKind {
             TokenKind::KwComptime => Self::KwComptime,
             TokenKind::KwInline => Self::KwInline,
             TokenKind::KwExtern => Self::KwExtern,
-            TokenKind::KwRex => Self::KwRex,
+            TokenKind::KwAsm => Self::KwAsm,
             TokenKind::KwLock => Self::KwLock,
-            TokenKind::KwFox => Self::KwFox,
+            TokenKind::KwTask => Self::KwTask,
             TokenKind::KwAwait => Self::KwAwait,
             TokenKind::KwYield => Self::KwYield,
             TokenKind::KwTrue => Self::KwTrue,
             TokenKind::KwFalse => Self::KwFalse,
             TokenKind::KwNil => Self::KwNil,
             TokenKind::KwEnum => Self::KwEnum,
-            TokenKind::KwUnion => Self::KwUnion,
             TokenKind::KwUnsafe => Self::KwUnsafe,
             TokenKind::LParen => Self::LParen,
             TokenKind::RParen => Self::RParen,

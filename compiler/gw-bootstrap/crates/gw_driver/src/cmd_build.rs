@@ -5,15 +5,15 @@
 //! Phase 2 increment F.1: multi-file builds. The build target's
 //! sibling `.gw` files in the same directory are auto-discovered and
 //! folded into one resolved module / typed module / MIR program.
-//! Manifest-driven (`MotherBase.gw`) builds remain a separate path.
+//! Manifest-driven (`build.gw`) builds remain a separate path.
 
+use bumpalo::Bump;
 use gw_ast::FileArena;
 use gw_lex::{render_simple, SourceMap};
 use gw_mir::lower;
 use gw_parse::parse;
 use gw_resolve::resolve_modules;
 use gw_typeck::type_check;
-use bumpalo::Bump;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};

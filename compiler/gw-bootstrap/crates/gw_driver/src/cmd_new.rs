@@ -1,10 +1,10 @@
 //! `gw new <name>` — scaffold a fresh GW project.
 //!
 //! Creates a directory `<name>/` containing:
-//! - `MotherBase.gw` — minimal manifest stub. Phase 0 doesn't yet read
-//!   it; the contents follow `docs/spec.md` §5.8.2 ("a `MotherBase.gw`
-//!   at the project root drives the `gw build` command and is
-//!   itself executable GW code") so the file is recognisable when the
+//! - `build.gw` — minimal manifest stub. Phase 0 doesn't yet read it;
+//!   the contents follow `docs/spec.md` §5.8.2 ("a `build.gw` at the
+//!   project root drives the `gw build` command and is itself
+//!   executable GW code") so the file is recognisable when the
 //!   manifest reader lands.
 //! - `hello.gw` — the canonical GW one-liner (`docs/spec.md` §5.15.1).
 
@@ -14,18 +14,18 @@ use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
-const MOTHERBASE_TEMPLATE: &str = "// Project manifest. See docs/spec.md §5.8.2.
-// The `gw cipher` package manager will read this once it lands;
+const BUILD_TEMPLATE: &str = "// Project manifest. See docs/spec.md §5.8.2.
+// The `gw` package manager will read this once it lands;
 // for now it is a placeholder.
 
-#virtuous {
+comptime {
     package = \"%NAME%\";
     version = \"0.0.1\";
 }
 ";
 
 const HELLO_TEMPLATE: &str = "// docs/spec.md §5.15.1: bare string literals are sugar for Print.
-\"Behold the Outer Heaven.\\n\";
+\"Hello, world.\\n\";
 ";
 
 /// Run `gw new <name>`.
@@ -58,24 +58,21 @@ pub fn run(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let mb_path = dir.join("MotherBase.gw");
-    let mb_contents = MOTHERBASE_TEMPLATE.replace("%NAME%", &name_str);
-    if let Err(e) = write_file(&mb_path, mb_contents.as_bytes()) {
-        eprintln!("gw new: failed to write `{}`: {e}", mb_path.display());
+    let build_path = dir.join("build.gw");
+    let build_contents = BUILD_TEMPLATE.replace("%NAME%", &name_str);
+    if let Err(e) = write_file(&build_path, build_contents.as_bytes()) {
+        eprintln!("gw new: failed to write `{}`: {e}", build_path.display());
         return ExitCode::from(1);
     }
 
     let hello_path = dir.join("hello.gw");
     if let Err(e) = write_file(&hello_path, HELLO_TEMPLATE.as_bytes()) {
-        eprintln!(
-            "gw new: failed to write `{}`: {e}",
-            hello_path.display()
-        );
+        eprintln!("gw new: failed to write `{}`: {e}", hello_path.display());
         return ExitCode::from(1);
     }
 
     println!("created project `{name_str}`:");
-    println!("  {}", mb_path.display());
+    println!("  {}", build_path.display());
     println!("  {}", hello_path.display());
     println!();
     println!("next:  gw build {name_str}");
@@ -104,7 +101,7 @@ mod tests {
     #[test]
     fn name_validation() {
         assert!(is_valid_project_name("hello"));
-        assert!(is_valid_project_name("snake-eater"));
+        assert!(is_valid_project_name("my-project"));
         assert!(is_valid_project_name("_underscore"));
         assert!(!is_valid_project_name(""));
         assert!(!is_valid_project_name("1numeric"));
