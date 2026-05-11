@@ -1,0 +1,10 @@
+[package]
+name                   = "gw_comptime"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW comptime engine (#virtuous, #run, #insert, @codec) (Phase 2+ stub). See docs/architecture.md Part B.11, Part E."
+
+[lints.rust]
+missing_docs = "deny"

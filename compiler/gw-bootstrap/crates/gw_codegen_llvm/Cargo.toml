@@ -1,0 +1,17 @@
+[package]
+name                   = "gw_codegen_llvm"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW LLVM backend via inkwell (Phase 13). See docs/architecture.md Part F.2."
+
+[dependencies]
+gw_mir    = { workspace = true }
+gw_typeck = { workspace = true }
+inkwell        = { workspace = true }
+rustc-hash     = { workspace = true }
+target-lexicon = { workspace = true }
+
+[lints.rust]
+missing_docs = "deny"

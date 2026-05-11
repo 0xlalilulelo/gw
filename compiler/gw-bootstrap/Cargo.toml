@@ -1,0 +1,81 @@
+# GW bootstrap compiler workspace.
+#
+# See docs/architecture.md Part A.3 (host language: Rust) and Part N.1 (file layout).
+# Phase 0 builds only the four front-end crates (lex, ast, parse, driver); the
+# remaining crates listed in Part N.1 exist as empty stubs so the workspace
+# graph is in place from day one and downstream tooling (CI, rustfmt, clippy)
+# treats every crate uniformly.
+
+[workspace]
+resolver = "2"
+members = [
+    # --- Phase 0 active --------------------------------------------------
+    "crates/gw_lex",
+    "crates/gw_ast",
+    "crates/gw_parse",
+    "crates/gw_driver",
+    # --- Phase 1+ stubs --------------------------------------------------
+    "crates/gw_resolve",
+    "crates/gw_typeck",
+    "crates/gw_mir",
+    "crates/gw_borrow",
+    "crates/gw_lir",
+    "crates/gw_codegen_llvm",
+    "crates/gw_codegen_fast",
+    "crates/gw_comptime",
+    "crates/gw_jit",
+    "crates/gw_lsp",
+    "crates/gw_fmt",
+    "crates/gw_doc",
+    "crates/gw_pkg",
+]
+
+[workspace.package]
+version      = "0.0.1"
+edition      = "2021"
+rust-version = "1.95"
+license      = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# In-tree (Phase 0+ active)
+gw_lex          = { path = "crates/gw_lex" }
+gw_ast          = { path = "crates/gw_ast" }
+gw_parse        = { path = "crates/gw_parse" }
+gw_resolve      = { path = "crates/gw_resolve" }
+gw_typeck       = { path = "crates/gw_typeck" }
+gw_mir          = { path = "crates/gw_mir" }
+gw_codegen_fast = { path = "crates/gw_codegen_fast" }
+gw_codegen_llvm = { path = "crates/gw_codegen_llvm" }
+
+# Foundational
+phf        = { version = "0.11", features = ["macros"] }
+rustc-hash = "2"
+bumpalo    = { version = "3", features = ["collections"] }
+
+# Phase 1 codegen — Cranelift acts as the placeholder backend until the
+# TPDE-style fast backend lands in Phase 7 (see gw_codegen_fast/lib.rs).
+# Cranelift is pure-Rust with zero system dependencies, in contrast to LLVM,
+# which is deferred to its own session.
+cranelift-codegen   = "0.115"
+cranelift-frontend  = "0.115"
+cranelift-module    = "0.115"
+cranelift-object    = "0.115"
+target-lexicon      = "0.12"
+
+# Phase 13 LLVM backend (architecture Part F.2, M.4). Consumed by
+# `gw_codegen_llvm`; the `llvm-sys` build script needs
+# `LLVM_SYS_180_PREFIX` set when compiling the workspace.
+inkwell  = { version = "0.5", features = ["llvm18-0"] }
+llvm-sys = "180"
+
+# Dev-only
+insta = { version = "1", features = ["glob"] }
+
+[profile.dev]
+debug       = "line-tables-only"
+incremental = true
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+debug         = "line-tables-only"

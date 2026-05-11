@@ -1,0 +1,21 @@
+[package]
+name                   = "gw_mir"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW MIR (CFG of SSA-ish basic blocks). See docs/architecture.md Part B.7, Part C.3."
+
+[dependencies]
+gw_lex     = { workspace = true }
+gw_ast     = { workspace = true }
+gw_resolve = { workspace = true }
+gw_typeck  = { workspace = true }
+rustc-hash      = { workspace = true }
+
+[dev-dependencies]
+gw_parse = { workspace = true }
+bumpalo       = { workspace = true }
+
+[lints.rust]
+missing_docs = "deny"

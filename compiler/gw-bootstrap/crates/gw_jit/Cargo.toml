@@ -1,0 +1,10 @@
+[package]
+name                   = "gw_jit"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW JIT engine — `gw repl` REPL backbone (Phase 7+ stub). See docs/architecture.md Part I."
+
+[lints.rust]
+missing_docs = "deny"

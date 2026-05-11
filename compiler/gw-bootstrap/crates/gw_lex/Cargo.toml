@@ -1,0 +1,17 @@
+[package]
+name                   = "gw_lex"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW lexer, source map, span, and diagnostic types. See docs/architecture.md Part B.2."
+
+[dependencies]
+phf        = { workspace = true }
+rustc-hash = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+
+[lints.rust]
+missing_docs = "deny"

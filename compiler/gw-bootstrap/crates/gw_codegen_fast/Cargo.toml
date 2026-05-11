@@ -1,0 +1,22 @@
+[package]
+name                   = "gw_codegen_fast"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW codegen — Phase 1 uses Cranelift; Phase 7 swaps in TPDE per architecture Part F.1."
+
+[dependencies]
+gw_lex     = { workspace = true }
+gw_resolve = { workspace = true }
+gw_typeck  = { workspace = true }
+gw_mir     = { workspace = true }
+cranelift-codegen   = { workspace = true }
+cranelift-frontend  = { workspace = true }
+cranelift-module    = { workspace = true }
+cranelift-object    = { workspace = true }
+target-lexicon      = { workspace = true }
+rustc-hash          = { workspace = true }
+
+[lints.rust]
+missing_docs = "deny"

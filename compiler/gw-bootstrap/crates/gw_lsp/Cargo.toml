@@ -1,0 +1,10 @@
+[package]
+name                   = "gw_lsp"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "GW Language Server Protocol implementation (Phase 9+ stub). See docs/architecture.md Part H.3."
+
+[lints.rust]
+missing_docs = "deny"
