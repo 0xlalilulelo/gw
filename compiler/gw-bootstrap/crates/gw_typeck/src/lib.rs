@@ -2281,11 +2281,11 @@ fn expr_span(e: Expr<'_>) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bumpalo::Bump;
     use gw_ast::FileArena;
     use gw_lex::SourceMap;
     use gw_parse::parse;
     use gw_resolve::resolve_module;
-    use bumpalo::Bump;
 
     fn check(src: &str) -> u32 {
         let mut sm = SourceMap::new();

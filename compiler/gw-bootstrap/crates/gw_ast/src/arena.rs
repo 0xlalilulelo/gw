@@ -10,8 +10,8 @@
 //! from the bump; dropping the bump releases the entire CST in O(1).
 
 use crate::cst::{SyntaxElement, SyntaxNode};
-use gw_lex::FileId;
 use bumpalo::Bump;
+use gw_lex::FileId;
 
 /// Allocates CST nodes and child slices for one source file.
 ///

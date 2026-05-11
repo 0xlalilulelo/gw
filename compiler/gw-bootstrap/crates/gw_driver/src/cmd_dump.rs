@@ -3,10 +3,10 @@
 //! `gw build`; in Phase 1 it lives behind its own subcommand so
 //! `gw build` can do real compilation.
 
+use bumpalo::Bump;
 use gw_ast::{dump, FileArena};
 use gw_lex::{render_simple, SourceMap};
 use gw_parse::parse;
-use bumpalo::Bump;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};

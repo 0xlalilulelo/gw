@@ -26,10 +26,10 @@
 //! actual list of diagnostics produced by the lexer + parser is
 //! compared to the expected list verbatim, in order.
 
+use bumpalo::Bump;
 use gw_ast::{dump, FileArena};
 use gw_lex::{DiagBag, SourceMap};
 use gw_parse::parse;
-use bumpalo::Bump;
 use std::fs;
 
 fn parse_one(path: &std::path::Path) -> (String, DiagBag, SourceMap, gw_lex::FileId) {

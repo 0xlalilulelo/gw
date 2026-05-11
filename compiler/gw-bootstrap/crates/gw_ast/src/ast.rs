@@ -1651,8 +1651,8 @@ mod tests {
     use super::*;
     use crate::arena::FileArena;
     use crate::cst::CstBuilder;
-    use gw_lex::{FileId, Span};
     use bumpalo::Bump;
+    use gw_lex::{FileId, Span};
 
     fn span(start: u32, end: u32) -> Span {
         Span::new(FileId::NONE, start, end)

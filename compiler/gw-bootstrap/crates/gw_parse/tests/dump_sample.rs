@@ -11,10 +11,10 @@
 //! diagnostics + AST output document where the parser stopped and how
 //! recovery played out.
 
+use bumpalo::Bump;
 use gw_ast::{dump_with, DumpOpts, FileArena};
 use gw_lex::{render_simple, SourceMap};
 use gw_parse::parse;
-use bumpalo::Bump;
 
 const FIXTURE: &str = include_str!("../../gw_lex/tests/fixtures/sample.gw");
 

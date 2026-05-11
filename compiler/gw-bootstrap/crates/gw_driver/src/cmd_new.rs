@@ -67,10 +67,7 @@ pub fn run(args: &[OsString]) -> ExitCode {
 
     let hello_path = dir.join("hello.gw");
     if let Err(e) = write_file(&hello_path, HELLO_TEMPLATE.as_bytes()) {
-        eprintln!(
-            "gw new: failed to write `{}`: {e}",
-            hello_path.display()
-        );
+        eprintln!("gw new: failed to write `{}`: {e}", hello_path.display());
         return ExitCode::from(1);
     }
 
