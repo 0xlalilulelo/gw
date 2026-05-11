@@ -17,7 +17,7 @@ pub use arena::FileArena;
 pub use ast::{
     ArgList, ArrayType, AstNode, BinaryExpr, Block, BreakExpr, CallExpr, CastExpr, ClassDecl,
     ContinueExpr, ErrorUnionType, Expr, ExprStmt, FieldDecl, FieldDeclList, FieldExpr, FnDecl,
-    ForExpr, IdentPat, IfExpr, Item, LetStmt, LibertyDecl, LiteralExpr, LiteralPat, MatchArm,
+    ForExpr, IdentPat, IfExpr, Item, LetStmt, ModDecl, LiteralExpr, LiteralPat, MatchArm,
     MatchArmList, MatchExpr, Module, MustExpr, OptType, OrPat, Param, ParamList, ParenExpr,
     PathExpr, PathType, Pattern, RangePat, RefType, RetType, ReturnExpr, SliceType, Stmt,
     StructLitExpr, StructLitField, StructLitFieldList, Type, UnaryExpr, UseDecl, WhileExpr,

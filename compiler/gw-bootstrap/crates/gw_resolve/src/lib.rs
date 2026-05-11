@@ -10,7 +10,7 @@
 //! Output: a [`ResolvedModule`] containing a flat map from names to
 //! [`DefId`]s plus the underlying CST root for downstream consumers.
 
-use gw_ast::{AstNode, ClassDecl, FnDecl, Item, LibertyDecl, Module, SyntaxNode, UseDecl};
+use gw_ast::{AstNode, ClassDecl, FnDecl, Item, ModDecl, Module, SyntaxNode, UseDecl};
 use gw_lex::{DiagBag, Diagnostic, FileId, Label, SourceMap, Span};
 use rustc_hash::FxHashMap;
 
@@ -29,11 +29,11 @@ pub mod ec {
     /// statements that synthesise the implicit `main`.
     pub const TOP_LEVEL_STMTS_IN_LIBRARY: ErrorCode = ErrorCode(203);
     /// `use <name>;` referenced a module that no file declared via
-    /// `liberty <name>;` (Phase 2 increment F.2).
+    /// `mod <name>;` (Phase 2 increment F.2).
     pub const UNKNOWN_MODULE: ErrorCode = ErrorCode(204);
-    /// A file declared more than one `liberty <name>;` (Phase 2
+    /// A file declared more than one `mod <name>;` (Phase 2
     /// increment F.2). Each file is a single module.
-    pub const DUPLICATE_LIBERTY: ErrorCode = ErrorCode(205);
+    pub const DUPLICATE_MOD: ErrorCode = ErrorCode(205);
 }
 
 /// Stable identifier for a top-level definition within a module.
@@ -78,13 +78,13 @@ pub struct ResolvedModule<'a> {
     /// Definitions in source order.
     pub defs: Vec<Def<'a>>,
     /// Flat-namespace lookup from source name to [`DefId`]. Holds
-    /// items from non-`liberty` files. Phase 2 F.3 keeps this map
+    /// items from non-`mod` files. Phase 2 F.3 keeps this map
     /// stable (independent of `use` decls in any file); cross-file
     /// imports flow through [`Self::file_scopes`].
     pub by_name: FxHashMap<String, DefId>,
     /// Per-file effective name scope (Phase 2 increment F.3). Each
     /// file's scope = the flat `by_name` pool + the file's own items
-    /// (regardless of liberty) + items from modules the file
+    /// (regardless of mod decl) + items from modules the file
     /// `use`s. Typeck consults this map via
     /// [`Self::lookup_in_file`] so a `use foo;` in main.gw doesn't
     /// leak `foo`'s items into lib.gw.
@@ -148,7 +148,7 @@ pub fn resolve_modules<'a>(
         Module::cast(primary_node).expect("resolve_modules called on non-Module syntax node");
     let mut defs: Vec<Def<'a>> = Vec::new();
     let mut by_name: FxHashMap<String, DefId> = FxHashMap::default();
-    // Phase 2 increment F.2: each file with a `liberty foo;` declaration
+    // Phase 2 increment F.2: each file with a `mod foo;` declaration
     // contributes to `module_tables[foo]` instead of the global flat
     // `by_name`. Phase 2 increment F.3: `use foo;` decls populate
     // per-file scopes (in `file_uses`), not the global by_name.
@@ -162,7 +162,7 @@ pub fn resolve_modules<'a>(
     let mut file_uses: FxHashMap<FileId, Vec<(String, Span)>> = FxHashMap::default();
     // The set of files we've seen at all (so the post-pass knows which
     // file_scopes entries to build, even for files that only have a
-    // `liberty` decl and no items / uses).
+    // `mod` decl and no items / uses).
     let mut all_files: Vec<FileId> = Vec::new();
 
     process_module(
@@ -252,7 +252,7 @@ pub fn resolve_modules<'a>(
                     diags.push(Diagnostic::error(
                         ec::UNKNOWN_MODULE,
                         Label::new(*span, ""),
-                        format!("`use {used_name};` references a module not declared by any `liberty {used_name};`"),
+                        format!("`use {used_name};` references a module not declared by any `mod {used_name};`"),
                     ));
                     continue;
                 };
@@ -295,7 +295,7 @@ pub fn resolve_modules<'a>(
 
 /// Walk one module's items, route each fn/class into either the
 /// global flat namespace or the module's own table (when the file
-/// declares `liberty <name>;`). Collect any `use <name>;` decls into
+/// declares `mod <name>;`). Collect any `use <name>;` decls into
 /// `file_uses` for the F.3 post-pass to resolve into per-file
 /// scopes. Phase 2 increments F.2 / F.3.
 #[allow(clippy::too_many_arguments)]
@@ -316,20 +316,20 @@ fn process_module<'a>(
     if !all_files.contains(&file) {
         all_files.push(file);
     }
-    // Find the file's `liberty <name>;` declaration, if any. Multiple
-    // libertys per file diagnose; only the first wins.
-    let mut liberty: Option<String> = None;
+    // Find the file's `mod <name>;` declaration, if any. Multiple
+    // mod decls per file diagnose; only the first wins.
+    let mut mod_decl_name: Option<String> = None;
     for item in module.items() {
-        if let Item::Liberty(decl) = item {
-            if let Some(name) = liberty_name(decl, sm) {
-                if liberty.is_some() {
+        if let Item::Mod(decl) = item {
+            if let Some(name) = module_name(decl, sm) {
+                if mod_decl_name.is_some() {
                     diags.push(Diagnostic::error(
-                        ec::DUPLICATE_LIBERTY,
+                        ec::DUPLICATE_MOD,
                         Label::new(decl.syntax().span, ""),
-                        "file already declared `liberty`; only one per file",
+                        "file already declared `mod`; only one per file",
                     ));
                 } else {
-                    liberty = Some(name);
+                    mod_decl_name = Some(name);
                 }
             }
         }
@@ -343,7 +343,7 @@ fn process_module<'a>(
     for item in module.items() {
         match item {
             Item::Fn(f) => {
-                let registered = match liberty.as_deref() {
+                let registered = match mod_decl_name.as_deref() {
                     Some(modname) => register_fn(
                         f,
                         sm,
@@ -358,7 +358,7 @@ fn process_module<'a>(
                 }
             }
             Item::Class(c) => {
-                let registered = match liberty.as_deref() {
+                let registered = match mod_decl_name.as_deref() {
                     Some(modname) => register_class(
                         c,
                         sm,
@@ -380,8 +380,8 @@ fn process_module<'a>(
                         .push((name, u.syntax().span));
                 }
             }
-            Item::Liberty(_) | Item::Stub(_) | Item::Error(_) => {
-                // Liberty already handled above; Stub/Error already
+            Item::Mod(_) | Item::Stub(_) | Item::Error(_) => {
+                // Mod decl already handled above; Stub/Error already
                 // diagnosed by the parser.
             }
         }
@@ -389,7 +389,7 @@ fn process_module<'a>(
 
     // Top-level statements: only the primary file may have them
     // (synthetic `main`). Sibling files' top-level stmts diagnose,
-    // even if the file is liberty-declared (the synthetic-main
+    // even if the file is mod-declared (the synthetic-main
     // semantics don't extend to libraries).
     if !is_primary && module.stmts().next().is_some() {
         diags.push(Diagnostic::error(
@@ -400,8 +400,8 @@ fn process_module<'a>(
     }
 }
 
-/// Recover the name from a `liberty <name>;` declaration.
-fn liberty_name(decl: LibertyDecl<'_>, sm: &SourceMap) -> Option<String> {
+/// Recover the name from a `mod <name>;` declaration.
+fn module_name(decl: ModDecl<'_>, sm: &SourceMap) -> Option<String> {
     let span = decl.name()?;
     sm.slice(span).map(str::to_string)
 }
@@ -698,17 +698,17 @@ mod tests {
         assert!(errs >= 1);
     }
 
-    // ─── Phase 2 increment F.2: liberty + use ─────────────────────────────
+    // ─── Phase 2 increment F.2: mod + use ─────────────────────────────
 
     #[test]
-    fn liberty_items_invisible_without_use() {
-        // `add` lives in a `liberty math;` file; main doesn't `use
+    fn mod_items_invisible_without_use() {
+        // `add` lives in a `mod math;` file; main doesn't `use
         // math;`. The resolver itself stays diag-free (typeck flags
         // the missing call name); but `add` is in the module table,
         // not the flat namespace.
         let (names, errs) = run_multi_resolver(
             "fn main() -> i32 { return add(2, 3); }",
-            &["liberty math; fn add(a: i32, b: i32) -> i32 { return a + b; }"],
+            &["mod math; fn add(a: i32, b: i32) -> i32 { return a + b; }"],
         );
         assert!(names.contains(&"main".to_string()));
         assert!(names.contains(&"add".to_string()));
@@ -716,10 +716,10 @@ mod tests {
     }
 
     #[test]
-    fn use_brings_liberty_items_into_scope() {
+    fn use_brings_mod_items_into_scope() {
         let (_, errs) = run_multi_resolver(
             "use math; fn main() -> i32 { return add(2, 3); }",
-            &["liberty math; fn add(a: i32, b: i32) -> i32 { return a + b; }"],
+            &["mod math; fn add(a: i32, b: i32) -> i32 { return a + b; }"],
         );
         assert_eq!(errs, 0);
     }
@@ -731,10 +731,10 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_liberty_in_same_file_diagnoses() {
+    fn duplicate_mod_in_same_file_diagnoses() {
         let (_, errs) = run_multi_resolver(
             "fn main() -> i32 { return 0; }",
-            &["liberty math; liberty algebra; fn add() -> i32 { return 1; }"],
+            &["mod math; mod algebra; fn add() -> i32 { return 1; }"],
         );
         assert!(errs >= 1);
     }
@@ -744,8 +744,8 @@ mod tests {
     #[test]
     fn use_only_visible_in_declaring_file() {
         // main.gw `use math;`, lib.gw doesn't. Both files have items
-        // (lib.gw is flat-namespace, no liberty). lib.gw's `helper`
-        // refers to `add`, which lives in `liberty math;` and only
+        // (lib.gw is flat-namespace, no mod). lib.gw's `helper`
+        // refers to `add`, which lives in `mod math;` and only
         // main.gw imported it. lib.gw's scope shouldn't include
         // `add` — typeck (not the resolver) flags the unknown
         // reference, but the resolver's per-file scope construction
@@ -766,7 +766,7 @@ mod tests {
 
         let math_file = sm.add_file(
             "math.gw",
-            "liberty math; fn add(a: i32, b: i32) -> i32 { return a + b; }",
+            "mod math; fn add(a: i32, b: i32) -> i32 { return a + b; }",
         );
         let math_bytes = sm.get(math_file).unwrap().contents.as_bytes();
         let math_arena = FileArena::new(&bump, math_file);
@@ -791,14 +791,14 @@ mod tests {
     #[test]
     fn use_then_collide_with_local_diagnoses() {
         // Both files define `add`: primary in flat namespace,
-        // sibling under `liberty math;`. `use math;` brings the
+        // sibling under `mod math;`. `use math;` brings the
         // sibling's `add` into the flat namespace and collides with
         // the local one.
         let (_, errs) = run_multi_resolver(
             "use math;\n\
              fn add() -> i32 { return 99; }\n\
              fn main() -> i32 { return add(); }",
-            &["liberty math; fn add() -> i32 { return 0; }"],
+            &["mod math; fn add() -> i32 { return 0; }"],
         );
         assert!(errs >= 1);
     }

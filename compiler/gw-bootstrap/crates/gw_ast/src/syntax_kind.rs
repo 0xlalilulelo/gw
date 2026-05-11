@@ -48,7 +48,7 @@ pub enum SyntaxKind {
     KwVar,
     KwConst,
     KwClass,
-    KwLiberty,
+    KwMod,
     KwCipher,
     KwIf,
     KwElse,
@@ -66,7 +66,6 @@ pub enum SyntaxKind {
     KwFoxdie,
     KwNaked,
     KwPub,
-    KwMod,
     KwUse,
     KwAs,
     KwIn,
@@ -164,7 +163,6 @@ pub enum SyntaxKind {
     UseDecl,
 
     // Item hooks (Phase 2+; parser produces `ErrorNode` for now)
-    LibertyDecl,
     CipherDecl,
     ImplBlock,
     AttrItem,
@@ -302,7 +300,7 @@ impl SyntaxKind {
                 | KwVar
                 | KwConst
                 | KwClass
-                | KwLiberty
+                | KwMod
                 | KwCipher
                 | KwIf
                 | KwElse
@@ -320,7 +318,6 @@ impl SyntaxKind {
                 | KwFoxdie
                 | KwNaked
                 | KwPub
-                | KwMod
                 | KwUse
                 | KwAs
                 | KwIn
@@ -434,7 +431,7 @@ impl From<TokenKind> for SyntaxKind {
             TokenKind::KwVar => Self::KwVar,
             TokenKind::KwConst => Self::KwConst,
             TokenKind::KwClass => Self::KwClass,
-            TokenKind::KwLiberty => Self::KwLiberty,
+            TokenKind::KwMod => Self::KwMod,
             TokenKind::KwCipher => Self::KwCipher,
             TokenKind::KwIf => Self::KwIf,
             TokenKind::KwElse => Self::KwElse,
@@ -452,7 +449,6 @@ impl From<TokenKind> for SyntaxKind {
             TokenKind::KwFoxdie => Self::KwFoxdie,
             TokenKind::KwNaked => Self::KwNaked,
             TokenKind::KwPub => Self::KwPub,
-            TokenKind::KwMod => Self::KwMod,
             TokenKind::KwUse => Self::KwUse,
             TokenKind::KwAs => Self::KwAs,
             TokenKind::KwIn => Self::KwIn,

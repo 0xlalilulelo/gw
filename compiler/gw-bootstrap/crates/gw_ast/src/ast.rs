@@ -102,7 +102,7 @@ impl<'a> Module<'a> {
 /// Top-level item.
 ///
 /// Phase 0 produces typed variants only for [`Item::Fn`] and
-/// [`Item::Class`]; Phase 2 increment F.2 promotes [`Item::Liberty`]
+/// [`Item::Class`]; Phase 2 increment F.2 promotes [`Item::Mod`]
 /// and [`Item::Use`] from `Stub`. Other Phase 1+ items (`const`,
 /// `mod`, …) are recognised by kind and surfaced through [`Item::Stub`]
 /// until their typed views land. [`Item::Error`] holds a parser-
@@ -113,8 +113,8 @@ pub enum Item<'a> {
     Fn(FnDecl<'a>),
     /// `pub? class ... { ... }`
     Class(ClassDecl<'a>),
-    /// `liberty name;` — module declaration (Phase 2 F.2).
-    Liberty(LibertyDecl<'a>),
+    /// `mod name;` — module declaration (Phase 2 F.2).
+    Mod(ModDecl<'a>),
     /// `use name;` — module import (Phase 2 F.2).
     Use(UseDecl<'a>),
     /// Item kind recognised by the parser but without a typed view yet.
@@ -129,7 +129,7 @@ impl<'a> Item<'a> {
         Some(match n.kind {
             SyntaxKind::FnDecl => Self::Fn(FnDecl(n)),
             SyntaxKind::ClassDecl => Self::Class(ClassDecl(n)),
-            SyntaxKind::LibertyDecl => Self::Liberty(LibertyDecl(n)),
+            SyntaxKind::ModDecl => Self::Mod(ModDecl(n)),
             SyntaxKind::UseDecl => Self::Use(UseDecl(n)),
             // Phase 1+ item kinds — recognised but not yet typed.
             SyntaxKind::ConstDecl
@@ -148,31 +148,31 @@ impl<'a> Item<'a> {
         match self {
             Self::Fn(f) => f.syntax(),
             Self::Class(c) => c.syntax(),
-            Self::Liberty(l) => l.syntax(),
+            Self::Mod(l) => l.syntax(),
             Self::Use(u) => u.syntax(),
             Self::Stub(n) | Self::Error(n) => n,
         }
     }
 }
 
-/// `liberty <name>;` — declares the containing file as a named
-/// module. Items in a liberty-declared file are not added to the
+/// `mod <name>;` — declares the containing file as a named
+/// module. Items in a mod-declared file are not added to the
 /// global flat namespace; another file must `use <name>;` to bring
 /// them into scope.
 #[derive(Copy, Clone)]
-pub struct LibertyDecl<'a>(&'a SyntaxNode<'a>);
+pub struct ModDecl<'a>(&'a SyntaxNode<'a>);
 
-impl<'a> AstNode<'a> for LibertyDecl<'a> {
+impl<'a> AstNode<'a> for ModDecl<'a> {
     fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
-        (n.kind == SyntaxKind::LibertyDecl).then_some(Self(n))
+        (n.kind == SyntaxKind::ModDecl).then_some(Self(n))
     }
     fn syntax(self) -> &'a SyntaxNode<'a> {
         self.0
     }
 }
 
-impl<'a> LibertyDecl<'a> {
-    /// The module name — the `Ident` token following `liberty`.
+impl<'a> ModDecl<'a> {
+    /// The module name — the `Ident` token following `mod`.
     pub fn name(self) -> Option<Span> {
         self.0.child_token(SyntaxKind::Ident)
     }
@@ -1720,7 +1720,7 @@ mod tests {
     #[test]
     fn unrecognized_item_is_stub() {
         // `ConstDecl` is still a Stub item kind in Phase 2 (Phase 2
-        // increment F.2 promoted `LibertyDecl` and `UseDecl` to typed
+        // increment F.2 promoted `ModDecl` and `UseDecl` to typed
         // views; the test now uses a kind that's still on the Stub
         // path).
         let bump = Bump::new();

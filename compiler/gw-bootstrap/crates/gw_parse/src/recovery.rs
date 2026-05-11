@@ -14,7 +14,7 @@ pub fn is_item_start(kind: TokenKind) -> bool {
         kind,
         TokenKind::KwFn
             | TokenKind::KwClass
-            | TokenKind::KwLiberty
+            | TokenKind::KwMod
             | TokenKind::KwCipher
             | TokenKind::KwConst
             | TokenKind::KwMod

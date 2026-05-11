@@ -6,7 +6,7 @@
 //! `let`/`if`/`while`/`return`, integer/bool/string literals, and basic
 //! binary/unary operators.
 //!
-//! Items not in the Phase-1 minimum subset (`liberty`, `cipher`, `match`,
+//! Items not in the Phase-1 minimum subset (`mod`, `cipher`, `match`,
 //! `for`, async, comptime, etc.) are recognised by leading keyword and
 //! either:
 //!   - emitted as `ErrorNode` plus a "not yet supported" diagnostic, or
@@ -65,7 +65,7 @@ fn is_top_level_item_kind(kw: TokenKind) -> bool {
         kw,
         TokenKind::KwFn
             | TokenKind::KwClass
-            | TokenKind::KwLiberty
+            | TokenKind::KwMod
             | TokenKind::KwCipher
             | TokenKind::KwConst
             | TokenKind::KwMod
@@ -99,10 +99,10 @@ fn parse_item_or_recover(p: &mut Parser<'_, '_, '_>) {
     match kw {
         TokenKind::KwFn => parse_fn_decl(p, item_start),
         TokenKind::KwClass => parse_class_decl(p, item_start),
-        // Phase 2 increment F.2: `liberty <ident>;` declares the file
+        // Phase 2 increment F.2: `mod <ident>;` declares the file
         // as a module; `use <ident>;` imports a module's items into
         // the current file's namespace.
-        TokenKind::KwLiberty => parse_liberty_decl(p, item_start),
+        TokenKind::KwMod => parse_mod_decl(p, item_start),
         TokenKind::KwUse => parse_use_decl(p, item_start),
         // Recognised but not supported in Phase 0.
         TokenKind::KwCipher
@@ -300,16 +300,16 @@ fn parse_ret_type(p: &mut Parser<'_, '_, '_>) {
     p.builder.finish_node(end);
 }
 
-// ─── liberty + use (Phase 2 increment F.2) ────────────────────────────
+// ─── mod + use (Phase 2 increment F.2) ────────────────────────────
 
-/// `liberty <ident>;` — declares the file as a named module. Items
-/// in a liberty-declared file are *not* added to the global flat
+/// `mod <ident>;` — declares the file as a named module. Items
+/// in a mod-declared file are *not* added to the global flat
 /// namespace; another file must `use <ident>;` to bring them into
 /// scope.
-fn parse_liberty_decl(p: &mut Parser<'_, '_, '_>, start: u32) {
-    p.builder.start_node(SyntaxKind::LibertyDecl, start);
+fn parse_mod_decl(p: &mut Parser<'_, '_, '_>, start: u32) {
+    p.builder.start_node(SyntaxKind::ModDecl, start);
     p.skip_trivia_into_node();
-    p.expect(TokenKind::KwLiberty);
+    p.expect(TokenKind::KwMod);
     p.expect(TokenKind::Ident);
     p.expect(TokenKind::Semi);
     let end = p.cur_byte_start();

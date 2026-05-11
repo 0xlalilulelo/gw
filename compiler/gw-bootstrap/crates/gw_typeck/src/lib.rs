@@ -734,7 +734,7 @@ fn resolve_type(
         return prim;
     }
     // Try class lookup. Phase 2 F.3 routes the lookup through the
-    // path's source file so a class declared under `liberty foo;`
+    // path's source file so a class declared under `mod foo;`
     // is only visible to files that `use foo;` themselves.
     if let Some(name) = single_segment_name(path, sm) {
         let file = path.syntax().span.file;

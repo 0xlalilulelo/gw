@@ -139,9 +139,9 @@ fn ref_and_opt_types() {
 
 #[test]
 fn unsupported_item_recovers_to_next_fn() {
-    // `liberty` is recognised but not yet supported; the parser should
+    // `mod` is recognised but not yet supported; the parser should
     // emit a diagnostic and skip ahead so the following `fn` parses.
-    let src = "liberty Tile { Floor, Wall } fn after() -> u0 {}";
+    let src = "mod Tile { Floor, Wall } fn after() -> u0 {}";
     let (dump, errs) = parse_to_dump(src);
     assert!(errs >= 1, "expected at least 1 error, got {errs}\n{dump}");
     assert!(

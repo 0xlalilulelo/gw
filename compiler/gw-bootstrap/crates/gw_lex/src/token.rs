@@ -64,7 +64,7 @@ pub enum TokenKind {
     KwVar,
     KwConst,
     KwClass,
-    KwLiberty,
+    KwMod,
     KwCipher,
     KwIf,
     KwElse,
@@ -82,7 +82,6 @@ pub enum TokenKind {
     KwFoxdie,
     KwNaked,
     KwPub,
-    KwMod,
     KwUse,
     KwAs,
     KwIn,
@@ -99,7 +98,7 @@ pub enum TokenKind {
     KwFalse,
     KwNil,
 
-    // Reserved theme aliases — rejected as identifiers so that `liberty` ↔
+    // Reserved theme aliases — rejected as identifiers so that `mod` ↔
     // `enum union` aliasing (spec §5.4.3) and `unsafe` ↔ `naked` aliasing
     // (spec §5.5.1) can be wired up later without source-breaking changes.
     KwEnum,
@@ -203,7 +202,7 @@ impl TokenKind {
                 | Self::KwVar
                 | Self::KwConst
                 | Self::KwClass
-                | Self::KwLiberty
+                | Self::KwMod
                 | Self::KwCipher
                 | Self::KwIf
                 | Self::KwElse
@@ -221,7 +220,6 @@ impl TokenKind {
                 | Self::KwFoxdie
                 | Self::KwNaked
                 | Self::KwPub
-                | Self::KwMod
                 | Self::KwUse
                 | Self::KwAs
                 | Self::KwIn
@@ -270,7 +268,7 @@ impl TokenKind {
             Self::KwVar => "var",
             Self::KwConst => "const",
             Self::KwClass => "class",
-            Self::KwLiberty => "liberty",
+            Self::KwMod => "mod",
             Self::KwCipher => "cipher",
             Self::KwIf => "if",
             Self::KwElse => "else",
@@ -288,7 +286,6 @@ impl TokenKind {
             Self::KwFoxdie => "foxdie",
             Self::KwNaked => "naked",
             Self::KwPub => "pub",
-            Self::KwMod => "mod",
             Self::KwUse => "use",
             Self::KwAs => "as",
             Self::KwIn => "in",
