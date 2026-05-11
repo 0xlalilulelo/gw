@@ -6,8 +6,8 @@
 //! `let`/`if`/`while`/`return`, integer/bool/string literals, and basic
 //! binary/unary operators.
 //!
-//! Items not in the Phase-1 minimum subset (`mod`, `cipher`, `match`,
-//! `for`, async, comptime, etc.) are recognised by leading keyword and
+//! Items not in the Phase-1 minimum subset (`trait`, `match`, `for`,
+//! async, comptime, etc.) are recognised by leading keyword and
 //! either:
 //!   - emitted as `ErrorNode` plus a "not yet supported" diagnostic, or
 //!   - skipped using bracket-counted recovery to the next item boundary.
@@ -66,12 +66,10 @@ fn is_top_level_item_kind(kw: TokenKind) -> bool {
         TokenKind::KwFn
             | TokenKind::KwClass
             | TokenKind::KwMod
-            | TokenKind::KwCipher
+            | TokenKind::KwTrait
             | TokenKind::KwConst
-            | TokenKind::KwMod
             | TokenKind::KwUse
             | TokenKind::KwEnum
-            | TokenKind::KwUnion
             | TokenKind::KwInline
             | TokenKind::KwComptime
             | TokenKind::Hash
@@ -105,11 +103,9 @@ fn parse_item_or_recover(p: &mut Parser<'_, '_, '_>) {
         TokenKind::KwMod => parse_mod_decl(p, item_start),
         TokenKind::KwUse => parse_use_decl(p, item_start),
         // Recognised but not supported in Phase 0.
-        TokenKind::KwCipher
+        TokenKind::KwTrait
         | TokenKind::KwConst
-        | TokenKind::KwMod
         | TokenKind::KwEnum
-        | TokenKind::KwUnion
         | TokenKind::Hash
         | TokenKind::At => recover_unsupported_item(p, item_start, kw),
         _ => recover_unrecognized_item(p, item_start),

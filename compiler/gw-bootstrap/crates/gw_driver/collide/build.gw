@@ -1,8 +1,8 @@
 // Project manifest. See docs/spec.md §5.8.2.
-// The `arsenal cipher` package manager will read this once it lands;
+// The `gw` package manager will read this once it lands;
 // for now it is a placeholder.
 
-#virtuous {
+comptime {
     package = "collide";
     version = "0.0.1";
 }

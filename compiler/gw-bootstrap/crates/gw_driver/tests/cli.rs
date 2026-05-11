@@ -75,7 +75,7 @@ fn new_then_build_round_trip() {
     // gw new hello
     let _ = run(&["new", "hello"]);
     // Files exist
-    assert!(tmp.join("hello").join("MotherBase.gw").is_file());
+    assert!(tmp.join("hello").join("build.gw").is_file());
     assert!(tmp.join("hello").join("hello.gw").is_file());
     // gw build hello — exits non-zero because Phase 0 templates
     // include directives the parser doesn't yet support, but the AST

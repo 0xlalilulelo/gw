@@ -133,8 +133,7 @@ impl<'a> Item<'a> {
             SyntaxKind::UseDecl => Self::Use(UseDecl(n)),
             // Phase 1+ item kinds — recognised but not yet typed.
             SyntaxKind::ConstDecl
-            | SyntaxKind::ModDecl
-            | SyntaxKind::CipherDecl
+            | SyntaxKind::TraitDecl
             | SyntaxKind::ImplBlock
             | SyntaxKind::AttrItem
             | SyntaxKind::DirectiveItem => Self::Stub(n),

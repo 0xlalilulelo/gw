@@ -6,8 +6,8 @@
 use crate::token::TokenKind;
 use phf::phf_map;
 
-/// Maps the source text of a keyword (or reserved theme alias) to its
-/// [`TokenKind`]. Constant-time lookup via a `phf` perfect hash.
+/// Maps the source text of a keyword to its [`TokenKind`]. Constant-time
+/// lookup via a `phf` perfect hash.
 ///
 /// Updates here must keep [`TokenKind::is_keyword`] and
 /// [`TokenKind::as_str`] in sync.
@@ -17,8 +17,8 @@ pub static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "var"       => TokenKind::KwVar,
     "const"     => TokenKind::KwConst,
     "class"     => TokenKind::KwClass,
-    "mod"   => TokenKind::KwMod,
-    "cipher"    => TokenKind::KwCipher,
+    "mod"       => TokenKind::KwMod,
+    "trait"     => TokenKind::KwTrait,
     "if"        => TokenKind::KwIf,
     "else"      => TokenKind::KwElse,
     "match"     => TokenKind::KwMatch,
@@ -32,8 +32,6 @@ pub static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "errdefer"  => TokenKind::KwErrdefer,
     "try"       => TokenKind::KwTry,
     "catch"     => TokenKind::KwCatch,
-    "foxdie"    => TokenKind::KwFoxdie,
-    "naked"     => TokenKind::KwNaked,
     "pub"       => TokenKind::KwPub,
     "use"       => TokenKind::KwUse,
     "as"        => TokenKind::KwAs,
@@ -42,16 +40,15 @@ pub static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "comptime"  => TokenKind::KwComptime,
     "inline"    => TokenKind::KwInline,
     "extern"    => TokenKind::KwExtern,
-    "rex"       => TokenKind::KwRex,
+    "asm"       => TokenKind::KwAsm,
     "lock"      => TokenKind::KwLock,
-    "fox"       => TokenKind::KwFox,
+    "task"      => TokenKind::KwTask,
     "await"     => TokenKind::KwAwait,
     "yield"     => TokenKind::KwYield,
     "true"      => TokenKind::KwTrue,
     "false"     => TokenKind::KwFalse,
     "nil"       => TokenKind::KwNil,
     "enum"      => TokenKind::KwEnum,
-    "union"     => TokenKind::KwUnion,
     "unsafe"    => TokenKind::KwUnsafe,
 };
 
@@ -62,16 +59,16 @@ mod tests {
     #[test]
     fn lookup_basic() {
         assert_eq!(KEYWORDS.get("fn").copied(), Some(TokenKind::KwFn));
-        assert_eq!(KEYWORDS.get("foxdie").copied(), Some(TokenKind::KwFoxdie));
+        assert_eq!(KEYWORDS.get("trait").copied(), Some(TokenKind::KwTrait));
         assert_eq!(KEYWORDS.get("notakeyword").copied(), None);
         assert_eq!(KEYWORDS.get("").copied(), None);
     }
 
     #[test]
-    fn theme_aliases_reserved() {
+    fn extra_reservations() {
         assert_eq!(KEYWORDS.get("enum").copied(), Some(TokenKind::KwEnum));
-        assert_eq!(KEYWORDS.get("union").copied(), Some(TokenKind::KwUnion));
         assert_eq!(KEYWORDS.get("unsafe").copied(), Some(TokenKind::KwUnsafe));
+        assert_eq!(KEYWORDS.get("asm").copied(), Some(TokenKind::KwAsm));
     }
 
     #[test]

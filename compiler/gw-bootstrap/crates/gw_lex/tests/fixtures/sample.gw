@@ -3,8 +3,8 @@
 // Goal: lex with zero diagnostics. Many constructs here are NOT yet
 // grammatical for the Phase 0 parser; this file is for the lexer alone.
 
-/// Sum-type smoke test for the eventual liberty parser.
-liberty Tile {
+/// Sum-type smoke test for the enum parser.
+enum Tile {
     Floor,
     Wall,
     Door { locked: bool },
@@ -23,7 +23,7 @@ class Player {
     name: []u8 @display,
 }
 
-cipher Ord {
+trait Ord {
     fn cmp(self: &Self, other: &Self) -> i32;
 }
 
@@ -124,10 +124,10 @@ fn options(opt: ?Player) -> ?i32 {
     return hp;
 }
 
-/// Error-union usage with foxdie propagation.
+/// Error-union usage with try propagation.
 fn read_int(path: []u8) -> !i32 {
-    let f = foxdie open(path);
-    let n = foxdie f.read_int();
+    let f = try open(path);
+    let n = try f.read_int();
     return n;
 }
 
@@ -148,14 +148,14 @@ fn match_smoke(t: Tile) -> u0 {
 }
 
 #[interrupt]
-fn irq_kbd() -> u0 naked {
-    rex {
+fn irq_kbd() -> u0 {
+    asm {
         IN AL, 0x60
         IRET
     }
 }
 
-#virtuous {
+comptime {
     const N: i32 = 4;
 }
 
@@ -165,10 +165,10 @@ class Saved {
     hp: i32 @range(0, 100),
 }
 
-extern fn malloc(size: usize) -> *naked u8;
+extern fn malloc(size: usize) -> *u8;
 
 pub fn use_attrs(p: &Player) -> u0 {
-    let info = @codec(Player);
+    let info = @type_info(Player);
     let val  = @field(p, "hp");
     let made = @call(makefn, args);
 }
@@ -222,7 +222,7 @@ lock {
     let _ = 0;
 }
 
-fox worker();
+task worker();
 await some_future();
 yield 0;
 
@@ -237,10 +237,8 @@ fn pub_const_var_where() -> u0 where T: Ord {
     let _ = v;
 }
 
-// Reserved theme aliases (spec §5.1, §5.4.3, §5.5.1). The lexer
-// classifies these as keywords; the parser aliases them later.
+// Extra reserved keywords beyond the core item set.
 enum Color { Red, Green, Blue }
-union Bytes { i: i64, f: f64 }
 fn raw_pointer_smoke() -> u0 {
     unsafe { let _ = 0; }
 }

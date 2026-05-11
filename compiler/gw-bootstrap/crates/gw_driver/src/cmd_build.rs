@@ -5,7 +5,7 @@
 //! Phase 2 increment F.1: multi-file builds. The build target's
 //! sibling `.gw` files in the same directory are auto-discovered and
 //! folded into one resolved module / typed module / MIR program.
-//! Manifest-driven (`MotherBase.gw`) builds remain a separate path.
+//! Manifest-driven (`build.gw`) builds remain a separate path.
 
 use gw_ast::FileArena;
 use gw_lex::{render_simple, SourceMap};
