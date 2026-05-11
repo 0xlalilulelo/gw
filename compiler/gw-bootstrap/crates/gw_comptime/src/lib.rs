@@ -5,14 +5,20 @@
 //! Phase 5 replaces it with a stack VM operating on MIR; the on-disk
 //! semantics (`CtValue`, sandbox budgets, error variants) carry over.
 //!
-//! CT.1 scope (this sub-bundle) — the smallest end-to-end comptime
-//! tracer. The evaluator accepts a `comptime { … }` block whose tail
-//! expression reduces to an integer literal (possibly wrapped in
-//! parens or a unary minus). Statements inside the block, arithmetic,
-//! and control flow are rejected with [`EvalError::Unsupported`]
-//! until CT.2 lands the interpreter loop.
+//! CT.1 scope — the smallest end-to-end comptime tracer. The
+//! evaluator accepts a `comptime { … }` block whose tail expression
+//! reduces to an integer literal (possibly wrapped in parens, a
+//! unary minus, or another block).
+//!
+//! CT.2a (this sub-bundle) — integer binary arithmetic. The
+//! evaluator gains an `Expr::Binary` arm dispatching on
+//! `+ - * / %` over `CtValue::Int(i128)` operands; overflow and
+//! division-by-zero raise the new [`EvalError::IntegerOverflow`] /
+//! [`EvalError::DivisionByZero`] variants. CT.2b will widen to
+//! comparisons + `CtValue::Bool`; CT.2c will add `if`/`else` +
+//! let-bindings + locals env.
 
-use gw_ast::ast::{AstNode, Block, Expr, LiteralExpr};
+use gw_ast::ast::{AstNode, BinaryExpr, Block, Expr, LiteralExpr};
 use gw_ast::SyntaxKind;
 use gw_lex::{SourceMap, Span};
 
@@ -45,6 +51,17 @@ pub enum EvalError {
     StackOverflow(Span),
     /// An integer literal could not be parsed as i128.
     BadIntLiteral(Span),
+    /// A checked integer operation overflowed `i128`. CT.2's
+    /// evaluator works in i128 arbitrary precision (decision Q1 in
+    /// the HANDOFF's CT.2 plan); overflow here means the comptime
+    /// computation itself exceeded i128, distinct from
+    /// materialisation-time narrowing overflow that fires in
+    /// `gw_typeck::lower_comptime` when the result doesn't fit the
+    /// surrounding runtime type.
+    IntegerOverflow(Span),
+    /// `lhs / 0` or `lhs % 0` during evaluation. Span points at the
+    /// offending binary expression.
+    DivisionByZero(Span),
 }
 
 impl EvalError {
@@ -54,7 +71,9 @@ impl EvalError {
             Self::Unsupported { span, .. }
             | Self::BudgetExceeded(span)
             | Self::StackOverflow(span)
-            | Self::BadIntLiteral(span) => *span,
+            | Self::BadIntLiteral(span)
+            | Self::IntegerOverflow(span)
+            | Self::DivisionByZero(span) => *span,
         }
     }
 }
@@ -136,11 +155,13 @@ impl<'sm> EvalCx<'sm> {
 
 /// Evaluate the body of a `comptime { … }` block.
 ///
-/// CT.1 surface: the block must consist of zero statements and a
-/// single tail expression that reduces to an integer literal
-/// (possibly wrapped in parens or `Unary(Minus, …)`). Wider shapes
-/// (let-bindings, control flow, arithmetic) are rejected with
-/// [`EvalError::Unsupported`] until CT.2.
+/// CT.1 + CT.2a surface: the block must consist of zero statements
+/// and a single tail expression. The tail expression may be an
+/// integer literal, a unary minus, a parenthesised expression, a
+/// nested block, or a binary arithmetic expression (`+ - * / %`)
+/// over integer operands. let-bindings, comparisons, control flow,
+/// and other shapes are rejected with [`EvalError::Unsupported`]
+/// until CT.2b / CT.2c.
 pub fn eval_comptime_block(block: Block<'_>, cx: &mut EvalCx<'_>) -> Result<CtValue, EvalError> {
     let span = block.syntax().span;
     cx.step(span)?;
@@ -203,11 +224,68 @@ fn eval_expr(expr: Expr<'_>, cx: &mut EvalCx<'_>) -> Result<CtValue, EvalError> 
             cx.exit();
             v
         }
+        Expr::Binary(b) => {
+            cx.enter(span)?;
+            let v = eval_binary(b, span, cx);
+            cx.exit();
+            v
+        }
         _ => Err(EvalError::Unsupported {
             span,
-            what: "this expression shape is not yet supported by the CT.1 evaluator",
+            what: "this expression shape is not yet supported by the CT.2 evaluator",
         }),
     }
+}
+
+/// Evaluate `lhs OP rhs` over `CtValue::Int(i128)` operands. CT.2
+/// supports `+ - * / %` only; comparisons / shifts / bitwise / logical
+/// land in later widenings. Arithmetic uses `i128` checked ops per
+/// decision Q1 (arbitrary-precision evaluator, narrow at
+/// materialisation): an overflow during compile-time eval is a
+/// distinct error from a materialisation-time narrowing overflow.
+fn eval_binary(
+    expr: BinaryExpr<'_>,
+    span: Span,
+    cx: &mut EvalCx<'_>,
+) -> Result<CtValue, EvalError> {
+    let lhs = expr.lhs().ok_or(EvalError::Unsupported {
+        span,
+        what: "binary operator missing its left operand",
+    })?;
+    let rhs = expr.rhs().ok_or(EvalError::Unsupported {
+        span,
+        what: "binary operator missing its right operand",
+    })?;
+    let op = expr.op_kind().ok_or(EvalError::Unsupported {
+        span,
+        what: "binary operator missing its operator token",
+    })?;
+    let CtValue::Int(l) = eval_expr(lhs, cx)?;
+    let CtValue::Int(r) = eval_expr(rhs, cx)?;
+    let result = match op {
+        SyntaxKind::Plus => l.checked_add(r).ok_or(EvalError::IntegerOverflow(span))?,
+        SyntaxKind::Minus => l.checked_sub(r).ok_or(EvalError::IntegerOverflow(span))?,
+        SyntaxKind::Star => l.checked_mul(r).ok_or(EvalError::IntegerOverflow(span))?,
+        SyntaxKind::Slash => {
+            if r == 0 {
+                return Err(EvalError::DivisionByZero(span));
+            }
+            l.checked_div(r).ok_or(EvalError::IntegerOverflow(span))?
+        }
+        SyntaxKind::Percent => {
+            if r == 0 {
+                return Err(EvalError::DivisionByZero(span));
+            }
+            l.checked_rem(r).ok_or(EvalError::IntegerOverflow(span))?
+        }
+        _ => {
+            return Err(EvalError::Unsupported {
+                span,
+                what: "this binary operator is not yet supported by the CT.2 evaluator",
+            });
+        }
+    };
+    Ok(CtValue::Int(result))
 }
 
 fn eval_literal(l: LiteralExpr<'_>, cx: &mut EvalCx<'_>) -> Result<CtValue, EvalError> {
@@ -350,12 +428,89 @@ mod tests {
         );
     }
 
+    // CT.2: binary arithmetic on integer literals.
+
     #[test]
-    fn arithmetic_is_unsupported_at_ct1() {
-        let err = eval_default("fn t() -> i32 { return comptime { 1 + 2 }; }").unwrap_err();
+    fn binary_addition() {
+        let CtValue::Int(n) = eval_default("fn t() -> i32 { return comptime { 1 + 2 }; }").unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn binary_subtraction() {
+        let CtValue::Int(n) =
+            eval_default("fn t() -> i32 { return comptime { 10 - 3 }; }").unwrap();
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn binary_multiplication() {
+        let CtValue::Int(n) = eval_default("fn t() -> i32 { return comptime { 6 * 7 }; }").unwrap();
+        assert_eq!(n, 42);
+    }
+
+    #[test]
+    fn binary_division_truncates() {
+        let CtValue::Int(n) =
+            eval_default("fn t() -> i32 { return comptime { 100 / 7 }; }").unwrap();
+        assert_eq!(n, 14);
+    }
+
+    #[test]
+    fn binary_modulo() {
+        let CtValue::Int(n) =
+            eval_default("fn t() -> i32 { return comptime { 100 % 7 }; }").unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn binary_precedence_respects_pratt() {
+        // `1 + 2 * 3` parses as `1 + (2 * 3)` via Pratt precedence;
+        // the evaluator simply walks the resulting CST so it inherits
+        // the correct precedence for free.
+        let CtValue::Int(n) =
+            eval_default("fn t() -> i32 { return comptime { 1 + 2 * 3 }; }").unwrap();
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn binary_negated_operand() {
+        // Exercises the interaction between the Unary(Minus, ...)
+        // arm (CT.1) and the Binary arm (CT.2).
+        let CtValue::Int(n) =
+            eval_default("fn t() -> i32 { return comptime { -3 + 10 }; }").unwrap();
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn division_by_zero_rejected() {
+        let err = eval_default("fn t() -> i32 { return comptime { 1 / 0 }; }").unwrap_err();
+        assert!(
+            matches!(err, EvalError::DivisionByZero(_)),
+            "expected DivisionByZero, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn modulo_by_zero_rejected() {
+        let err = eval_default("fn t() -> i32 { return comptime { 1 % 0 }; }").unwrap_err();
+        assert!(
+            matches!(err, EvalError::DivisionByZero(_)),
+            "expected DivisionByZero, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn unsupported_binary_op_rejects() {
+        // `<` lands in a later CT.x widening (comparisons require
+        // CtValue::Bool). For now the evaluator's Binary arm
+        // explicitly rejects non-arithmetic operators with a clear
+        // Unsupported diagnostic rather than producing wrong
+        // numbers.
+        let err = eval_default("fn t() -> i32 { return comptime { 1 < 2 }; }").unwrap_err();
         assert!(
             matches!(err, EvalError::Unsupported { .. }),
-            "expected Unsupported (binary ops land in CT.2), got {err:?}",
+            "expected Unsupported (comparison ops land in a later CT.x), got {err:?}",
         );
     }
 

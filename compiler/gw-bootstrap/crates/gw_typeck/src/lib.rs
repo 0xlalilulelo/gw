@@ -1488,6 +1488,12 @@ fn comptime_error_message(err: &EvalError) -> String {
         EvalError::BadIntLiteral(_) => {
             "comptime evaluation could not parse this integer literal".to_string()
         }
+        EvalError::IntegerOverflow(_) => {
+            "comptime arithmetic overflowed `i128` during evaluation".to_string()
+        }
+        EvalError::DivisionByZero(_) => {
+            "comptime evaluation attempted division or modulo by zero".to_string()
+        }
     }
 }
 
