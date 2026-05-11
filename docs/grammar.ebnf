@@ -1,194 +1,677 @@
-(* ============================================================================
- * GW grammar — Phase 0 subset accepted by `arsenal_parse`.
+(* ============================================================
+ * GW Language Grammar
+ * ------------------------------------------------------------
+ * Status:   1.0-draft
+ * Scope:    The canonical syntactic reference for GW source.
+ * Audience: Parser implementers, tooling authors, LLM consumers.
  *
- * This file describes the *exact* subset of GW the bootstrap parser
- * currently accepts; it is updated as the parser evolves. The full GW
- * surface is described in `docs/spec.md`; the architecture rationale
- * for keeping a hand-written parser is in `docs/architecture.md` Part B.3.
+ * Notation:
+ *   ::=     production
+ *   |       alternative
+ *   ?       optional (0 or 1)
+ *   *       zero or more
+ *   +       one or more
+ *   ( )     grouping
+ *   "..."   terminal string (literal)
+ *   [ ]     character class
+ *   [^ ]    negated character class
+ *   ~       lookahead negation
+ *   (* *)   comment
  *
- * Notation
- * --------
- *   Nonterminals are PascalCase.
- *   Terminals are either:
- *     - uppercase token names (matching `arsenal_lex::TokenKind` variants
- *       whose lexeme varies — `IDENT`, `INT_LIT`, `STRING_LIT`, ...), or
- *     - quoted lexemes for tokens whose text is fixed (`'fn'`, `'->'`).
+ * Whitespace and comments are skipped between tokens unless
+ * inside a string literal.
  *
- *   `?`   optional
- *   `*`   zero or more
- *   `+`   one or more
- *   `|`   alternation
- *   `(.)` grouping
+ * Disambiguation rules that the grammar alone cannot express
+ * are documented in `(* note: ... *)` comments adjacent to the
+ * affected production.
+ * ============================================================ *)
+
+
+(* ============================================================
+ * § 1. Lexical
+ * ============================================================ *)
+
+(* --- Whitespace and comments --- *)
+
+Whitespace      ::= ( " " | "\t" | "\r" | "\n" )+
+LineComment     ::= "//" ( [^\n] )* ( "\n" | EOF )
+DocComment      ::= "///" ( [^\n] )* ( "\n" | EOF )
+                  | "//!" ( [^\n] )* ( "\n" | EOF )   (* inner doc *)
+BlockComment    ::= "/*" ( BlockComment | ~"*/" Any )* "*/"   (* nestable *)
+
+(* --- Identifiers --- *)
+
+Ident           ::= IdentStart IdentCont*
+IdentStart      ::= [A-Za-z_]
+IdentCont       ::= [A-Za-z0-9_]
+
+(* note: identifiers are ASCII at the lexer level for trivial
+ * editor tooling. Keywords below are *reserved* and cannot
+ * appear as identifiers anywhere they would be syntactically
+ * acceptable. *)
+
+(* --- Keywords --- *)
+
+Keyword ::=
+      "fn" | "let" | "var" | "const"
+    | "class" | "enum" | "trait" | "impl"
+    | "if" | "else" | "then" | "match"
+    | "for" | "while" | "loop" | "in"
+    | "break" | "continue" | "return"
+    | "defer" | "errdefer"
+    | "try" | "catch"
+    | "unsafe" | "manual" | "safe"
+    | "pub" | "mod" | "use" | "as" | "where"
+    | "comptime" | "inline" | "extern" | "asm"
+    | "lock" | "task" | "async" | "await" | "yield"
+    | "nursery"
+    | "true" | "false" | "nil"
+    | "self" | "Self" | "type"
+
+(* --- Integer literals --- *)
+
+IntLit          ::= ( DecIntLit | HexIntLit | OctIntLit | BinIntLit ) IntSuffix?
+DecIntLit       ::= [0-9] [0-9_]*
+HexIntLit       ::= "0x" [0-9a-fA-F] [0-9a-fA-F_]*
+OctIntLit       ::= "0o" [0-7] [0-7_]*
+BinIntLit       ::= "0b" [01] [01_]*
+IntSuffix       ::= ( "i" | "u" ) ( "8" | "16" | "32" | "64" | "128" | "size" )
+
+(* --- Float literals --- *)
+
+FloatLit        ::= DecFloatLit FloatSuffix?
+                  | HexFloatLit FloatSuffix?
+DecFloatLit     ::= [0-9] [0-9_]* "." [0-9] [0-9_]* FloatExp?
+                  | [0-9] [0-9_]* FloatExp
+FloatExp        ::= ( "e" | "E" ) ( "+" | "-" )? [0-9] [0-9_]*
+HexFloatLit     ::= "0x" [0-9a-fA-F] [0-9a-fA-F_]*
+                    ( "." [0-9a-fA-F] [0-9a-fA-F_]* )?
+                    ( "p" | "P" ) ( "+" | "-" )? [0-9]+
+FloatSuffix     ::= "f16" | "bf16" | "f32" | "f64"
+
+(* --- Character literals --- *)
+
+CharLit         ::= "'" ( CharChar | EscapeSeq ) "'"      (* rune *)
+ByteCharLit     ::= "c'" ( CharChar | EscapeSeq ) "'"     (* u8   *)
+CharChar        ::= [^'\\\n]
+
+(* --- String literals --- *)
+
+StringLit       ::= "\"" ( StringChar | EscapeSeq )* "\""
+ByteStringLit   ::= "c\"" ( StringChar | EscapeSeq )* "\""   (* null-terminated *)
+RawStringLit    ::= "\\\\" ( ~"\\\\" Any )* "\\\\"            (* delimited by \\, no escapes *)
+StringChar      ::= [^"\\\n]
+
+EscapeSeq       ::= "\\" ( "n" | "r" | "t" | "0" | "\\" | "\"" | "'"
+                         | "x" [0-9a-fA-F][0-9a-fA-F]
+                         | "u" "{" [0-9a-fA-F]+ "}" )
+
+(* --- Other literal-like tokens --- *)
+
+BoolLit         ::= "true" | "false"
+NilLit          ::= "nil"
+
+(* --- Operators and punctuation (lexer tokens) --- *)
+
+(* Multi-character operators must be tried before single-character ones.
+ * Compound assignment operators precede their bare forms. *)
+Operator ::=
+    (* compound assignment *)
+      "+=" | "-=" | "*=" | "/=" | "%="
+    | "&=" | "|=" | "^=" | "<<=" | ">>="
+    (* comparison *)
+    | "==" | "!=" | "<=" | ">="
+    (* shifts *)
+    | "<<" | ">>"
+    (* range *)
+    | "..=" | ".."
+    (* fallible *)
+    | "??" | "?." | "!!"
+    (* arrows *)
+    | "->" | "=>" | "<-"
+    (* power - see § 6 disambiguation *)
+    | "**"
+    (* single-char *)
+    | "+" | "-" | "*" | "/" | "%"
+    | "&" | "|" | "^" | "~" | "!"
+    | "<" | ">" | "="
+    | "?" | "@" | "#"
+
+Delimiter       ::= "(" | ")" | "[" | "]" | "{" | "}"
+                  | "," | ";" | ":" | "." | "_"
+
+
+(* ============================================================
+ * § 2. Compilation Unit
+ * ============================================================ *)
+
+CompilationUnit ::= Shebang? Item*
+Shebang         ::= "#!" [^\n]* "\n"
+
+Item ::=
+      Attribute*
+      Visibility?
+      ( UseDecl
+      | ModuleDecl
+      | FnDecl
+      | ClassDecl
+      | EnumDecl
+      | TraitDecl
+      | ImplBlock
+      | ConstDecl
+      | ExternBlock
+      | TopLevelStmt
+      )
+
+Visibility      ::= "pub"
+
+Attribute       ::= "#[" AttrPath AttrArgs? "]"
+AttrPath        ::= Ident ( "." Ident )*
+AttrArgs        ::= "(" AttrArgList? ")"
+AttrArgList     ::= AttrArg ( "," AttrArg )* ","?
+AttrArg         ::= Expr | Ident "=" Expr
+
+(* note: An item without `pub` is module-private. Inside an impl block,
+ * inner items default to whatever the impl block's visibility is. *)
+
+
+(* ============================================================
+ * § 3. Modules and Imports
+ * ============================================================ *)
+
+ModuleDecl      ::= "mod" Ident ";"
+                  | "mod" Ident "{" Item* "}"   (* inline submodule, rare *)
+
+UseDecl         ::= "use" UseTree ";"
+UseTree         ::= UsePath UseSuffix?
+UsePath         ::= Ident ( "." Ident )*
+UseSuffix       ::= "." "{" UseItem ( "," UseItem )* ","? "}"
+                  | "." "*"
+                  | "as" Ident
+UseItem         ::= Ident ( "as" Ident )?
+                  | "{" UseItem ( "," UseItem )* ","? "}"
+
+
+(* ============================================================
+ * § 4. Functions and Signatures
+ * ============================================================ *)
+
+FnDecl          ::= FnPrefix "fn" Ident GenericParams?
+                    "(" FnParams? ")" FnReturn?
+                    WhereClause?
+                    FnBody
+
+FnPrefix        ::= ( "pub" )? FnQualifier*
+FnQualifier     ::= "manual" | "inline" | "async" | "unsafe" | "comptime" | "extern" StringLit?
+
+FnSignature     ::= FnPrefix "fn" Ident GenericParams?
+                    "(" FnParams? ")" FnReturn?
+                    WhereClause?
+                    (* used in trait declarations; no body *)
+
+GenericParams   ::= "[" GenericParam ( "," GenericParam )* ","? "]"
+GenericParam    ::= "comptime"? Ident ( ":" TypeBounds )? ( "=" Type )?
+
+TypeBounds      ::= Type ( "+" Type )*
+
+FnParams        ::= FnParam ( "," FnParam )* ","?
+FnParam         ::= "comptime"? SelfParam
+                  | "comptime"? Pattern ":" Type DefaultValue?
+SelfParam       ::= "self" ":" SelfType
+SelfType        ::= "Self" | "&Self" | "&mut Self"
+DefaultValue    ::= "=" Expr
+
+FnReturn        ::= "->" Type
+
+WhereClause     ::= "where" WhereBound ( "," WhereBound )* ","?
+WhereBound      ::= Type ":" TypeBounds
+
+FnBody          ::= Block | ";"
+
+
+(* ============================================================
+ * § 5. Classes, Enums, Traits, Impls
+ * ============================================================ *)
+
+(* --- Classes (POD aggregates) --- *)
+
+ClassDecl       ::= ClassKind? "class" Ident GenericParams? WhereClause?
+                    "{" ClassFields? "}"
+ClassKind       ::= "packed" | "extern"
+ClassFields     ::= ClassField ( "," ClassField )* ","?
+ClassField      ::= Attribute* Visibility?
+                    Ident ":" Type FieldAttribute*
+FieldAttribute  ::= "@" Ident AttrArgs?
+
+(* --- Enums (tagged unions) --- *)
+
+EnumDecl        ::= "enum" Ident GenericParams? WhereClause?
+                    "{" EnumVariants? "}"
+EnumVariants    ::= EnumVariant ( "," EnumVariant )* ","?
+EnumVariant     ::= Attribute* Ident VariantPayload?
+VariantPayload  ::= "{" ClassFields? "}"
+                  | "(" Type ( "," Type )* ","? ")"
+
+(* --- Traits --- *)
+
+TraitDecl       ::= "trait" Ident GenericParams? TraitSupers? WhereClause?
+                    "{" TraitItem* "}"
+TraitSupers     ::= ":" TypeBounds
+TraitItem       ::= Attribute*
+                    ( FnSignature ";"
+                    | FnDecl                  (* default method body *)
+                    | AssocConst
+                    | AssocType
+                    )
+AssocConst      ::= "const" Ident ":" Type ( "=" Expr )? ";"
+AssocType       ::= "type" Ident ( ":" TypeBounds )? ( "=" Type )? ";"
+
+(* --- Impl Blocks --- *)
+
+ImplBlock       ::= "impl" GenericParams?
+                    ( Type "for" )? Type
+                    WhereClause?
+                    "{" ImplItem* "}"
+ImplItem        ::= Attribute* Visibility?
+                    ( FnDecl | ConstDecl | AssocType )
+
+(* note: `impl Foo { ... }` is an inherent-impl (free functions on Foo).
+ * `impl Trait for Foo { ... }` is a trait-impl.
+ * One impl block contains one or the other. *)
+
+
+(* ============================================================
+ * § 6. Types
+ * ============================================================ *)
+
+Type ::=
+      TypePath GenericArgs?
+    | "*" Type                            (* raw pointer *)
+    | "**" Type                           (* sugar: pointer-to-pointer *)
+    | "&" Type                            (* shared reference *)
+    | "&" "mut" Type                      (* mutable reference *)
+    | "?" Type                            (* optional *)
+    | "!" Type? Type                      (* error union; first T is E-set *)
+    | "[" "]" Type                        (* slice *)
+    | "[" "*" "]" Type                    (* many-pointer *)
+    | "[" "*" ":" Expr "]" Type           (* sentinel-terminated pointer *)
+    | "[" "dyn" "]" Type                  (* dynamic array *)
+    | "[" Expr "]" Type                   (* fixed array *)
+    | "(" TypeTupleBody? ")"              (* tuple type or unit type *)
+    | FnType
+    | "dyn" Type                          (* trait object *)
+    | "type"                              (* type-of-types; comptime only *)
+    | "_"                                 (* type hole; inference site *)
+
+TypePath        ::= Ident ( "." Ident )*
+
+GenericArgs     ::= "[" GenericArg ( "," GenericArg )* ","? "]"
+GenericArg      ::= Type | Expr           (* expr for comptime values *)
+
+TypeTupleBody   ::= Type "," ( Type ( "," Type )* )? ","?
+                  (* note: `(T)` is a parenthesized type, NOT a 1-tuple.
+                   * `(T,)` is a 1-tuple. `()` is the unit type. *)
+
+FnType          ::= "fn" "(" ( Type ( "," Type )* ","? )? ")" FnReturn?
+
+(* note on `**T`:
+ *   Lexed as a single `**` token. In type position, equivalent to `*(*T)`.
+ *   In expression position, decomposed by the parser:
+ *     - As a prefix operator on an expression, `**e` means `*(*e)` (double-deref).
+ *     - As an infix operator between two expressions, `a ** b` is the power
+ *       operator with precedence between unary and multiplicative.
+ *   Type and expression contexts are syntactically distinct, so this is
+ *   unambiguous. *)
+
+
+(* ============================================================
+ * § 7. Statements
+ * ============================================================ *)
+
+Block           ::= "{" Stmt* TailExpr? "}"
+TailExpr        ::= Expr                  (* expression without trailing `;` *)
+
+Stmt ::=
+      LetStmt
+    | DeferStmt
+    | ErrdeferStmt
+    | ExprStmt
+    | ItemStmt
+    | EmptyStmt
+
+LetStmt         ::= ( "let" | "var" ) Pattern ( ":" Type )? ( "=" Expr )? ";"
+DeferStmt       ::= "defer" Expr ";"
+ErrdeferStmt    ::= "errdefer" Expr ";"
+ExprStmt        ::= Expr ";"
+ItemStmt        ::= FnDecl | ClassDecl | EnumDecl | TraitDecl
+                  | ImplBlock | ConstDecl | UseDecl
+                  (* nested items inside function bodies *)
+EmptyStmt       ::= ";"
+
+ConstDecl       ::= "const" Ident ( ":" Type )? "=" Expr ";"
+
+ExternBlock     ::= "extern" StringLit? "{" ExternItem* "}"
+ExternItem      ::= Attribute* Visibility?
+                    ( FnSignature ";" | ConstDecl )
+
+
+(* ============================================================
+ * § 8. Patterns
+ * ============================================================ *)
+
+Pattern ::=
+      "_"                                 (* wildcard *)
+    | Literal                             (* literal pattern *)
+    | RangePattern
+    | Ident                               (* binding pattern *)
+    | "&" Pattern                         (* reference-binding *)
+    | "&" "mut" Pattern
+    | TuplePattern
+    | StructPattern
+    | EnumPattern
+    | OrPattern
+
+RangePattern    ::= Literal ".." Literal
+                  | Literal "..=" Literal
+
+TuplePattern    ::= "(" ( Pattern ( "," Pattern )* ","? )? ")"
+
+StructPattern   ::= TypePath "{" FieldPatterns? "}"
+FieldPatterns   ::= FieldPattern ( "," FieldPattern )* ( "," ".." )? ","?
+FieldPattern    ::= "." Ident                       (* shorthand: bind `name` from field `.name` *)
+                  | "." Ident ":" Pattern           (* full form *)
+
+EnumPattern     ::= TypePath "." Ident VariantPayloadPattern?
+VariantPayloadPattern
+                ::= "{" FieldPatterns? "}"
+                  | "(" Pattern ( "," Pattern )* ","? ")"
+
+OrPattern       ::= Pattern ( "|" Pattern )+
+
+(* note: a top-level OrPattern is only legal in `match` and `if let`.
+ * `let` and function parameter positions require irrefutable patterns. *)
+
+
+(* ============================================================
+ * § 9. Expressions
+ * ============================================================ *)
+
+(* Precedence table, lowest to highest binding.
  *
- * Trivia (whitespace, line/block/doc comments) may appear between any
- * two terminals. The rules below describe significant tokens only.
- * ============================================================================ *)
-
-
-(* ===== File =============================================================== *)
-
-Module        ::= Item*
-
-
-(* ===== Items ============================================================== *)
-
-Item          ::= FnDecl
-              |   ClassDecl
-
-FnDecl        ::= 'pub'? 'extern'?
-                  'fn' IDENT ParamList RetType? ( Block | ';' )
-
-ParamList     ::= '(' ( Param ( ',' Param )* )? ')'
-Param         ::= IDENT ':' Type
-
-RetType       ::= '->' Type
-
-ClassDecl     ::= 'pub'? 'class' IDENT FieldDeclList
-FieldDeclList ::= '{' ( FieldDecl ( ',' FieldDecl )* )? '}'
-
-(* Field metadata `@range(0,100)` etc. is lexed and consumed by the
- * parser but not modelled as a CST node yet — see SyntaxKind::Attr in
- * arsenal_ast for the Phase 2+ hook. *)
-FieldDecl     ::= IDENT ':' Type Attr*
-Attr          ::= '@' IDENT ( '(' AttrArgs? ')' )?
-AttrArgs      ::= ANY_TOKEN+        (* bracket-balanced, opaque to Phase 0 *)
-
-
-(* ===== Types ============================================================== *)
-
-Type          ::= PathType
-              |   RefType
-              |   OptType
-              |   SliceType
-              |   ArrayType
-
-PathType      ::= IDENT ( '::' IDENT )*
-RefType       ::= '&' Type
-OptType       ::= '?' Type
-SliceType     ::= '[' ']' Type
-ArrayType     ::= '[' Expr ']' Type
-
-
-(* ===== Patterns =========================================================== *)
-
-Pattern       ::= IdentPat
-              |   WildcardPat
-
-IdentPat      ::= IDENT                 (* IDENT whose lexeme != "_" *)
-WildcardPat   ::= '_'                   (* lexed as IDENT, classified by text *)
-
-
-(* ===== Statements ========================================================= *)
-
-Stmt          ::= LetStmt
-              |   ExprStmt
-              |   BlockLikeExprStmt
-
-LetStmt       ::= 'let' Pattern ( ':' Type )? ( '=' Expr )? ';'
-ExprStmt      ::= Expr ';'
-
-(* Block-like expressions in statement position do not require a
- * trailing `;`; the trailing `;` is consumed if present. *)
-BlockLikeExprStmt
-              ::= ( IfExpr | WhileExpr | Block ) ';'?
-
-
-(* ===== Expressions (Pratt precedence) ===================================== *)
-
-(* The parser implements Pratt-style precedence climbing in
- * `arsenal_parse::grammar::parse_expr_bp`. The grammar below describes
- * the resulting parse trees by precedence level, lowest to highest.
- * The `(left_bp, right_bp)` annotations match the binding-power table
- * in `infix_bp`. Operators within a level are equal-precedence and
- * left-associative unless noted. *)
-
-Expr          ::= LogOrExpr
-
-(* (3, 4)  left-assoc *)
-LogOrExpr     ::= LogAndExpr     ( '||'  LogAndExpr     )*
-(* (5, 6)  left-assoc *)
-LogAndExpr    ::= CmpExpr        ( '&&'  CmpExpr        )*
-(* (7, 8)  left-assoc — non-associative chaining is a Phase 2+ enhancement *)
-CmpExpr       ::= BitOrExpr      ( CmpOp BitOrExpr      )*
-CmpOp         ::= '==' | '!=' | '<' | '<=' | '>' | '>='
-(* (9, 10) left-assoc *)
-BitOrExpr     ::= BitXorExpr     ( '|'   BitXorExpr     )*
-(* (11, 12) left-assoc *)
-BitXorExpr    ::= BitAndExpr     ( '^'   BitAndExpr     )*
-(* (13, 14) left-assoc *)
-BitAndExpr    ::= ShiftExpr      ( '&'   ShiftExpr      )*
-(* (15, 16) left-assoc *)
-ShiftExpr     ::= AddExpr        ( ShiftOp AddExpr      )*
-ShiftOp       ::= '<<' | '>>'
-(* (17, 18) left-assoc *)
-AddExpr       ::= MulExpr        ( AddOp MulExpr        )*
-AddOp         ::= '+' | '-'
-(* (19, 20) left-assoc *)
-MulExpr       ::= PowExpr        ( MulOp PowExpr        )*
-MulOp         ::= '*' | '/' | '%'
-(* (22, 21) right-assoc *)
-PowExpr       ::= UnaryExpr      ( '**' PowExpr         )?
-(* (right-bp 23) — prefix unary *)
-UnaryExpr     ::= UnaryOp UnaryExpr
-              |   PostfixExpr
-UnaryOp       ::= '-' | '!' | '~'
-
-(* Postfix: only function call in Phase 0. Field access (`.foo`),
- * indexing (`[i]`), method calls, optional chaining (`?.`), nil-
- * coalescing (`??`), must-not-fail (`!!`), and casts (`as T`) are
- * Phase 2+. *)
-PostfixExpr   ::= Atom ( ArgList )*
-ArgList       ::= '(' ( Expr ( ',' Expr )* )? ')'
-
-(* ----- Atoms --------------------------------------------------------------- *)
-
-Atom          ::= LiteralExpr
-              |   PathExpr
-              |   ParenExpr
-              |   Block
-              |   IfExpr
-              |   WhileExpr
-              |   ReturnExpr
-
-LiteralExpr   ::= INT_LIT
-              |   FLOAT_LIT
-              |   STRING_LIT
-              |   RAW_STRING_LIT
-              |   C_STRING_LIT
-              |   RUNE_LIT
-              |   BYTE_CHAR_LIT
-              |   'true'
-              |   'false'
-              |   'nil'
-
-PathExpr      ::= IDENT ( '::' IDENT )*
-ParenExpr     ::= '(' Expr ')'
-Block         ::= '{' Stmt* '}'
-
-IfExpr        ::= 'if'    Expr Block ( 'else' ( IfExpr | Block ) )?
-WhileExpr     ::= 'while' Expr Block
-ReturnExpr    ::= 'return' Expr?
-
-
-(* ===== Lexical (informative) ============================================= *)
-
-(* Token kinds referenced above are produced by `arsenal_lex`. The full
- * GW lexical grammar is in `docs/spec.md` §5.3. Phase 0 highlights:
+ *   1.  assignment              =  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=
+ *   2.  logical or              or
+ *   3.  logical and             and
+ *   4.  nil coalesce            ??
+ *   5.  comparison              ==  !=  <  >  <=  >=
+ *   6.  bit or                  |
+ *   7.  bit xor                 ^
+ *   8.  bit and                 &
+ *   9.  shift                   <<  >>
+ *  10.  range                   ..  ..=
+ *  11.  additive                +  -
+ *  12.  multiplicative          *  /  %
+ *  13.  power                   **                  (right-associative)
+ *  14.  unary prefix            -  !  *  &  &mut    (** decomposes here)
+ *  15.  postfix                 . [] () as !!
+ *  16.  primary
  *
- *   IDENT          ::= [A-Za-z_] [A-Za-z0-9_]*    (* ASCII-only *)
- *   INT_LIT        ::= ('0x' HEX+) | ('0o' OCT+) | ('0b' BIN+) | DEC+
- *                      (* Underscores allowed between digits *)
- *   FLOAT_LIT      ::= DEC+ ('.' DEC+)? (('e'|'E') ('+'|'-')? DEC+)?
- *                      | '0x' HEX+ ('.' HEX+)? ('p'|'P') ('+'|'-')? DEC+
- *   STRING_LIT     ::= '"' ( STRING_CHAR | ESCAPE )* '"'
- *   RAW_STRING_LIT ::= '\\' ANY* '\\'
- *   C_STRING_LIT   ::= 'c' STRING_LIT
- *   RUNE_LIT       ::= "'" ( RUNE_CHAR | ESCAPE ) "'"
- *   BYTE_CHAR_LIT  ::= 'c' RUNE_LIT
+ * All comparison operators are non-associative: `a == b == c` is an error,
+ * not chained comparison. *)
+
+Expr            ::= AssignExpr
+
+AssignExpr      ::= LogicalOrExpr ( AssignOp Expr )?
+AssignOp        ::= "=" | "+=" | "-=" | "*=" | "/=" | "%="
+                  | "&=" | "|=" | "^=" | "<<=" | ">>="
+
+LogicalOrExpr   ::= LogicalAndExpr ( "or" LogicalAndExpr )*
+LogicalAndExpr  ::= NilCoalesceExpr ( "and" NilCoalesceExpr )*
+NilCoalesceExpr ::= ComparisonExpr ( "??" ComparisonExpr )?
+
+ComparisonExpr  ::= BitOrExpr ( CompareOp BitOrExpr )?      (* non-associative *)
+CompareOp       ::= "==" | "!=" | "<" | ">" | "<=" | ">="
+
+BitOrExpr       ::= BitXorExpr ( "|" BitXorExpr )*
+BitXorExpr      ::= BitAndExpr ( "^" BitAndExpr )*
+BitAndExpr      ::= ShiftExpr ( "&" ShiftExpr )*
+
+ShiftExpr       ::= RangeExpr ( ShiftOp RangeExpr )*
+ShiftOp         ::= "<<" | ">>"
+
+RangeExpr       ::= AddExpr ( RangeOp AddExpr )?
+                  | RangeOp AddExpr                          (* prefix: `..5` *)
+                  | AddExpr RangeOp                          (* suffix: `5..` *)
+RangeOp         ::= ".." | "..="
+
+AddExpr         ::= MulExpr ( ( "+" | "-" ) MulExpr )*
+MulExpr         ::= PowerExpr ( ( "*" | "/" | "%" ) PowerExpr )*
+PowerExpr       ::= UnaryExpr ( "**" PowerExpr )?            (* right-associative *)
+
+UnaryExpr       ::= UnaryOp UnaryExpr
+                  | PostfixExpr
+UnaryOp         ::= "-" | "!" | "*" | "&" | "&" "mut"
+(* note: a prefix `**` is parsed as two `*` operators stacked. *)
+
+PostfixExpr     ::= PrimaryExpr Postfix*
+Postfix ::=
+      "." Ident                                  (* field access *)
+    | "." Ident GenericArgs? CallArgs            (* method / UFCS call *)
+    | "?." Ident                                 (* option chaining *)
+    | "[" Expr "]"                               (* indexing *)
+    | CallArgs                                   (* function call *)
+    | "as" Type                                  (* cast *)
+    | "!!"                                       (* must-not-fail unwrap *)
+
+CallArgs        ::= "(" ( Arg ( "," Arg )* ","? )? ")"
+Arg             ::= ( "." Ident "=" )? Expr      (* named or positional *)
+
+(* note on UFCS / field disambiguation (spec § 4.2):
+ *   `v.x` first resolves to a field access if `x` is a field of `typeof(v)`.
+ *   If no such field exists, the compiler searches free functions named `x`
+ *   in scope; if exactly one matches `(typeof(v), ...) -> ...`, the syntax
+ *   desugars to that call. Field-wins is the deterministic rule.
+ *   To call a free function `x` on a value with a field `x`, write `x(v)`. *)
+
+
+(* --- Primary expressions --- *)
+
+PrimaryExpr ::=
+      Literal
+    | "self"
+    | "Self"
+    | Ident
+    | PathExpr
+    | "(" Expr ")"                       (* parenthesized *)
+    | TupleExpr
+    | ArrayExpr
+    | AggregateExpr
+    | Block
+    | IfExpr
+    | MatchExpr
+    | LoopExpr
+    | WhileExpr
+    | ForExpr
+    | BreakExpr
+    | ContinueExpr
+    | ReturnExpr
+    | TryExpr
+    | LambdaExpr
+    | TaskExpr
+    | LockExpr
+    | UnsafeBlock
+    | NurseryBlock
+    | AsyncBlock
+    | AwaitExpr
+    | AsmBlock
+    | ComptimeBlock
+    | RunDirective
+    | InsertDirective
+    | IntrinsicCall
+    | ChannelSend
+
+PathExpr        ::= Ident ( "." Ident )+
+                    (* e.g. `Tile.Floor`, `std.fmt.print`; distinct from
+                     * postfix `.` field access only at the leftmost step *)
+
+TupleExpr       ::= "(" Expr "," ( Expr ( "," Expr )* )? ","? ")"
+                    (* `(e)` parenthesizes; `(e,)` is a 1-tuple *)
+
+ArrayExpr       ::= "[" ( Expr ( "," Expr )* ","? )? "]"
+                  | "[" Expr ";" Expr "]"   (* repeat literal: `[0; 16]` *)
+
+AggregateExpr   ::= TypePath "{" FieldInits? "}"
+                  | "." "{" FieldInits? "}"            (* anonymous *)
+FieldInits      ::= FieldInit ( "," FieldInit )* ","?
+FieldInit       ::= "." Ident "=" Expr
+                  | "." Ident                           (* shorthand: `.x` ≡ `.x = x` *)
+
+Literal         ::= IntLit | FloatLit | StringLit | RawStringLit
+                  | ByteStringLit | CharLit | ByteCharLit
+                  | BoolLit | NilLit
+
+(* --- Control-flow expressions --- *)
+
+IfExpr          ::= "if" Expr IfBody ( "else" IfTail )?
+IfBody          ::= "then" Expr
+                  | Block
+IfTail          ::= IfExpr
+                  | "then" Expr
+                  | Block
+(* note: `if cond then a else b` and `if cond { a } else { b }` are both
+ * accepted. `if ... then ... { ... }` mixing is rejected as a style error. *)
+
+MatchExpr       ::= "match" Expr "{" MatchArm ( "," MatchArm )* ","? "}"
+MatchArm        ::= Pattern Guard? "=>" ( Expr | Block )
+Guard           ::= "if" Expr
+
+LoopExpr        ::= LoopLabel? "loop" Block
+WhileExpr       ::= LoopLabel? "while" Expr Block
+ForExpr         ::= LoopLabel? "for" ForBinding "in" Expr Block
+ForBinding      ::= Pattern
+                  | Ident "," Pattern               (* index-value form *)
+LoopLabel       ::= ":" Ident ":"                   (* e.g. `:outer: for ... in ...` *)
+
+BreakExpr       ::= "break" LoopLabelRef? Expr?
+ContinueExpr    ::= "continue" LoopLabelRef?
+LoopLabelRef    ::= ":" Ident
+
+ReturnExpr      ::= "return" Expr?
+
+TryExpr         ::= "try" Expr
+                  (* parsed as a postfix-precedence prefix; binds tighter
+                   * than most operators. *)
+
+CatchExpr       ::= Expr "catch" CatchBinding? ( Expr | Block )
+CatchBinding    ::= "|" Ident "|"
+
+(* --- Other expressions --- *)
+
+LambdaExpr      ::= "|" LambdaParams? "|" LambdaBody
+LambdaParams    ::= LambdaParam ( "," LambdaParam )* ","?
+LambdaParam     ::= Pattern ( ":" Type )?
+LambdaBody      ::= FnReturn? Block
+                  | Expr
+
+TaskExpr        ::= "task" ( Block | CallExpr )
+                    (* `task work(x, y);` spawns a call;
+                     *  `task { ... };` spawns a block. *)
+CallExpr        ::= PostfixExpr                       (* must end in CallArgs *)
+
+LockExpr        ::= "lock" Expr Block
+UnsafeBlock     ::= "unsafe" Block
+NurseryBlock    ::= "nursery" Block
+AsyncBlock      ::= "async" Block
+AwaitExpr       ::= Expr "." "await"                  (* postfix-like *)
+
+AsmBlock        ::= "asm" AsmModifier* "{" AsmBody "}"
+AsmModifier     ::= "volatile"
+AsmBody         ::= /* platform-canonical assembly mnemonics;
+                     * GW locals referenced by `&name` and `[&name]`;
+                     * not parsed as GW expressions */
+
+ComptimeBlock   ::= "comptime" Block
+RunDirective    ::= "#run" Expr
+InsertDirective ::= "#insert" "(" Expr ")"
+
+IntrinsicCall   ::= "@" Ident CallArgs?
+                    (* @type_info(T), @field(v, "x"), @call(f, args),
+                     * @embed_file(path), @import(name), @sizeof(T),
+                     * @alignof(T), @offsetof(T, field), ... *)
+
+ChannelSend     ::= PostfixExpr "<-" Expr             (* `ch <- value` *)
+
+
+(* ============================================================
+ * § 10. Top-Level Statements
+ * ============================================================ *)
+
+TopLevelStmt    ::= Stmt
+                    (* note: statements at the top of a CompilationUnit
+                     * are collected into a synthetic `main` function in
+                     * source order, after items have been processed.
+                     * Top-level `let` / `var` are NOT module-level globals;
+                     * use `const` for module-level constants. *)
+
+
+(* ============================================================
+ * § 11. Disambiguation Summary
+ * ============================================================ *)
+
+(* The grammar is LL(2) with the following context-sensitive rules
+ * applied during parsing:
  *
- * Trivia (skipped by the parser cursor; preserved in the CST):
- *   Whitespace     ::= ( ' ' | '\t' | '\r' | '\n' )+
- *   LineComment    ::= '//'   [^\n]*
- *   BlockComment   ::= '/*'   ANY*  '*/'           (* nestable *)
- *   DocComment     ::= '///'  [^\n]*               (* doc trivia *)
+ * D1. `**` lexing (§ 6 note):
+ *     Always one token at lex time. Type-position: pointer-to-pointer.
+ *     Expression-prefix: decomposed into two `*` operators.
+ *     Expression-infix: power operator.
+ *
+ * D2. UFCS vs field access (§ 9 note):
+ *     `v.x` is field access if `x` is a field of typeof(v); else free-
+ *     function UFCS. `v.x()` is field-call if `x` is a callable field;
+ *     else UFCS call. Tie-breaking is field-first, always.
+ *
+ * D3. Parenthesized type vs tuple type (§ 6):
+ *     `(T)` is a parenthesized type. `(T,)` is a 1-tuple. `()` is unit.
+ *
+ * D4. `if ... then ...` vs `if ... { ... }` (§ 9):
+ *     Both forms accepted; mixing in one chain is a style error, not
+ *     a parse error. `gw fmt` normalizes.
+ *
+ * D5. Range expression and pattern ambiguity:
+ *     In pattern position, `0..10` is a range pattern. In expression
+ *     position, it is a range expression. Position determines parse.
+ *
+ * D6. `<` and generic argument lists:
+ *     GW uses `[...]` for generic args, not `<...>`, so the C++/Rust
+ *     `<` ambiguity does not occur.
+ *
+ * D7. Labels and macros:
+ *     `:label:` is a loop label only in statement position before a
+ *     loop keyword. Elsewhere `:` is unambiguous.
+ *
+ * D8. `extern` as keyword vs ABI specifier:
+ *     `extern "C" fn` is an extern declaration. `extern fn` is the
+ *     default ABI (current platform's C). `extern { ... }` opens an
+ *     extern block.
+ *)
+
+
+(* ============================================================
+ * § 12. Non-Goals
+ * ============================================================ *)
+
+(* This grammar does NOT cover:
+ *
+ *   - The full whitespace-and-comment rules (handled by lexer).
+ *   - Doc-comment trivia attachment (handled at AST construction).
+ *   - The `@cImport` style C-header lowering (a separate tool).
+ *   - The asm-block inner grammar (per-target; see docs/asm-syntax.md).
+ *   - Macros (GW has no procedural macros; comptime + #insert covers
+ *     the use case, with no surface-syntax extension).
+ *   - Operator overloading (whitelist of traits handles this without
+ *     grammar changes; see spec Part 18).
+ *
+ * Implementers should treat this file as the authoritative reference
+ * for the parser's accept set. If the implementation diverges, the
+ * grammar wins and the parser is the bug.
  *)
