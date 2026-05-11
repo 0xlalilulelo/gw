@@ -13,9 +13,9 @@
 //! the IR is filled in to support increments 2–6 without churn.
 
 use gw_ast::{
-    AstNode, BinaryExpr, Block, CallExpr, CastExpr, Expr, ExprStmt, FieldExpr, FnDecl, ForExpr,
-    IfExpr, LetStmt, LiteralExpr, MatchExpr, Module, MustExpr, ParenExpr, PathExpr, Pattern,
-    ReturnExpr, Stmt, StructLitExpr, SyntaxKind, UnaryExpr, WhileExpr,
+    AstNode, BinaryExpr, Block, CallExpr, CastExpr, ComptimeExpr, Expr, ExprStmt, FieldExpr,
+    FnDecl, ForExpr, IfExpr, LetStmt, LiteralExpr, MatchExpr, Module, MustExpr, ParenExpr,
+    PathExpr, Pattern, ReturnExpr, Stmt, StructLitExpr, SyntaxKind, UnaryExpr, WhileExpr,
 };
 use gw_lex::{SourceMap, Span};
 use gw_resolve::{DefId, DefKind, ResolvedModule};
@@ -1002,6 +1002,7 @@ fn lower_expr<'a>(
         Expr::Cast(c) => lower_cast(b, c, lcx),
         Expr::Match(m) => lower_match(b, m, lcx),
         Expr::Must(m) => lower_must(b, m, lcx),
+        Expr::Comptime(c) => lower_comptime(c, lcx),
         Expr::Stub(_) | Expr::Error(_) => Operand::Const(Const::Error),
     }
 }
@@ -1475,6 +1476,33 @@ fn lower_coalesce<'a>(
 /// (`fb.ins().trap(...)` on Cranelift, `unreachable` IR on LLVM —
 /// both abort the program), so a runtime err on `!T` produces a
 /// loud failure instead of UB.
+/// Phase 2 increment CT.1: lower a `comptime { … }` block. Typeck
+/// has already evaluated the block and stashed a `CtValue` in
+/// `typed.comptime_values`; MIR materialises that value as an
+/// `Operand::Const` directly, never lowering the block body itself.
+/// The CST node for the inner Block is therefore left untouched —
+/// codegen never sees any of its statements or sub-expressions.
+fn lower_comptime<'a>(c: ComptimeExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>) -> Operand {
+    let Some(value) = lcx.typed.comptime_values.get(&NodePtr(c.syntax())).copied() else {
+        // Typeck rejected the block; emit an error operand so any
+        // surrounding lowering keeps progressing.
+        return Operand::Const(Const::Error);
+    };
+    let ty = lcx
+        .typed
+        .expr_types
+        .get(&NodePtr(c.syntax()))
+        .copied()
+        .unwrap_or(Ty::Error);
+    match (value, ty) {
+        (gw_comptime::CtValue::Int(n), Ty::Int(int_ty)) => Operand::Const(Const::Int {
+            value: n,
+            ty: int_ty,
+        }),
+        _ => Operand::Const(Const::Error),
+    }
+}
+
 fn lower_must<'a>(
     b: &mut Builder,
     m: MustExpr<'a>,

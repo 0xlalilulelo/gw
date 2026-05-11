@@ -571,8 +571,20 @@ fn parse_let_stmt(p: &mut Parser<'_, '_, '_>) {
 
 fn parse_expr_stmt(p: &mut Parser<'_, '_, '_>, _leading_kw: bool) {
     let start = p.cur_byte_start();
-    p.builder.start_node(SyntaxKind::ExprStmt, start);
+    let cp = p.builder.checkpoint();
     parse_expr(p);
+    // Phase 2 increment CT.1: tail-expression form — if the source
+    // omitted `;` and we're at the enclosing block's `}`, emit a
+    // bare `Expr` child rather than wrapping in `ExprStmt`. Block
+    // consumers consult `Block::tail_expr` (which already returns
+    // the bare-Expr-shaped last child). Top-level statements close
+    // at `Eof`, not `}`, so module-level behaviour is unchanged —
+    // a missing `;` there still routes through the
+    // expect-then-recover path below.
+    if p.at(TokenKind::RBrace) {
+        return;
+    }
+    p.builder.start_node_at(cp, SyntaxKind::ExprStmt, start);
     if !p.expect(TokenKind::Semi) {
         skip_to_stmt_boundary(p);
         let _ = p.eat(TokenKind::Semi);
@@ -842,6 +854,7 @@ fn parse_atom(p: &mut Parser<'_, '_, '_>) {
         TokenKind::KwContinue => parse_continue_expr(p),
         TokenKind::KwFor => parse_for_expr(p),
         TokenKind::KwMatch => parse_match_expr(p),
+        TokenKind::KwComptime => parse_comptime_expr(p),
         _ => {
             let span = p.current_span();
             p.error(
@@ -920,6 +933,25 @@ fn parse_cond_expr(p: &mut Parser<'_, '_, '_>) {
     p.struct_literals_allowed = false;
     parse_expr(p);
     p.struct_literals_allowed = prev;
+}
+
+// ─── comptime (Phase 2 increment CT.1) ─────────────────────────────────
+
+/// Parse `comptime { … }` at expression position. The keyword is
+/// followed by a single inner block whose body is type-checked
+/// normally and then handed to the comptime evaluator, which reduces
+/// it to a value MIR materialises as a constant at the use site.
+fn parse_comptime_expr(p: &mut Parser<'_, '_, '_>) {
+    let start = p.cur_byte_start();
+    p.builder.start_node(SyntaxKind::ComptimeExpr, start);
+    p.expect(TokenKind::KwComptime);
+    if p.at(TokenKind::LBrace) {
+        parse_block(p);
+    } else {
+        p.unexpected("`{` to begin the comptime block");
+    }
+    let end = p.cur_byte_start();
+    p.builder.finish_node(end);
 }
 
 // ─── match (Phase 2 increment M.1) ─────────────────────────────────────

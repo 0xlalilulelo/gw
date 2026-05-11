@@ -26,11 +26,12 @@
 //! lowering can still produce best-effort output.
 
 use gw_ast::{
-    AstNode, BinaryExpr, Block, BreakExpr, CallExpr, CastExpr, ClassDecl, ContinueExpr, Expr,
-    ExprStmt, FieldExpr, FnDecl, ForExpr, IfExpr, LetStmt, LiteralExpr, MatchExpr, Module,
-    MustExpr, ParenExpr, PathExpr, PathType, Pattern, ReturnExpr, Stmt, StructLitExpr, SyntaxKind,
-    SyntaxNode, Type, UnaryExpr, WhileExpr,
+    AstNode, BinaryExpr, Block, BreakExpr, CallExpr, CastExpr, ClassDecl, ComptimeExpr,
+    ContinueExpr, Expr, ExprStmt, FieldExpr, FnDecl, ForExpr, IfExpr, LetStmt, LiteralExpr,
+    MatchExpr, Module, MustExpr, ParenExpr, PathExpr, PathType, Pattern, ReturnExpr, Stmt,
+    StructLitExpr, SyntaxKind, SyntaxNode, Type, UnaryExpr, WhileExpr,
 };
+use gw_comptime::{eval_comptime_block, EvalCx, EvalError};
 use gw_lex::{DiagBag, Diagnostic, FileId, Label, SourceMap, Span};
 use gw_resolve::{primitive_type_name, DefId, DefKind, ResolvedModule};
 use rustc_hash::FxHashMap;
@@ -68,6 +69,17 @@ pub mod ec {
     pub const FIELD_ON_NON_CLASS: ErrorCode = ErrorCode(312);
     /// Struct-literal path didn't resolve to a class.
     pub const NOT_A_CLASS: ErrorCode = ErrorCode(313);
+    /// A `comptime { … }` block could not be evaluated. The diagnostic
+    /// message names the offending shape (unsupported construct,
+    /// budget exhausted, malformed integer literal, …).
+    pub const COMPTIME_EVAL_FAILED: ErrorCode = ErrorCode(314);
+    /// A function body ended with a bare tail expression (no trailing
+    /// `;`). Phase 2 / CT.1 exposes this shape to the comptime
+    /// evaluator but does not yet promote it to an implicit return at
+    /// the function level — the user must add `;` to discard the
+    /// value or `return` to make it the function's return value.
+    /// Tracked for a future sub-bundle (implicit-tail-return).
+    pub const TAIL_EXPR_IN_FN_BODY: ErrorCode = ErrorCode(315);
 }
 
 /// Concrete type. Phase-1 supports primitives and POD classes;
@@ -343,6 +355,11 @@ pub struct TypedModule<'a> {
     /// because MIR introduces fresh `Local`s for expression
     /// intermediates that typeck does not.
     pub pat_bindings: FxHashMap<NodePtr<'a>, BindingId>,
+    /// Per-CST-node evaluated value for each `ComptimeExpr` whose
+    /// evaluator run succeeded (Phase 2 increment CT.1). MIR consumes
+    /// this map to materialise an `Operand::Const` at the use site
+    /// without re-lowering the comptime block's body.
+    pub comptime_values: FxHashMap<NodePtr<'a>, gw_comptime::CtValue>,
 }
 
 /// Pointer-identity key into the bump-allocated CST.
@@ -436,6 +453,7 @@ pub fn type_check<'a>(
         call_targets: FxHashMap::default(),
         path_bindings: FxHashMap::default(),
         pat_bindings: FxHashMap::default(),
+        comptime_values: FxHashMap::default(),
     };
     for def in &resolved.defs {
         match def.kind {
@@ -894,6 +912,25 @@ fn check_fn_body<'a>(
         return;
     };
     check_block(body, sig.ret, &mut cx);
+    // Phase 2 / CT.1 widens `parse_expr_stmt` so a block's trailing
+    // expression without `;` becomes a bare-Expr tail child rather
+    // than an `ExprStmt`. The comptime evaluator consumes that shape
+    // directly, but at the *function* level MIR's `lower_fn`
+    // discards the tail operand and fabricates either `Return(Unit)`
+    // (for `u0`/`Error` returns) or `Unreachable` (which traps at
+    // runtime) — neither matches the implicit-tail-return semantics
+    // a user reaching for `fn f() -> i32 { 42 }` would expect.
+    // Until a dedicated sub-bundle wires the tail operand into the
+    // fn's `Return` terminator and the typeck-side type compatibility
+    // check, reject the shape with a clear suggestion so users get a
+    // compile-time error rather than a silent runtime trap.
+    if let Some(tail) = body.tail_expr() {
+        cx.diags.push(Diagnostic::error(
+            ec::TAIL_EXPR_IN_FN_BODY,
+            Label::new(expr_span(tail), ""),
+            "function body ends with a bare expression; add `;` to discard it, or `return` to make it the function's return value",
+        ));
+    }
 }
 
 /// Type-check a synthetic `main` body composed of the module's top-level
@@ -1157,6 +1194,7 @@ fn synth_expr<'a>(expr: Expr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
         Expr::Cast(c) => synth_cast(c, cx),
         Expr::Match(m) => synth_match(m, cx),
         Expr::Must(m) => synth_must(m, cx),
+        Expr::Comptime(c) => synth_comptime(c, cx),
         Expr::Stub(n) | Expr::Error(n) => {
             cx.diags.push(Diagnostic::error(
                 ec::UNSUPPORTED_CONSTRUCT,
@@ -1379,6 +1417,80 @@ fn is_free_numeric_literal(e: Expr<'_>) -> bool {
 /// LHS must be `Ty::ErrorUnion(_)`; result type is the unwrapped
 /// inner. The runtime trap on err is emitted by MIR
 /// (`lower_must`).
+/// Phase 2 increment CT.1: type-check a `comptime { … }` block.
+///
+/// 1. Synthesise the inner block's type the same way any `Expr::Block`
+///    would, so subexpressions populate `expr_types` for downstream
+///    consumers (gw_dump, future inspectors, the evaluator if it ever
+///    needs to look up an inner expression's type).
+/// 2. Run the comptime evaluator on the inner block. On success,
+///    stash the resulting `CtValue` keyed by the `ComptimeExpr`'s
+///    NodePtr so MIR can materialise an `Operand::Const` at the use
+///    site without re-lowering the block body.
+/// 3. On evaluator failure, push a `COMPTIME_EVAL_FAILED` diagnostic
+///    pointing at the offending span and return `Ty::Error`. Typeck
+///    keeps walking the rest of the function so subsequent
+///    diagnostics still surface.
+fn synth_comptime<'a>(c: ComptimeExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
+    let Some(block) = c.block() else {
+        cx.diags.push(Diagnostic::error(
+            ec::UNSUPPORTED_CONSTRUCT,
+            Label::new(c.syntax().span, ""),
+            "`comptime` must be followed by a block expression",
+        ));
+        return Ty::Error;
+    };
+    let inner_ty = synth_block(block, cx);
+    if matches!(inner_ty, Ty::Error) {
+        return Ty::Error;
+    }
+    // CT.1 only realises integer-valued comptime blocks. Wider inners
+    // (bool, float, …) ride later sub-bundles where the evaluator's
+    // CtValue gains the corresponding arms.
+    if !matches!(inner_ty, Ty::Int(_)) {
+        cx.diags.push(Diagnostic::error(
+            ec::UNSUPPORTED_CONSTRUCT,
+            Label::new(c.syntax().span, ""),
+            format!(
+                "`comptime` blocks producing `{inner_ty}` are not yet supported (CT.1 handles integer-valued blocks only)"
+            ),
+        ));
+        return Ty::Error;
+    }
+    let mut ecx = EvalCx::new(cx.sm);
+    match eval_comptime_block(block, &mut ecx) {
+        Ok(v) => {
+            cx.tm.comptime_values.insert(NodePtr(c.syntax()), v);
+            inner_ty
+        }
+        Err(err) => {
+            cx.diags.push(Diagnostic::error(
+                ec::COMPTIME_EVAL_FAILED,
+                Label::new(err.primary_span(), ""),
+                comptime_error_message(&err),
+            ));
+            Ty::Error
+        }
+    }
+}
+
+fn comptime_error_message(err: &EvalError) -> String {
+    match err {
+        EvalError::Unsupported { what, .. } => {
+            format!("comptime evaluation failed: {what}")
+        }
+        EvalError::BudgetExceeded(_) => {
+            "comptime evaluation exceeded the step budget (suspected infinite loop)".to_string()
+        }
+        EvalError::StackOverflow(_) => {
+            "comptime evaluation exceeded the recursion-depth budget".to_string()
+        }
+        EvalError::BadIntLiteral(_) => {
+            "comptime evaluation could not parse this integer literal".to_string()
+        }
+    }
+}
+
 fn synth_must<'a>(m: MustExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     let inner_ty = m.expr().map(|e| synth_expr(e, cx)).unwrap_or(Ty::Error);
     match inner_ty {
@@ -2274,6 +2386,7 @@ fn expr_span(e: Expr<'_>) -> Span {
         Expr::Cast(x) => x.syntax().span,
         Expr::Match(x) => x.syntax().span,
         Expr::Must(x) => x.syntax().span,
+        Expr::Comptime(x) => x.syntax().span,
         Expr::Stub(n) | Expr::Error(n) => n.span,
     }
 }
@@ -2297,6 +2410,22 @@ mod tests {
         let resolved = resolve_module(root, &sm, &mut diags);
         let _typed = type_check(&resolved, &sm, &mut diags);
         diags.error_count()
+    }
+
+    /// Like `check`, but returns the list of error codes emitted (in
+    /// the order the diagnostics were pushed) so individual tests can
+    /// assert on the *specific* diagnostic they're exercising rather
+    /// than just "at least one error".
+    fn check_codes(src: &str) -> Vec<gw_lex::ErrorCode> {
+        let mut sm = SourceMap::new();
+        let file = sm.add_file("t.gw", src);
+        let bytes = sm.get(file).unwrap().contents.as_bytes();
+        let bump = Bump::new();
+        let arena = FileArena::new(&bump, file);
+        let (root, mut diags) = parse(file, bytes, &arena);
+        let resolved = resolve_module(root, &sm, &mut diags);
+        let _typed = type_check(&resolved, &sm, &mut diags);
+        diags.iter().filter_map(|d| d.code).collect()
     }
 
     #[test]
@@ -2982,5 +3111,63 @@ mod tests {
         let src = "fn make() -> []u8 { return \"abc\"; }\n\
                    fn main() -> i32 { let s: []u8 = make(); return s.len as i32; }";
         assert_eq!(check(src), 0);
+    }
+
+    // ─── Phase 2 increment CT.1: bare tail expression in fn body ──────────
+
+    #[test]
+    fn fn_body_with_tail_expr_rejects() {
+        // `fn f() -> i32 { 42 }` parses cleanly (the CT.1 parser
+        // change populates `Block::tail_expr`) but the function-level
+        // implicit-tail-return is not yet wired; typeck must
+        // diagnose so the user gets a compile-time error rather than
+        // a silent runtime trap from `lower_fn`'s `Unreachable`
+        // fabrication.
+        let codes = check_codes("fn f() -> i32 { 42 }");
+        assert!(
+            codes.contains(&ec::TAIL_EXPR_IN_FN_BODY),
+            "expected E0315 TAIL_EXPR_IN_FN_BODY, got {codes:?}",
+        );
+    }
+
+    #[test]
+    fn fn_body_with_tail_expr_rejects_even_for_u0() {
+        // The rule is uniform across return types: `fn f() -> u0 { 42 }`
+        // is also rejected. (For `u0`, `lower_fn` would *not* trap —
+        // the discard-and-Return(Unit) path is well-formed — but the
+        // shape is still surprising and benefits from the same clear
+        // diagnostic until implicit-tail-return ships as its own
+        // sub-bundle.)
+        let codes = check_codes("fn f() -> u0 { 42 }");
+        assert!(
+            codes.contains(&ec::TAIL_EXPR_IN_FN_BODY),
+            "expected E0315 TAIL_EXPR_IN_FN_BODY, got {codes:?}",
+        );
+    }
+
+    #[test]
+    fn fn_body_with_explicit_return_is_clean() {
+        // The pre-CT.1 shape (explicit `return` + trailing `;`) must
+        // remain accepted — anything else would silently churn the
+        // 241-program corpus.
+        assert_eq!(check("fn f() -> i32 { return 42; }"), 0);
+    }
+
+    #[test]
+    fn fn_body_with_trailing_semi_is_clean() {
+        // `fn f() -> u0 { foo(); }` — trailing `;` keeps the call an
+        // `ExprStmt`, leaving `tail_expr` as `None`. No diagnostic.
+        let src = "extern fn foo() -> i32;\nfn f() -> u0 { foo(); }";
+        assert_eq!(check(src), 0);
+    }
+
+    #[test]
+    fn comptime_tracer_remains_clean() {
+        // Regression coverage: the CT.1 tracer shape (`return comptime
+        // { N };`) must not trip the new tail-expr-in-fn-body check.
+        // The trailing `;` makes the outer fn body's last child an
+        // `ExprStmt`; the bare-Expr tail lives *inside* the comptime
+        // block, not in the fn body.
+        assert_eq!(check("fn main() -> i32 { return comptime { 4 }; }"), 0);
     }
 }

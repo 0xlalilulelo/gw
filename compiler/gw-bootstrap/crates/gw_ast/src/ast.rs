@@ -509,6 +509,11 @@ pub enum Expr<'a> {
     /// Reads the LHS error-union's tag and traps on err; returns the
     /// payload on ok.
     Must(MustExpr<'a>),
+    /// `comptime { … }` — compile-time-evaluated block (Phase 2
+    /// increment CT.1). The inner `Block` is type-checked normally;
+    /// the evaluator reduces it to a [`CtValue`](../../../gw_comptime/index.html)
+    /// which MIR materialises as an `Operand::Const` at the use site.
+    Comptime(ComptimeExpr<'a>),
     /// Recognised expression kind without a typed view yet.
     Stub(&'a SyntaxNode<'a>),
     /// Parser-recovery node.
@@ -538,11 +543,12 @@ impl<'a> Expr<'a> {
             CastExpr => Self::Cast(self::CastExpr(n)),
             MatchExpr => Self::Match(self::MatchExpr(n)),
             MustExpr => Self::Must(self::MustExpr(n)),
+            ComptimeExpr => Self::Comptime(self::ComptimeExpr(n)),
             // Hooks
             LoopExpr | IndexExpr | RefExpr | DerefExpr | RangeExpr | OptionalChainExpr
             | NilCoalesceExpr | FoxdieExpr | CatchExpr | TryExpr | AwaitExpr | YieldExpr
             | ChannelSendExpr | ChannelRecvExpr | LockExpr | NakedExpr | RexBlock
-            | ComptimeExpr | IntrinsicCallExpr | AnonAggregateExpr | ArrayLitExpr => Self::Stub(n),
+            | IntrinsicCallExpr | AnonAggregateExpr | ArrayLitExpr => Self::Stub(n),
             ErrorNode => Self::Error(n),
             _ => return None,
         })
@@ -569,6 +575,7 @@ impl<'a> Expr<'a> {
             Self::Cast(e) => e.syntax(),
             Self::Match(e) => e.syntax(),
             Self::Must(e) => e.syntax(),
+            Self::Comptime(e) => e.syntax(),
             Self::Stub(n) | Self::Error(n) => n,
         }
     }
@@ -876,6 +883,29 @@ impl<'a> MustExpr<'a> {
     /// The expression being asserted — the LHS of postfix `!`.
     pub fn expr(self) -> Option<Expr<'a>> {
         self.0.child_nodes().find_map(Expr::cast)
+    }
+}
+
+/// `comptime { … }` — compile-time-evaluated block (Phase 2 increment
+/// CT.1). The single inner child is a [`Block`]; the comptime
+/// evaluator walks the typed AST inside it and produces a `CtValue`
+/// that MIR materialises as a constant at the use site.
+#[derive(Copy, Clone)]
+pub struct ComptimeExpr<'a>(&'a SyntaxNode<'a>);
+
+impl<'a> AstNode<'a> for ComptimeExpr<'a> {
+    fn cast(n: &'a SyntaxNode<'a>) -> Option<Self> {
+        (n.kind == SyntaxKind::ComptimeExpr).then_some(Self(n))
+    }
+    fn syntax(self) -> &'a SyntaxNode<'a> {
+        self.0
+    }
+}
+
+impl<'a> ComptimeExpr<'a> {
+    /// The inner `{ … }` block whose body is evaluated at compile time.
+    pub fn block(self) -> Option<Block<'a>> {
+        self.0.child_nodes().find_map(Block::cast)
     }
 }
 

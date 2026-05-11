@@ -7,9 +7,10 @@ license.workspace      = true
 description            = "GW bidirectional type checker. See docs/architecture.md Part B.6, Part D."
 
 [dependencies]
-gw_lex     = { workspace = true }
-gw_ast     = { workspace = true }
-gw_resolve = { workspace = true }
+gw_lex      = { workspace = true }
+gw_ast      = { workspace = true }
+gw_resolve  = { workspace = true }
+gw_comptime = { workspace = true }
 rustc-hash      = { workspace = true }
 
 [dev-dependencies]

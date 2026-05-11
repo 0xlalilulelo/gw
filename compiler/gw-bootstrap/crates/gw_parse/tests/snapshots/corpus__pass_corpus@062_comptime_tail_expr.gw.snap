@@ -1,0 +1,29 @@
+---
+source: crates/gw_parse/tests/corpus.rs
+expression: dump_text
+---
+Module @1:1..2:1
+  FnDecl @1:1..2:1
+    KwFn `fn` @1:1..1:3
+    Ident `t` @1:4..1:5
+    ParamList @1:5..1:8
+      LParen `(` @1:5..1:6
+      RParen `)` @1:6..1:7
+    RetType @1:8..1:15
+      Arrow `->` @1:8..1:10
+      PathType @1:11..1:15
+        Ident `i32` @1:11..1:14
+    Block @1:15..2:1
+      LBrace `{` @1:15..1:16
+      ExprStmt @1:17..1:40
+        ReturnExpr @1:17..1:38
+          KwReturn `return` @1:17..1:23
+          ComptimeExpr @1:24..1:38
+            KwComptime `comptime` @1:24..1:32
+            Block @1:33..1:38
+              LBrace `{` @1:33..1:34
+              LiteralExpr @1:35..1:37
+                IntLit `4` @1:35..1:36
+              RBrace `}` @1:37..1:38
+        Semi `;` @1:38..1:39
+      RBrace `}` @1:40..1:41

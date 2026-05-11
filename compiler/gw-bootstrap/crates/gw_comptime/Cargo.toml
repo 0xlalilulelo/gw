@@ -4,7 +4,15 @@ version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
-description            = "GW comptime engine (comptime, #run, #insert, @type_info) (Phase 2+ stub). See docs/architecture.md Part B.11, Part E."
+description            = "GW comptime engine (comptime, #run, #insert, @type_info). Phase 2 / CT.1: tree-walking interpreter on the typed AST. See docs/architecture.md Part B.11, Part E."
+
+[dependencies]
+gw_ast = { workspace = true }
+gw_lex = { workspace = true }
+
+[dev-dependencies]
+gw_parse = { workspace = true }
+bumpalo  = { workspace = true }
 
 [lints.rust]
 missing_docs = "deny"

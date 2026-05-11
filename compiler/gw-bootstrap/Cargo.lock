@@ -338,6 +338,12 @@ dependencies = [
 [[package]]
 name = "gw_comptime"
 version = "0.0.1"
+dependencies = [
+ "bumpalo",
+ "gw_ast",
+ "gw_lex",
+ "gw_parse",
+]
 
 [[package]]
 name = "gw_doc"
@@ -390,6 +396,7 @@ version = "0.0.1"
 dependencies = [
  "bumpalo",
  "gw_ast",
+ "gw_comptime",
  "gw_lex",
  "gw_parse",
  "gw_resolve",
@@ -428,6 +435,7 @@ version = "0.0.1"
 dependencies = [
  "bumpalo",
  "gw_ast",
+ "gw_comptime",
  "gw_lex",
  "gw_parse",
  "gw_resolve",
