@@ -1,4 +1,4 @@
-//! Phase-1 run-tests: each `tests/snake_eater/pass/phase1/<name>.gw`
+//! Phase-1 run-tests: each `tests/corpus/pass/phase1/<name>.gw`
 //! is built via `arsenal build`, the resulting executable is run, and
 //! its observable behaviour is matched against any sibling expectation
 //! files:
@@ -27,7 +27,7 @@ fn corpus_dir() -> PathBuf {
         .join("..")
         .join("..")
         .join("tests")
-        .join("snake_eater")
+        .join("corpus")
         .join("pass")
         .join("phase1")
         .canonicalize()

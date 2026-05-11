@@ -1,6 +1,6 @@
 //! LLVM-backend run-tests (Phase 13).
 //!
-//! Each program in `tests/snake_eater/pass/phase1/` is built via
+//! Each program in `tests/corpus/pass/phase1/` is built via
 //! `arsenal build --backend=llvm`, the resulting executable is run, and
 //! its observable behaviour is matched against any sibling expectation
 //! files — same protocol as `phase1_run.rs`. As of B.5, the LLVM backend
@@ -29,7 +29,7 @@ fn corpus_dir() -> PathBuf {
         .join("..")
         .join("..")
         .join("tests")
-        .join("snake_eater")
+        .join("corpus")
         .join("pass")
         .join("phase1")
         .canonicalize()

@@ -1,0 +1,43 @@
+---
+source: crates/arsenal_parse/tests/corpus.rs
+expression: dump_text
+---
+Module @1:1..2:1
+  FnDecl @1:1..2:1
+    KwFn `fn` @1:1..1:3
+    Ident `t` @1:4..1:5
+    ParamList @1:5..1:14
+      LParen `(` @1:5..1:6
+      Param @1:6..1:12
+        Ident `x` @1:6..1:7
+        Colon `:` @1:7..1:8
+        PathType @1:9..1:12
+          Ident `i32` @1:9..1:12
+      RParen `)` @1:12..1:13
+    RetType @1:14..1:20
+      Arrow `->` @1:14..1:16
+      PathType @1:17..1:20
+        Ident `u0` @1:17..1:19
+    Block @1:20..2:1
+      LBrace `{` @1:20..1:21
+      ExprStmt @1:22..1:56
+        IfExpr @1:22..1:56
+          KwIf `if` @1:22..1:24
+          PathExpr @1:25..1:27
+            Ident `x` @1:25..1:26
+          Block @1:27..1:39
+            LBrace `{` @1:27..1:28
+            ExprStmt @1:29..1:37
+              ReturnExpr @1:29..1:35
+                KwReturn `return` @1:29..1:35
+              Semi `;` @1:35..1:36
+            RBrace `}` @1:37..1:38
+          KwElse `else` @1:39..1:43
+          Block @1:44..1:56
+            LBrace `{` @1:44..1:45
+            ExprStmt @1:46..1:54
+              ReturnExpr @1:46..1:52
+                KwReturn `return` @1:46..1:52
+              Semi `;` @1:52..1:53
+            RBrace `}` @1:54..1:55
+      RBrace `}` @1:56..1:57

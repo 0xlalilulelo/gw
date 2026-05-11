@@ -1,6 +1,6 @@
 //! Phase 2 increment F.1: multi-file build integration test.
 //!
-//! Each subdirectory under `tests/snake_eater/pass/phase2_multifile/`
+//! Each subdirectory under `tests/corpus/pass/phase2_multifile/`
 //! is a multi-file project: a `main.gw` driver file plus zero or more
 //! sibling `.gw` files in the same directory. The test stages the
 //! whole subdirectory into a per-test temp dir, runs `arsenal build
@@ -29,7 +29,7 @@ fn corpus_dir() -> PathBuf {
         .join("..")
         .join("..")
         .join("tests")
-        .join("snake_eater")
+        .join("corpus")
         .join("pass")
         .join("phase2_multifile")
         .canonicalize()

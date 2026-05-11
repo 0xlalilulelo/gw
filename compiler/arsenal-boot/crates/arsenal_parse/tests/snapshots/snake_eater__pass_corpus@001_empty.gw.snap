@@ -1,5 +1,0 @@
----
-source: crates/arsenal_parse/tests/snake_eater.rs
-expression: dump_text
----
-Module @2:1..2:1

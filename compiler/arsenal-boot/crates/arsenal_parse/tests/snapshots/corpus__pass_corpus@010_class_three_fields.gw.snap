@@ -1,0 +1,28 @@
+---
+source: crates/arsenal_parse/tests/corpus.rs
+expression: dump_text
+---
+Module @1:1..2:1
+  ClassDecl @1:1..2:1
+    KwClass `class` @1:1..1:6
+    Ident `Vec3` @1:7..1:11
+    FieldDeclList @1:12..2:1
+      LBrace `{` @1:12..1:13
+      FieldDecl @1:14..1:20
+        Ident `x` @1:14..1:15
+        Colon `:` @1:15..1:16
+        PathType @1:17..1:20
+          Ident `f32` @1:17..1:20
+      Comma `,` @1:20..1:21
+      FieldDecl @1:22..1:28
+        Ident `y` @1:22..1:23
+        Colon `:` @1:23..1:24
+        PathType @1:25..1:28
+          Ident `f32` @1:25..1:28
+      Comma `,` @1:28..1:29
+      FieldDecl @1:30..1:37
+        Ident `z` @1:30..1:31
+        Colon `:` @1:31..1:32
+        PathType @1:33..1:37
+          Ident `f32` @1:33..1:36
+      RBrace `}` @1:37..1:38

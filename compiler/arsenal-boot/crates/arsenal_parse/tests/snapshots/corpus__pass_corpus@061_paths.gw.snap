@@ -1,0 +1,33 @@
+---
+source: crates/arsenal_parse/tests/corpus.rs
+expression: dump_text
+---
+Module @1:1..2:1
+  FnDecl @1:1..2:1
+    KwFn `fn` @1:1..1:3
+    Ident `t` @1:4..1:5
+    ParamList @1:5..1:8
+      LParen `(` @1:5..1:6
+      RParen `)` @1:6..1:7
+    RetType @1:8..1:14
+      Arrow `->` @1:8..1:10
+      PathType @1:11..1:14
+        Ident `u0` @1:11..1:13
+    Block @1:14..2:1
+      LBrace `{` @1:14..1:15
+      LetStmt @1:16..1:44
+        KwLet `let` @1:16..1:19
+        WildcardPat @1:20..1:21
+          Ident `_` @1:20..1:21
+        Colon `:` @1:21..1:22
+        PathType @1:23..1:37
+          Ident `std` @1:23..1:26
+          ColonColon `::` @1:26..1:28
+          Ident `mem` @1:28..1:31
+          ColonColon `::` @1:31..1:33
+          Ident `Foo` @1:33..1:36
+        Eq `=` @1:37..1:38
+        LiteralExpr @1:39..1:42
+          KwNil `nil` @1:39..1:42
+        Semi `;` @1:42..1:43
+      RBrace `}` @1:44..1:45

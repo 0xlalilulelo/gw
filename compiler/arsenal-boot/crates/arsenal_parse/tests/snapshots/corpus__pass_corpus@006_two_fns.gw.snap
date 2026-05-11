@@ -1,0 +1,31 @@
+---
+source: crates/arsenal_parse/tests/corpus.rs
+expression: dump_text
+---
+Module @1:1..3:1
+  FnDecl @1:1..2:1
+    KwFn `fn` @1:1..1:3
+    Ident `a` @1:4..1:5
+    ParamList @1:5..1:8
+      LParen `(` @1:5..1:6
+      RParen `)` @1:6..1:7
+    RetType @1:8..1:14
+      Arrow `->` @1:8..1:10
+      PathType @1:11..1:14
+        Ident `u0` @1:11..1:13
+    Block @1:14..2:1
+      LBrace `{` @1:14..1:15
+      RBrace `}` @1:15..1:16
+  FnDecl @2:1..3:1
+    KwFn `fn` @2:1..2:3
+    Ident `b` @2:4..2:5
+    ParamList @2:5..2:8
+      LParen `(` @2:5..2:6
+      RParen `)` @2:6..2:7
+    RetType @2:8..2:14
+      Arrow `->` @2:8..2:10
+      PathType @2:11..2:14
+        Ident `u0` @2:11..2:13
+    Block @2:14..3:1
+      LBrace `{` @2:14..2:15
+      RBrace `}` @2:15..2:16
