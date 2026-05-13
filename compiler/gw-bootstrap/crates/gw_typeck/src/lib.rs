@@ -1444,15 +1444,16 @@ fn synth_comptime<'a>(c: ComptimeExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     if matches!(inner_ty, Ty::Error) {
         return Ty::Error;
     }
-    // CT.1 only realises integer-valued comptime blocks. Wider inners
-    // (bool, float, …) ride later sub-bundles where the evaluator's
-    // CtValue gains the corresponding arms.
-    if !matches!(inner_ty, Ty::Int(_)) {
+    // CT.1 + CT.2a realised integer-valued comptime blocks; CT.2b
+    // adds `Ty::Bool` alongside the new comparison ops. Wider inners
+    // (float, classes, …) ride later sub-bundles where the
+    // evaluator's CtValue gains the corresponding arms.
+    if !matches!(inner_ty, Ty::Int(_) | Ty::Bool) {
         cx.diags.push(Diagnostic::error(
             ec::UNSUPPORTED_CONSTRUCT,
             Label::new(c.syntax().span, ""),
             format!(
-                "`comptime` blocks producing `{inner_ty}` are not yet supported (CT.1 handles integer-valued blocks only)"
+                "`comptime` blocks producing `{inner_ty}` are not yet supported (CT.2b handles `int` and `bool` blocks only)"
             ),
         ));
         return Ty::Error;

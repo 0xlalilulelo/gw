@@ -1476,12 +1476,16 @@ fn lower_coalesce<'a>(
 /// (`fb.ins().trap(...)` on Cranelift, `unreachable` IR on LLVM —
 /// both abort the program), so a runtime err on `!T` produces a
 /// loud failure instead of UB.
-/// Phase 2 increment CT.1: lower a `comptime { … }` block. Typeck
-/// has already evaluated the block and stashed a `CtValue` in
-/// `typed.comptime_values`; MIR materialises that value as an
-/// `Operand::Const` directly, never lowering the block body itself.
-/// The CST node for the inner Block is therefore left untouched —
-/// codegen never sees any of its statements or sub-expressions.
+/// Phase 2 increment CT.1 + CT.2a + CT.2b: lower a `comptime { … }`
+/// block. Typeck has already evaluated the block and stashed a
+/// `CtValue` in `typed.comptime_values`; MIR materialises that
+/// value as an `Operand::Const` directly, never lowering the block
+/// body itself. The CST node for the inner Block is therefore left
+/// untouched — codegen never sees any of its statements or
+/// sub-expressions. CT.2b adds the `(CtValue::Bool, Ty::Bool) →
+/// Const::Bool(b)` arm; this is the first comptime sub-bundle whose
+/// materialisation shape changes since CT.1, so the dual-backend
+/// invariant gets a fresh check at the new arm.
 fn lower_comptime<'a>(c: ComptimeExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>) -> Operand {
     let Some(value) = lcx.typed.comptime_values.get(&NodePtr(c.syntax())).copied() else {
         // Typeck rejected the block; emit an error operand so any
@@ -1499,6 +1503,7 @@ fn lower_comptime<'a>(c: ComptimeExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>
             value: n,
             ty: int_ty,
         }),
+        (gw_comptime::CtValue::Bool(b), Ty::Bool) => Operand::Const(Const::Bool(b)),
         _ => Operand::Const(Const::Error),
     }
 }

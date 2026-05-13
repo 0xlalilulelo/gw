@@ -10,12 +10,21 @@
 //! reduces to an integer literal (possibly wrapped in parens, a
 //! unary minus, or another block).
 //!
-//! CT.2a (this sub-bundle) — integer binary arithmetic. The
-//! evaluator gains an `Expr::Binary` arm dispatching on
-//! `+ - * / %` over `CtValue::Int(i128)` operands; overflow and
-//! division-by-zero raise the new [`EvalError::IntegerOverflow`] /
-//! [`EvalError::DivisionByZero`] variants. CT.2b will widen to
-//! comparisons + `CtValue::Bool`; CT.2c will add `if`/`else` +
+//! CT.2a — integer binary arithmetic. The evaluator gains an
+//! `Expr::Binary` arm dispatching on `+ - * / %` over
+//! `CtValue::Int(i128)` operands; overflow and division-by-zero
+//! raise the new [`EvalError::IntegerOverflow`] /
+//! [`EvalError::DivisionByZero`] variants.
+//!
+//! CT.2b (this sub-bundle) — comparisons + booleans. `CtValue` gains
+//! the [`CtValue::Bool`] arm. `eval_binary` is reorganised around
+//! op-first dispatch with three groups: integer arithmetic (CT.2a),
+//! integer ordering (`< <= > >=`), and equality (`==` / `!=`,
+//! overloaded for both integer and bool operands). Bool ordering
+//! (`true < false`) and logical `&&` / `||` ride a later sub-bundle.
+//! Operand-type checks go through [`expect_int`] so non-integer
+//! operands of arithmetic / ordering ops produce a clear diagnostic
+//! rather than a wrong answer. CT.2c will add `if`/`else` +
 //! let-bindings + locals env.
 
 use gw_ast::ast::{AstNode, BinaryExpr, Block, Expr, LiteralExpr};
@@ -25,11 +34,14 @@ use gw_lex::{SourceMap, Span};
 /// Result of evaluating one comptime expression. The width carried by
 /// `Int` is left to the typed AST: typeck records the surrounding
 /// expression's `Ty` in `expr_types`, and MIR uses that to pick the
-/// `IntTy` for the materialised `Const::Int`.
+/// `IntTy` for the materialised `Const::Int`. `Bool` has no width
+/// — MIR lowers it directly to `Const::Bool(b)`.
 #[derive(Copy, Clone, Debug)]
 pub enum CtValue {
     /// Integer constant in two's-complement i128 representation.
     Int(i128),
+    /// Boolean constant. Added in CT.2b alongside the comparison ops.
+    Bool(bool),
 }
 
 /// Error raised by the evaluator. Spans point into the original source
@@ -155,13 +167,16 @@ impl<'sm> EvalCx<'sm> {
 
 /// Evaluate the body of a `comptime { … }` block.
 ///
-/// CT.1 + CT.2a surface: the block must consist of zero statements
-/// and a single tail expression. The tail expression may be an
-/// integer literal, a unary minus, a parenthesised expression, a
-/// nested block, or a binary arithmetic expression (`+ - * / %`)
-/// over integer operands. let-bindings, comparisons, control flow,
-/// and other shapes are rejected with [`EvalError::Unsupported`]
-/// until CT.2b / CT.2c.
+/// CT.1 + CT.2a + CT.2b surface: the block must consist of zero
+/// statements and a single tail expression. The tail expression
+/// may be an integer literal (CT.1), `true` / `false` (CT.2b), a
+/// unary minus on an integer (CT.1), a parenthesised expression
+/// (CT.1), a nested block (CT.1), a binary arithmetic expression
+/// `+ - * / %` over integer operands (CT.2a), an integer ordering
+/// comparison `< <= > >=` (CT.2b), or an `==` / `!=` over matching
+/// integer-or-bool operands (CT.2b). let-bindings, control flow,
+/// logical `&&` / `||`, and other shapes are rejected with
+/// [`EvalError::Unsupported`] until CT.2c.
 pub fn eval_comptime_block(block: Block<'_>, cx: &mut EvalCx<'_>) -> Result<CtValue, EvalError> {
     let span = block.syntax().span;
     cx.step(span)?;
@@ -214,9 +229,8 @@ fn eval_expr(expr: Expr<'_>, cx: &mut EvalCx<'_>) -> Result<CtValue, EvalError> 
             cx.enter(span)?;
             let v = eval_expr(operand, cx);
             cx.exit();
-            match v? {
-                CtValue::Int(n) => Ok(CtValue::Int(n.wrapping_neg())),
-            }
+            let n = expect_int(v?, span)?;
+            Ok(CtValue::Int(n.wrapping_neg()))
         }
         Expr::Block(b) => {
             cx.enter(span)?;
@@ -237,12 +251,20 @@ fn eval_expr(expr: Expr<'_>, cx: &mut EvalCx<'_>) -> Result<CtValue, EvalError> 
     }
 }
 
-/// Evaluate `lhs OP rhs` over `CtValue::Int(i128)` operands. CT.2
-/// supports `+ - * / %` only; comparisons / shifts / bitwise / logical
-/// land in later widenings. Arithmetic uses `i128` checked ops per
-/// decision Q1 (arbitrary-precision evaluator, narrow at
-/// materialisation): an overflow during compile-time eval is a
-/// distinct error from a materialisation-time narrowing overflow.
+/// Evaluate `lhs OP rhs`. CT.2a accepts arithmetic (`+`, `-`, `*`,
+/// `/`, `%`) over `i128` operands; CT.2b adds the four integer
+/// ordering comparisons (`<`, `<=`, `>`, `>=`) and overloaded
+/// equality (`==`, `!=`) for both integer and boolean operands.
+/// Bool ordering (`true < false`) and logical `&&` / `||` are
+/// deferred. Arithmetic uses `i128` checked ops per decision Q1
+/// (arbitrary-precision evaluator, narrow at materialisation): an
+/// overflow during compile-time eval is a distinct error from a
+/// materialisation-time narrowing overflow. Op-first dispatch
+/// keeps each operator's operand-type contract local — arithmetic
+/// and ordering route through [`expect_int`]; equality accepts
+/// matching `(Int, Int)` or `(Bool, Bool)` pairs and rejects mixed
+/// pairs explicitly so the user sees the type-mismatch rather than
+/// an arbitrary dominant-type rule.
 fn eval_binary(
     expr: BinaryExpr<'_>,
     span: Span,
@@ -260,32 +282,85 @@ fn eval_binary(
         span,
         what: "binary operator missing its operator token",
     })?;
-    let CtValue::Int(l) = eval_expr(lhs, cx)?;
-    let CtValue::Int(r) = eval_expr(rhs, cx)?;
-    let result = match op {
-        SyntaxKind::Plus => l.checked_add(r).ok_or(EvalError::IntegerOverflow(span))?,
-        SyntaxKind::Minus => l.checked_sub(r).ok_or(EvalError::IntegerOverflow(span))?,
-        SyntaxKind::Star => l.checked_mul(r).ok_or(EvalError::IntegerOverflow(span))?,
-        SyntaxKind::Slash => {
-            if r == 0 {
-                return Err(EvalError::DivisionByZero(span));
-            }
-            l.checked_div(r).ok_or(EvalError::IntegerOverflow(span))?
+    let lv = eval_expr(lhs, cx)?;
+    let rv = eval_expr(rhs, cx)?;
+    match op {
+        SyntaxKind::Plus
+        | SyntaxKind::Minus
+        | SyntaxKind::Star
+        | SyntaxKind::Slash
+        | SyntaxKind::Percent => {
+            let l = expect_int(lv, span)?;
+            let r = expect_int(rv, span)?;
+            let result = match op {
+                SyntaxKind::Plus => l.checked_add(r).ok_or(EvalError::IntegerOverflow(span))?,
+                SyntaxKind::Minus => l.checked_sub(r).ok_or(EvalError::IntegerOverflow(span))?,
+                SyntaxKind::Star => l.checked_mul(r).ok_or(EvalError::IntegerOverflow(span))?,
+                SyntaxKind::Slash => {
+                    if r == 0 {
+                        return Err(EvalError::DivisionByZero(span));
+                    }
+                    l.checked_div(r).ok_or(EvalError::IntegerOverflow(span))?
+                }
+                SyntaxKind::Percent => {
+                    if r == 0 {
+                        return Err(EvalError::DivisionByZero(span));
+                    }
+                    l.checked_rem(r).ok_or(EvalError::IntegerOverflow(span))?
+                }
+                _ => unreachable!("outer match guarantees arithmetic op"),
+            };
+            Ok(CtValue::Int(result))
         }
-        SyntaxKind::Percent => {
-            if r == 0 {
-                return Err(EvalError::DivisionByZero(span));
-            }
-            l.checked_rem(r).ok_or(EvalError::IntegerOverflow(span))?
+        SyntaxKind::Lt | SyntaxKind::LtEq | SyntaxKind::Gt | SyntaxKind::GtEq => {
+            let l = expect_int(lv, span)?;
+            let r = expect_int(rv, span)?;
+            let result = match op {
+                SyntaxKind::Lt => l < r,
+                SyntaxKind::LtEq => l <= r,
+                SyntaxKind::Gt => l > r,
+                SyntaxKind::GtEq => l >= r,
+                _ => unreachable!("outer match guarantees ordering op"),
+            };
+            Ok(CtValue::Bool(result))
         }
-        _ => {
-            return Err(EvalError::Unsupported {
-                span,
-                what: "this binary operator is not yet supported by the CT.2 evaluator",
-            });
+        SyntaxKind::EqEq | SyntaxKind::BangEq => {
+            let equal = match (lv, rv) {
+                (CtValue::Int(l), CtValue::Int(r)) => l == r,
+                (CtValue::Bool(l), CtValue::Bool(r)) => l == r,
+                _ => {
+                    return Err(EvalError::Unsupported {
+                        span,
+                        what: "`==` / `!=` operands must have matching types in a comptime block",
+                    });
+                }
+            };
+            let result = if matches!(op, SyntaxKind::EqEq) {
+                equal
+            } else {
+                !equal
+            };
+            Ok(CtValue::Bool(result))
         }
-    };
-    Ok(CtValue::Int(result))
+        _ => Err(EvalError::Unsupported {
+            span,
+            what: "this binary operator is not yet supported by the comptime evaluator",
+        }),
+    }
+}
+
+/// Pin a `CtValue` to its integer payload, or report an Unsupported
+/// diagnostic at `span`. Used by every arithmetic and ordering op so
+/// the operand-shape contract lives in exactly one place; CT.2c's
+/// additions (let-bindings, branches) will route the same way.
+fn expect_int(v: CtValue, span: Span) -> Result<i128, EvalError> {
+    match v {
+        CtValue::Int(n) => Ok(n),
+        CtValue::Bool(_) => Err(EvalError::Unsupported {
+            span,
+            what: "this operator requires an integer operand, found `bool`",
+        }),
+    }
 }
 
 fn eval_literal(l: LiteralExpr<'_>, cx: &mut EvalCx<'_>) -> Result<CtValue, EvalError> {
@@ -300,9 +375,11 @@ fn eval_literal(l: LiteralExpr<'_>, cx: &mut EvalCx<'_>) -> Result<CtValue, Eval
                 .map(CtValue::Int)
                 .ok_or(EvalError::BadIntLiteral(span))
         }
+        SyntaxKind::KwTrue => Ok(CtValue::Bool(true)),
+        SyntaxKind::KwFalse => Ok(CtValue::Bool(false)),
         _ => Err(EvalError::Unsupported {
             span,
-            what: "literal kind not yet supported by the CT.1 evaluator",
+            what: "this literal kind is not yet supported by the comptime evaluator",
         }),
     }
 }
@@ -383,21 +460,35 @@ mod tests {
         eval(src, Budget::default())
     }
 
+    fn assert_int(v: CtValue) -> i128 {
+        match v {
+            CtValue::Int(n) => n,
+            other => panic!("expected CtValue::Int, got {other:?}"),
+        }
+    }
+
+    fn assert_bool(v: CtValue) -> bool {
+        match v {
+            CtValue::Bool(b) => b,
+            other => panic!("expected CtValue::Bool, got {other:?}"),
+        }
+    }
+
     #[test]
     fn bare_int_literal() {
-        let CtValue::Int(n) = eval_default("fn t() -> i32 { return comptime { 42 }; }").unwrap();
+        let n = assert_int(eval_default("fn t() -> i32 { return comptime { 42 }; }").unwrap());
         assert_eq!(n, 42);
     }
 
     #[test]
     fn negated_literal() {
-        let CtValue::Int(n) = eval_default("fn t() -> i32 { return comptime { -3 }; }").unwrap();
+        let n = assert_int(eval_default("fn t() -> i32 { return comptime { -3 }; }").unwrap());
         assert_eq!(n, -3);
     }
 
     #[test]
     fn paren_wrapped() {
-        let CtValue::Int(n) = eval_default("fn t() -> i32 { return comptime { (5) }; }").unwrap();
+        let n = assert_int(eval_default("fn t() -> i32 { return comptime { (5) }; }").unwrap());
         assert_eq!(n, 5);
     }
 
@@ -408,14 +499,13 @@ mod tests {
         // Paren-wrapping forces the inner block into expression
         // context so it becomes the comptime block's tail expression
         // and exercises eval_expr's `Expr::Block` arm.
-        let CtValue::Int(n) =
-            eval_default("fn t() -> i32 { return comptime { ({ 7 }) }; }").unwrap();
+        let n = assert_int(eval_default("fn t() -> i32 { return comptime { ({ 7 }) }; }").unwrap());
         assert_eq!(n, 7);
     }
 
     #[test]
     fn hex_literal_decodes() {
-        let CtValue::Int(n) = eval_default("fn t() -> i32 { return comptime { 0xff }; }").unwrap();
+        let n = assert_int(eval_default("fn t() -> i32 { return comptime { 0xff }; }").unwrap());
         assert_eq!(n, 255);
     }
 
@@ -428,38 +518,35 @@ mod tests {
         );
     }
 
-    // CT.2: binary arithmetic on integer literals.
+    // CT.2a: binary arithmetic on integer literals.
 
     #[test]
     fn binary_addition() {
-        let CtValue::Int(n) = eval_default("fn t() -> i32 { return comptime { 1 + 2 }; }").unwrap();
+        let n = assert_int(eval_default("fn t() -> i32 { return comptime { 1 + 2 }; }").unwrap());
         assert_eq!(n, 3);
     }
 
     #[test]
     fn binary_subtraction() {
-        let CtValue::Int(n) =
-            eval_default("fn t() -> i32 { return comptime { 10 - 3 }; }").unwrap();
+        let n = assert_int(eval_default("fn t() -> i32 { return comptime { 10 - 3 }; }").unwrap());
         assert_eq!(n, 7);
     }
 
     #[test]
     fn binary_multiplication() {
-        let CtValue::Int(n) = eval_default("fn t() -> i32 { return comptime { 6 * 7 }; }").unwrap();
+        let n = assert_int(eval_default("fn t() -> i32 { return comptime { 6 * 7 }; }").unwrap());
         assert_eq!(n, 42);
     }
 
     #[test]
     fn binary_division_truncates() {
-        let CtValue::Int(n) =
-            eval_default("fn t() -> i32 { return comptime { 100 / 7 }; }").unwrap();
+        let n = assert_int(eval_default("fn t() -> i32 { return comptime { 100 / 7 }; }").unwrap());
         assert_eq!(n, 14);
     }
 
     #[test]
     fn binary_modulo() {
-        let CtValue::Int(n) =
-            eval_default("fn t() -> i32 { return comptime { 100 % 7 }; }").unwrap();
+        let n = assert_int(eval_default("fn t() -> i32 { return comptime { 100 % 7 }; }").unwrap());
         assert_eq!(n, 2);
     }
 
@@ -468,17 +555,16 @@ mod tests {
         // `1 + 2 * 3` parses as `1 + (2 * 3)` via Pratt precedence;
         // the evaluator simply walks the resulting CST so it inherits
         // the correct precedence for free.
-        let CtValue::Int(n) =
-            eval_default("fn t() -> i32 { return comptime { 1 + 2 * 3 }; }").unwrap();
+        let n =
+            assert_int(eval_default("fn t() -> i32 { return comptime { 1 + 2 * 3 }; }").unwrap());
         assert_eq!(n, 7);
     }
 
     #[test]
     fn binary_negated_operand() {
         // Exercises the interaction between the Unary(Minus, ...)
-        // arm (CT.1) and the Binary arm (CT.2).
-        let CtValue::Int(n) =
-            eval_default("fn t() -> i32 { return comptime { -3 + 10 }; }").unwrap();
+        // arm (CT.1) and the Binary arm (CT.2a).
+        let n = assert_int(eval_default("fn t() -> i32 { return comptime { -3 + 10 }; }").unwrap());
         assert_eq!(n, 7);
     }
 
@@ -500,17 +586,123 @@ mod tests {
         );
     }
 
+    // CT.2b: booleans + comparisons.
+
     #[test]
-    fn unsupported_binary_op_rejects() {
-        // `<` lands in a later CT.x widening (comparisons require
-        // CtValue::Bool). For now the evaluator's Binary arm
-        // explicitly rejects non-arithmetic operators with a clear
-        // Unsupported diagnostic rather than producing wrong
-        // numbers.
-        let err = eval_default("fn t() -> i32 { return comptime { 1 < 2 }; }").unwrap_err();
+    fn bool_true_literal() {
+        let b = assert_bool(eval_default("fn t() -> bool { return comptime { true }; }").unwrap());
+        assert!(b);
+    }
+
+    #[test]
+    fn bool_false_literal() {
+        let b = assert_bool(eval_default("fn t() -> bool { return comptime { false }; }").unwrap());
+        assert!(!b);
+    }
+
+    #[test]
+    fn integer_lt() {
+        let b = assert_bool(eval_default("fn t() -> bool { return comptime { 1 < 2 }; }").unwrap());
+        assert!(b);
+    }
+
+    #[test]
+    fn integer_le_is_inclusive() {
+        let b =
+            assert_bool(eval_default("fn t() -> bool { return comptime { 2 <= 2 }; }").unwrap());
+        assert!(b);
+    }
+
+    #[test]
+    fn integer_gt() {
+        let b = assert_bool(eval_default("fn t() -> bool { return comptime { 3 > 2 }; }").unwrap());
+        assert!(b);
+    }
+
+    #[test]
+    fn integer_ge_at_boundary() {
+        let b =
+            assert_bool(eval_default("fn t() -> bool { return comptime { 2 >= 2 }; }").unwrap());
+        assert!(b);
+    }
+
+    #[test]
+    fn integer_eq_ne() {
+        let eq_true =
+            assert_bool(eval_default("fn t() -> bool { return comptime { 5 == 5 }; }").unwrap());
+        assert!(eq_true);
+        let ne_true =
+            assert_bool(eval_default("fn t() -> bool { return comptime { 5 != 6 }; }").unwrap());
+        assert!(ne_true);
+    }
+
+    #[test]
+    fn bool_eq_ne() {
+        let eq_true = assert_bool(
+            eval_default("fn t() -> bool { return comptime { true == true }; }").unwrap(),
+        );
+        assert!(eq_true);
+        let ne_true = assert_bool(
+            eval_default("fn t() -> bool { return comptime { true != false }; }").unwrap(),
+        );
+        assert!(ne_true);
+    }
+
+    #[test]
+    fn negated_operand_with_comparison() {
+        // -3 < 0 — exercises the Unary(Minus) + Lt interaction (the
+        // negated literal flows through the integer-ordering arm
+        // without special handling).
+        let b =
+            assert_bool(eval_default("fn t() -> bool { return comptime { -3 < 0 }; }").unwrap());
+        assert!(b);
+    }
+
+    #[test]
+    fn arithmetic_on_bool_rejects() {
+        // `1 + true` — expect_int should fire on the rhs operand and
+        // produce a clear Unsupported diagnostic. The typeck would
+        // normally reject this before we reach the evaluator, but
+        // the evaluator's contract is independent of typeck so we
+        // exercise it directly.
+        let err = eval_default("fn t() -> i32 { return comptime { 1 + true }; }").unwrap_err();
         assert!(
             matches!(err, EvalError::Unsupported { .. }),
-            "expected Unsupported (comparison ops land in a later CT.x), got {err:?}",
+            "expected Unsupported, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn ordering_on_bool_rejects() {
+        // `true < false` — bool ordering is deliberately deferred.
+        let err = eval_default("fn t() -> i32 { return comptime { true < false }; }").unwrap_err();
+        assert!(
+            matches!(err, EvalError::Unsupported { .. }),
+            "expected Unsupported, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn mixed_eq_rejects() {
+        // `1 == true` has no obvious comparison semantics — reject
+        // explicitly rather than inventing a dominant-type rule.
+        let err = eval_default("fn t() -> bool { return comptime { 1 == true }; }").unwrap_err();
+        assert!(
+            matches!(err, EvalError::Unsupported { .. }),
+            "expected Unsupported, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn logical_and_still_rejects() {
+        // `&&` / `||` are deferred — make sure the evaluator's
+        // catch-all `_` arm catches them with a clear Unsupported
+        // rather than producing a wrong answer.
+        let err =
+            eval_default("fn t() -> bool { return comptime { true && false }; }").unwrap_err();
+        assert!(
+            matches!(err, EvalError::Unsupported { .. }),
+            "expected Unsupported (logical && is deferred), got {err:?}",
         );
     }
 
