@@ -38,19 +38,30 @@
 //! arm in `eval_expr` reads the same env to materialise a local
 //! reference.
 //!
-//! CT.2d (this sub-bundle) — `if`/`else` control flow. The
-//! evaluator gains an `Expr::If` arm: the condition is evaluated
-//! via [`expect_bool`] (analog of [`expect_int`]) and exactly one
-//! arm is evaluated. The un-taken arm is never visited, so any
-//! side effect (a let-init that would panic, a comparison that
-//! would otherwise produce `Unsupported`, a `1 / 0`) stays
-//! latent. This is the first comptime sub-bundle where the
-//! evaluator's control flow diverges from the syntactic shape
-//! the typed AST exposes. Else-if chains fall out naturally
-//! because `IfExpr::else_branch` returns an `Expr` — either a
-//! `Block` (terminal `else { … }`) or another `IfExpr` (chained
-//! `else if`) — and both shapes are already dispatched by
-//! `eval_expr`. Logical `&&` / `||` ride CT.2e.
+//! CT.2d — `if`/`else` control flow. The evaluator gains an
+//! `Expr::If` arm: the condition is evaluated via [`expect_bool`]
+//! (analog of [`expect_int`]) and exactly one arm is evaluated.
+//! The un-taken arm is never visited, so any side effect (a
+//! let-init that would panic, a comparison that would otherwise
+//! produce `Unsupported`, a `1 / 0`) stays latent. This is the
+//! first comptime sub-bundle where the evaluator's control flow
+//! diverges from the syntactic shape the typed AST exposes.
+//! Else-if chains fall out naturally because `IfExpr::else_branch`
+//! returns an `Expr` — either a `Block` (terminal `else { … }`)
+//! or another `IfExpr` (chained `else if`) — and both shapes are
+//! already dispatched by `eval_expr`.
+//!
+//! CT.2e (this sub-bundle) — short-circuit `&&` / `||`. Pure
+//! recombination of CT.2b's `CtValue::Bool` + CT.2d's
+//! branch-eval discipline applied at the operator level rather
+//! than the statement level. `eval_binary` intercepts
+//! `SyntaxKind::AmpAmp` / `PipePipe` *before* its eager RHS eval
+//! and dispatches to [`eval_logical_short_circuit`], which
+//! evaluates the LHS, pins it to bool via [`expect_bool`], and
+//! evaluates the RHS only when the LHS doesn't determine the
+//! result (`false` for `&&`, `true` for `||`). The RHS therefore
+//! never runs when it would short-circuit — `false && (1 / 0 ==
+//! 0)` returns false rather than raising `DivisionByZero`.
 
 use gw_ast::ast::{AstNode, BinaryExpr, Block, Expr, IfExpr, LetStmt, LiteralExpr, Pattern, Stmt};
 use gw_ast::cst::NodePtr;
@@ -272,21 +283,22 @@ impl<'sm, 'env, 'a> EvalCx<'sm, 'env, 'a> {
 
 /// Evaluate the body of a `comptime { … }` block.
 ///
-/// CT.1 + CT.2a + CT.2b + CT.2c + CT.2d surface: the block may
-/// contain zero or more `let` statements followed by a single tail
-/// expression. `let` patterns are limited to `IdentPat` (single
-/// name); the initialiser must be a supported expression. The tail
-/// expression may be an integer literal (CT.1), `true` / `false`
-/// (CT.2b), a unary minus on an integer (CT.1), a parenthesised
-/// expression (CT.1), a nested block (CT.1), a path reference to
-/// a previously `let`-bound local (CT.2c), a binary arithmetic
-/// expression `+ - * / %` over integer operands (CT.2a), an
-/// integer ordering comparison `< <= > >=` (CT.2b), an `==` / `!=`
-/// over matching integer-or-bool operands (CT.2b), or an
+/// CT.1 + CT.2a + CT.2b + CT.2c + CT.2d + CT.2e surface: the block
+/// may contain zero or more `let` statements followed by a single
+/// tail expression. `let` patterns are limited to `IdentPat`
+/// (single name); the initialiser must be a supported expression.
+/// The tail expression may be an integer literal (CT.1), `true` /
+/// `false` (CT.2b), a unary minus on an integer (CT.1), a
+/// parenthesised expression (CT.1), a nested block (CT.1), a path
+/// reference to a previously `let`-bound local (CT.2c), a binary
+/// arithmetic expression `+ - * / %` over integer operands
+/// (CT.2a), an integer ordering comparison `< <= > >=` (CT.2b), an
+/// `==` / `!=` over matching integer-or-bool operands (CT.2b), an
 /// `if cond { … } else { … }` (CT.2d — including `else if` chains)
-/// where the condition evaluates to a `CtValue::Bool`. Expression
-/// statements, logical `&&` / `||`, and other shapes are rejected
-/// with [`EvalError::Unsupported`] until CT.2e.
+/// where the condition evaluates to a `CtValue::Bool`, or a
+/// short-circuit `&&` / `||` over bool operands (CT.2e). Expression
+/// statements and other shapes are rejected with
+/// [`EvalError::Unsupported`].
 pub fn eval_comptime_block<'a>(
     block: Block<'a>,
     cx: &mut EvalCx<'_, '_, 'a>,
@@ -502,6 +514,14 @@ fn eval_binary<'a>(
         span,
         what: "binary operator missing its operator token",
     })?;
+    // CT.2e: short-circuit operators evaluate LHS first, RHS only
+    // when LHS doesn't determine the result. Must intercept
+    // *before* the eager RHS eval below — otherwise the RHS would
+    // always run, defeating the short-circuit semantics that match
+    // the runtime `&&` / `||` lowering (decision #15).
+    if matches!(op, SyntaxKind::AmpAmp | SyntaxKind::PipePipe) {
+        return eval_logical_short_circuit(op, lhs, rhs, span, cx);
+    }
     let lv = eval_expr(lhs, cx)?;
     let rv = eval_expr(rhs, cx)?;
     match op {
@@ -567,6 +587,35 @@ fn eval_binary<'a>(
             what: "this binary operator is not yet supported by the comptime evaluator",
         }),
     }
+}
+
+/// Evaluate a short-circuit `&&` / `||`. Mirrors the runtime
+/// lowering (decision #15): the LHS is evaluated first; the RHS
+/// runs only when the LHS doesn't determine the result. `&&`
+/// short-circuits on `false`; `||` short-circuits on `true`. The
+/// "short-circuit value" is the LHS value that immediately fixes
+/// the result without consulting the RHS — namely the operator's
+/// identity element under boolean conjunction / disjunction
+/// (`false` for AND, `true` for OR). When the LHS doesn't
+/// short-circuit, the result is the RHS pinned to bool — both `true
+/// && rhs` and `false || rhs` yield exactly `rhs`'s bool value.
+fn eval_logical_short_circuit<'a>(
+    op: SyntaxKind,
+    lhs: Expr<'a>,
+    rhs: Expr<'a>,
+    span: Span,
+    cx: &mut EvalCx<'_, '_, 'a>,
+) -> Result<CtValue, EvalError> {
+    let lv = eval_expr(lhs, cx)?;
+    let l = expect_bool(lv, span)?;
+    // `&&` short-circuits on false; `||` on true.
+    let short_circuit_value = matches!(op, SyntaxKind::PipePipe);
+    if l == short_circuit_value {
+        return Ok(CtValue::Bool(short_circuit_value));
+    }
+    let rv = eval_expr(rhs, cx)?;
+    let r = expect_bool(rv, span)?;
+    Ok(CtValue::Bool(r))
 }
 
 /// Pin a `CtValue` to its integer payload, or report an Unsupported
@@ -946,16 +995,84 @@ mod tests {
         );
     }
 
+    // CT.2e: short-circuit `&&` / `||` over bools.
+
     #[test]
-    fn logical_and_still_rejects() {
-        // `&&` / `||` are deferred — make sure the evaluator's
-        // catch-all `_` arm catches them with a clear Unsupported
-        // rather than producing a wrong answer.
-        let err =
-            eval_default("fn t() -> bool { return comptime { true && false }; }").unwrap_err();
+    fn and_with_eager_path() {
+        // LHS=true, doesn't short-circuit, so RHS evaluates and
+        // determines the result.
+        let b = assert_bool(
+            eval_default("fn t() -> bool { return comptime { true && (3 > 2) }; }").unwrap(),
+        );
+        assert!(b);
+    }
+
+    #[test]
+    fn and_short_circuits_on_false_lhs() {
+        // LHS=false → short-circuit to false, RHS never runs.
+        // The RHS is `1 / 0` which would raise
+        // `EvalError::DivisionByZero` if evaluated; a passing test
+        // proves the short-circuit fired.
+        let b = assert_bool(
+            eval_default("fn t() -> bool { return comptime { false && (1 / 0 == 0) }; }").unwrap(),
+        );
+        assert!(!b);
+    }
+
+    #[test]
+    fn or_with_eager_path() {
+        // LHS=false, doesn't short-circuit, so RHS evaluates.
+        let b = assert_bool(
+            eval_default("fn t() -> bool { return comptime { false || (3 > 2) }; }").unwrap(),
+        );
+        assert!(b);
+    }
+
+    #[test]
+    fn or_short_circuits_on_true_lhs() {
+        // LHS=true → short-circuit to true, RHS never runs. Same
+        // `1 / 0` regression-net pattern as the `&&` case.
+        let b = assert_bool(
+            eval_default("fn t() -> bool { return comptime { true || (1 / 0 == 0) }; }").unwrap(),
+        );
+        assert!(b);
+    }
+
+    #[test]
+    fn and_propagates_rhs_error_when_lhs_true() {
+        // LHS=true means RHS evaluates and any error inside it
+        // surfaces. Catches an asymmetric "always short-circuit"
+        // miscompile that would mask the RHS's DivisionByZero.
+        let err = eval_default("fn t() -> bool { return comptime { true && (1 / 0 == 0) }; }")
+            .unwrap_err();
+        assert!(
+            matches!(err, EvalError::DivisionByZero(_)),
+            "expected DivisionByZero (RHS must run when LHS is true), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn or_propagates_rhs_error_when_lhs_false() {
+        // Symmetric to the previous test for `||`. LHS=false →
+        // RHS evaluates → DivisionByZero surfaces.
+        let err = eval_default("fn t() -> bool { return comptime { false || (1 / 0 == 0) }; }")
+            .unwrap_err();
+        assert!(
+            matches!(err, EvalError::DivisionByZero(_)),
+            "expected DivisionByZero (RHS must run when LHS is false), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn integer_lhs_in_logical_rejects() {
+        // `1 && true` — integer LHS; expect_bool should reject.
+        // Typeck would normally diagnose this before the
+        // evaluator runs; the test exercises the evaluator's
+        // contract independently.
+        let err = eval_default("fn t() -> bool { return comptime { 1 && true }; }").unwrap_err();
         assert!(
             matches!(err, EvalError::Unsupported { .. }),
-            "expected Unsupported (logical && is deferred), got {err:?}",
+            "expected Unsupported (non-bool LHS), got {err:?}",
         );
     }
 
