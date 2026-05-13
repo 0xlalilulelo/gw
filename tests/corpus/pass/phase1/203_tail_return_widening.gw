@@ -1,0 +1,5 @@
+fn pick() -> i64 { 100 }
+
+fn main() -> i32 {
+    return pick() as i32;
+}

@@ -643,7 +643,7 @@ fn lower_fn<'a>(
         let entry = b.alloc_block();
         b.cur = entry;
 
-        if let Some(body) = fn_decl.body() {
+        let body_tail_operand = if let Some(body) = fn_decl.body() {
             let mut lcx = LowerCx {
                 typed,
                 sm,
@@ -654,17 +654,42 @@ fn lower_fn<'a>(
                 print_write_fnidx,
                 fn_return_ty: sig.ret,
             };
-            let _ = lower_block(&mut b, body, &mut lcx);
-        }
+            let op = lower_block(&mut b, body, &mut lcx);
+            // Capture the operand only when the body's tail
+            // expression was actually a bare-Expr tail (the CT.1
+            // parser shape used by implicit-tail-return). If the
+            // block ended with an `ExprStmt` instead, `lower_block`
+            // returns `Operand::Const(Const::Unit)`, which we
+            // don't want to install as the fn's return value —
+            // the existing fallthrough handles u0/non-u0 fns
+            // correctly in that case.
+            if fn_decl.body().and_then(|b| b.tail_expr()).is_some() {
+                Some(op)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-        // If the trailing block has no terminator yet, fabricate one.
-        // This happens when the function body falls through without an
-        // explicit `return`. For a function returning `u0` this is
-        // fine; for any other return type it would have been a type-
-        // checker error already, and the unreachable terminator is a
-        // safety net.
+        // Terminator selection priority:
+        //   1. The block-lowering itself emitted a terminator
+        //      (explicit `return`, `match` with a divergent arm,
+        //      …) — leave it alone.
+        //   2. Implicit-tail-return: a bare-Expr tail was lowered
+        //      and produced an operand of the fn's return type —
+        //      Return it. typeck's `check_fn_body` already ran
+        //      `check_expr(tail, sig.ret, …)` so the operand's
+        //      type is sig.ret-compatible (literal narrowing
+        //      applied where needed).
+        //   3. Fall-through with no value: `u0` / `Error` returns
+        //      synthesise `Return(Unit)`; anything else gets
+        //      `Unreachable` as a safety net (typeck would have
+        //      flagged a missing-return-value already).
         if b.blocks[b.cur.0 as usize].terminator_set {
             // already set
+        } else if let Some(op) = body_tail_operand {
+            b.set_terminator(b.cur, Terminator::Return(op));
         } else if sig.ret == Ty::U0 || sig.ret == Ty::Error {
             b.set_terminator(b.cur, Terminator::Return(Operand::Const(Const::Unit)));
         } else {

@@ -1,0 +1,8 @@
+fn double(n: i32) -> i32 {
+    let r = n * 2;
+    r
+}
+
+fn main() -> i32 {
+    return double(11);
+}

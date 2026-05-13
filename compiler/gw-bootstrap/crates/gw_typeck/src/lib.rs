@@ -74,13 +74,13 @@ pub mod ec {
     /// message names the offending shape (unsupported construct,
     /// budget exhausted, malformed integer literal, …).
     pub const COMPTIME_EVAL_FAILED: ErrorCode = ErrorCode(314);
-    /// A function body ended with a bare tail expression (no trailing
-    /// `;`). Phase 2 / CT.1 exposes this shape to the comptime
-    /// evaluator but does not yet promote it to an implicit return at
-    /// the function level — the user must add `;` to discard the
-    /// value or `return` to make it the function's return value.
-    /// Tracked for a future sub-bundle (implicit-tail-return).
-    pub const TAIL_EXPR_IN_FN_BODY: ErrorCode = ErrorCode(315);
+    // ErrorCode(315) was TAIL_EXPR_IN_FN_BODY — the temporary CT.1
+    // guard rail against the latent "fn body ends with a bare
+    // expression" runtime trap. Retired when implicit-tail-return
+    // shipped: the tail expression is now type-checked against the
+    // declared return type and lowered into `Terminator::Return`
+    // directly. A non-matching tail type now diagnoses as the
+    // ordinary `TYPE_MISMATCH` (E0300).
 }
 
 /// Concrete type. Phase-1 supports primitives and POD classes;
@@ -885,24 +885,23 @@ fn check_fn_body<'a>(
         return;
     };
     check_block(body, sig.ret, &mut cx);
-    // Phase 2 / CT.1 widens `parse_expr_stmt` so a block's trailing
-    // expression without `;` becomes a bare-Expr tail child rather
-    // than an `ExprStmt`. The comptime evaluator consumes that shape
-    // directly, but at the *function* level MIR's `lower_fn`
-    // discards the tail operand and fabricates either `Return(Unit)`
-    // (for `u0`/`Error` returns) or `Unreachable` (which traps at
-    // runtime) — neither matches the implicit-tail-return semantics
-    // a user reaching for `fn f() -> i32 { 42 }` would expect.
-    // Until a dedicated sub-bundle wires the tail operand into the
-    // fn's `Return` terminator and the typeck-side type compatibility
-    // check, reject the shape with a clear suggestion so users get a
-    // compile-time error rather than a silent runtime trap.
+    // Phase 2 / implicit-tail-return: when CT.1's parser widening
+    // leaves a bare expression at the end of the fn body (no `;`
+    // before `}`), check that expression against the declared
+    // return type. `check_expr` runs the bidirectional narrowing
+    // already wired for `let` initialisers and `return` operands
+    // (decision #16), so `fn add(a: i32, b: i32) -> i32 { a + b }`
+    // and `fn f() -> i64 { 42 }` work without explicit annotation.
+    // Scope is deliberately limited to bare-expression tails: the
+    // parser still wraps block-like statements (`if` / `while` /
+    // `for` / `{ … }`) in `ExprStmt`, so `fn f() -> i32 { if c
+    // { 1 } else { 2 } }` stays in its pre-CT.1 typing (no
+    // tail_expr, no implicit return). That widening rides a
+    // future sub-bundle so the corpus-regression handling
+    // (divergent tails, u0-discard policy) can be designed
+    // separately.
     if let Some(tail) = body.tail_expr() {
-        cx.diags.push(Diagnostic::error(
-            ec::TAIL_EXPR_IN_FN_BODY,
-            Label::new(expr_span(tail), ""),
-            "function body ends with a bare expression; add `;` to discard it, or `return` to make it the function's return value",
-        ));
+        check_expr(tail, sig.ret, &mut cx);
     }
 }
 
@@ -3121,35 +3120,35 @@ mod tests {
         assert_eq!(check(src), 0);
     }
 
-    // ─── Phase 2 increment CT.1: bare tail expression in fn body ──────────
+    // ─── Phase 2 implicit-tail-return (bare-expression tails) ─────────────
 
     #[test]
-    fn fn_body_with_tail_expr_rejects() {
-        // `fn f() -> i32 { 42 }` parses cleanly (the CT.1 parser
-        // change populates `Block::tail_expr`) but the function-level
-        // implicit-tail-return is not yet wired; typeck must
-        // diagnose so the user gets a compile-time error rather than
-        // a silent runtime trap from `lower_fn`'s `Unreachable`
-        // fabrication.
-        let codes = check_codes("fn f() -> i32 { 42 }");
-        assert!(
-            codes.contains(&ec::TAIL_EXPR_IN_FN_BODY),
-            "expected E0315 TAIL_EXPR_IN_FN_BODY, got {codes:?}",
-        );
+    fn fn_body_with_int_tail_accepts() {
+        // `fn f() -> i32 { 42 }` parses with a bare-Expr tail (CT.1)
+        // and now type-checks cleanly: the tail's `42` narrows to
+        // i32 via the standard bidirectional rule (decision #16).
+        assert_eq!(check("fn f() -> i32 { 42 }"), 0);
     }
 
     #[test]
-    fn fn_body_with_tail_expr_rejects_even_for_u0() {
-        // The rule is uniform across return types: `fn f() -> u0 { 42 }`
-        // is also rejected. (For `u0`, `lower_fn` would *not* trap —
-        // the discard-and-Return(Unit) path is well-formed — but the
-        // shape is still surprising and benefits from the same clear
-        // diagnostic until implicit-tail-return ships as its own
-        // sub-bundle.)
+    fn fn_body_with_arith_tail_accepts() {
+        // The canonical implicit-tail-return shape: `a + b` is the
+        // tail expression and types as the param's i32.
+        assert_eq!(check("fn add(a: i32, b: i32) -> i32 { a + b }"), 0);
+    }
+
+    #[test]
+    fn fn_body_with_tail_type_mismatch_rejects() {
+        // `fn f() -> u0 { 42 }` — the bare `42` tail types as i32
+        // and doesn't narrow to u0. The ordinary TYPE_MISMATCH
+        // (E0300) fires; the old E0315 guard rail is retired
+        // because the normal type-mismatch diagnostic carries the
+        // user-facing fix ("change the return type or remove the
+        // tail value") with no special-casing needed.
         let codes = check_codes("fn f() -> u0 { 42 }");
         assert!(
-            codes.contains(&ec::TAIL_EXPR_IN_FN_BODY),
-            "expected E0315 TAIL_EXPR_IN_FN_BODY, got {codes:?}",
+            codes.contains(&ec::TYPE_MISMATCH),
+            "expected TYPE_MISMATCH (E0300) for u0 fn returning i32 tail, got {codes:?}",
         );
     }
 
