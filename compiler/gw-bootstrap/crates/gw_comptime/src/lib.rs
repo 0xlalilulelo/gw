@@ -26,20 +26,33 @@
 //! operands of arithmetic / ordering ops produce a clear diagnostic
 //! rather than a wrong answer.
 //!
-//! CT.2c (this sub-bundle) — let-bindings + locals env. The
-//! evaluator gains a [`BindingEnv`] trait that abstracts CST-node →
-//! binding-index lookup so `gw_comptime` doesn't need to depend on
-//! `gw_typeck` (which would form a cycle). [`EvalCx`] carries a
+//! CT.2c — let-bindings + locals env. The evaluator gains a
+//! [`BindingEnv`] trait that abstracts CST-node → binding-index
+//! lookup so `gw_comptime` doesn't need to depend on `gw_typeck`
+//! (which would form a cycle). [`EvalCx`] carries a
 //! `Vec<Option<CtValue>>` indexed by `BindingId.0` (decision Q5 ⇒
 //! option (a) — dense vector, mirrors runtime MIR's `Local`
-//! indexing). `eval_comptime_block_inner` now walks statements:
+//! indexing). `eval_comptime_block_inner` walks statements:
 //! `Stmt::Let` evaluates the initialiser and stores it in `locals`
 //! at the index supplied by the binding env. A new `Expr::Path`
 //! arm in `eval_expr` reads the same env to materialise a local
-//! reference. `if`/`else` and logical `&&` / `||` ride CT.2d /
-//! CT.2e.
+//! reference.
+//!
+//! CT.2d (this sub-bundle) — `if`/`else` control flow. The
+//! evaluator gains an `Expr::If` arm: the condition is evaluated
+//! via [`expect_bool`] (analog of [`expect_int`]) and exactly one
+//! arm is evaluated. The un-taken arm is never visited, so any
+//! side effect (a let-init that would panic, a comparison that
+//! would otherwise produce `Unsupported`, a `1 / 0`) stays
+//! latent. This is the first comptime sub-bundle where the
+//! evaluator's control flow diverges from the syntactic shape
+//! the typed AST exposes. Else-if chains fall out naturally
+//! because `IfExpr::else_branch` returns an `Expr` — either a
+//! `Block` (terminal `else { … }`) or another `IfExpr` (chained
+//! `else if`) — and both shapes are already dispatched by
+//! `eval_expr`. Logical `&&` / `||` ride CT.2e.
 
-use gw_ast::ast::{AstNode, BinaryExpr, Block, Expr, LetStmt, LiteralExpr, Pattern, Stmt};
+use gw_ast::ast::{AstNode, BinaryExpr, Block, Expr, IfExpr, LetStmt, LiteralExpr, Pattern, Stmt};
 use gw_ast::cst::NodePtr;
 use gw_ast::SyntaxKind;
 use gw_lex::{SourceMap, Span};
@@ -259,19 +272,21 @@ impl<'sm, 'env, 'a> EvalCx<'sm, 'env, 'a> {
 
 /// Evaluate the body of a `comptime { … }` block.
 ///
-/// CT.1 + CT.2a + CT.2b + CT.2c surface: the block may contain zero
-/// or more `let` statements followed by a single tail expression.
-/// `let` patterns are limited to `IdentPat` (single name); the
-/// initialiser must be a supported expression. The tail expression
-/// may be an integer literal (CT.1), `true` / `false` (CT.2b), a
-/// unary minus on an integer (CT.1), a parenthesised expression
-/// (CT.1), a nested block (CT.1), a path reference to a previously
-/// `let`-bound local (CT.2c), a binary arithmetic expression
-/// `+ - * / %` over integer operands (CT.2a), an integer ordering
-/// comparison `< <= > >=` (CT.2b), or an `==` / `!=` over matching
-/// integer-or-bool operands (CT.2b). Expression statements, `if` /
-/// `else`, logical `&&` / `||`, and other shapes are rejected with
-/// [`EvalError::Unsupported`] until CT.2d / CT.2e.
+/// CT.1 + CT.2a + CT.2b + CT.2c + CT.2d surface: the block may
+/// contain zero or more `let` statements followed by a single tail
+/// expression. `let` patterns are limited to `IdentPat` (single
+/// name); the initialiser must be a supported expression. The tail
+/// expression may be an integer literal (CT.1), `true` / `false`
+/// (CT.2b), a unary minus on an integer (CT.1), a parenthesised
+/// expression (CT.1), a nested block (CT.1), a path reference to
+/// a previously `let`-bound local (CT.2c), a binary arithmetic
+/// expression `+ - * / %` over integer operands (CT.2a), an
+/// integer ordering comparison `< <= > >=` (CT.2b), an `==` / `!=`
+/// over matching integer-or-bool operands (CT.2b), or an
+/// `if cond { … } else { … }` (CT.2d — including `else if` chains)
+/// where the condition evaluates to a `CtValue::Bool`. Expression
+/// statements, logical `&&` / `||`, and other shapes are rejected
+/// with [`EvalError::Unsupported`] until CT.2e.
 pub fn eval_comptime_block<'a>(
     block: Block<'a>,
     cx: &mut EvalCx<'_, '_, 'a>,
@@ -400,10 +415,59 @@ fn eval_expr<'a>(expr: Expr<'a>, cx: &mut EvalCx<'_, '_, 'a>) -> Result<CtValue,
             cx.exit();
             v
         }
+        Expr::If(i) => {
+            cx.enter(span)?;
+            let v = eval_if(i, span, cx);
+            cx.exit();
+            v
+        }
         _ => Err(EvalError::Unsupported {
             span,
             what: "this expression shape is not yet supported by the comptime evaluator",
         }),
+    }
+}
+
+/// Evaluate an `if cond { then } else { else_arm }`. The condition
+/// is evaluated and constrained to `CtValue::Bool` via
+/// [`expect_bool`]; exactly one arm runs depending on the result.
+/// The un-taken arm is never visited — `lower_pattern_test`-style
+/// branch-eval discipline, decoupled from typeck's syntactic
+/// walk-both-arms type check.
+///
+/// `else if` chains fall out naturally: `IfExpr::else_branch` returns
+/// an `Expr`, which is dispatched through the standard `eval_expr`
+/// match. A terminal `else { … }` arrives as `Expr::Block`; a
+/// chained `else if` arrives as `Expr::If` and recurses through
+/// this same function. An `if` without `else` used as a
+/// value-producing expression is a typeck-side error (the if's
+/// type would be `Ty::U0`, and CT.2c's inner-type gate already
+/// rejects it before the evaluator runs); the defensive arm
+/// below treats it as `Unsupported`.
+fn eval_if<'a>(
+    i: IfExpr<'a>,
+    span: Span,
+    cx: &mut EvalCx<'_, '_, 'a>,
+) -> Result<CtValue, EvalError> {
+    let cond = i.cond().ok_or(EvalError::Unsupported {
+        span,
+        what: "`if` is missing its condition expression",
+    })?;
+    let cond_v = eval_expr(cond, cx)?;
+    let cond_b = expect_bool(cond_v, span)?;
+    if cond_b {
+        let then_block = i.then_block().ok_or(EvalError::Unsupported {
+            span,
+            what: "`if` is missing its then-block",
+        })?;
+        eval_comptime_block_inner(then_block, span, cx)
+    } else if let Some(else_branch) = i.else_branch() {
+        eval_expr(else_branch, cx)
+    } else {
+        Err(EvalError::Unsupported {
+            span,
+            what: "`if` without `else` inside a `comptime` block cannot produce a value",
+        })
     }
 }
 
@@ -507,14 +571,27 @@ fn eval_binary<'a>(
 
 /// Pin a `CtValue` to its integer payload, or report an Unsupported
 /// diagnostic at `span`. Used by every arithmetic and ordering op so
-/// the operand-shape contract lives in exactly one place; CT.2c's
-/// additions (let-bindings, branches) will route the same way.
+/// the operand-shape contract lives in exactly one place.
 fn expect_int(v: CtValue, span: Span) -> Result<i128, EvalError> {
     match v {
         CtValue::Int(n) => Ok(n),
         CtValue::Bool(_) => Err(EvalError::Unsupported {
             span,
             what: "this operator requires an integer operand, found `bool`",
+        }),
+    }
+}
+
+/// Pin a `CtValue` to its boolean payload, or report an Unsupported
+/// diagnostic at `span`. Used by `if`-condition evaluation and (in
+/// CT.2e) by logical `&&` / `||` operand checks. Symmetric to
+/// [`expect_int`].
+fn expect_bool(v: CtValue, span: Span) -> Result<bool, EvalError> {
+    match v {
+        CtValue::Bool(b) => Ok(b),
+        CtValue::Int(_) => Err(EvalError::Unsupported {
+            span,
+            what: "this operator requires a bool operand, found `int`",
         }),
     }
 }
@@ -879,6 +956,95 @@ mod tests {
         assert!(
             matches!(err, EvalError::Unsupported { .. }),
             "expected Unsupported (logical && is deferred), got {err:?}",
+        );
+    }
+
+    // CT.2d: `if`/`else` over CtValue::Bool.
+
+    #[test]
+    fn if_true_takes_then_arm() {
+        let n = assert_int(
+            eval_default("fn t() -> i32 { return comptime { (if true { 7 } else { 0 }) }; }")
+                .unwrap(),
+        );
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn if_false_takes_else_arm() {
+        let n = assert_int(
+            eval_default("fn t() -> i32 { return comptime { (if false { 7 } else { 99 }) }; }")
+                .unwrap(),
+        );
+        assert_eq!(n, 99);
+    }
+
+    #[test]
+    fn if_un_taken_arm_is_not_evaluated() {
+        // The else arm contains `1 / 0`. Under proper branch-eval
+        // discipline only the taken (then) arm runs and the
+        // division by zero stays latent. If the evaluator
+        // accidentally walked both arms it would raise
+        // EvalError::DivisionByZero and this test would fail.
+        let n = assert_int(
+            eval_default("fn t() -> i32 { return comptime { (if true { 5 } else { 1 / 0 }) }; }")
+                .unwrap(),
+        );
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn if_un_taken_then_arm_is_not_evaluated() {
+        // Mirror of the previous test, with the side-effecting
+        // expression in the then arm. Catches an asymmetric
+        // "only evaluate else arm" miscompile.
+        let n = assert_int(
+            eval_default("fn t() -> i32 { return comptime { (if false { 1 / 0 } else { 5 }) }; }")
+                .unwrap(),
+        );
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn if_else_if_chain_dispatches_correctly() {
+        // First condition false, second true → take the middle
+        // arm. Exercises the recursive `else_branch` returning
+        // an `Expr::If` that re-enters eval_if through eval_expr.
+        let n = assert_int(
+            eval_default(
+                "fn t() -> i32 { return comptime { (if false { 1 } else if true { 22 } else { 99 }) }; }",
+            )
+            .unwrap(),
+        );
+        assert_eq!(n, 22);
+    }
+
+    #[test]
+    fn if_with_bool_result() {
+        // Both arms produce CtValue::Bool. The condition is `1 < 2`
+        // (true), then arm `true == true` (true).
+        let b = assert_bool(
+            eval_default(
+                "fn t() -> bool { return comptime { (if 1 < 2 { true == true } else { false }) }; }",
+            )
+            .unwrap(),
+        );
+        assert!(b);
+    }
+
+    #[test]
+    fn if_condition_must_be_bool() {
+        // `if 1 { ... }` — integer condition; expect_bool should
+        // reject. The corpus path goes through typeck which
+        // rejects the integer condition with TYPE_MISMATCH; the
+        // evaluator-level Unsupported is the defensive
+        // last-resort message if a malformed program ever makes
+        // it past typeck.
+        let err = eval_default("fn t() -> i32 { return comptime { (if 1 { 7 } else { 0 }) }; }")
+            .unwrap_err();
+        assert!(
+            matches!(err, EvalError::Unsupported { .. }),
+            "expected Unsupported (non-bool condition), got {err:?}",
         );
     }
 
