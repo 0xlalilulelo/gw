@@ -111,6 +111,41 @@ impl<'a> SyntaxElement<'a> {
     }
 }
 
+/// Pointer-identity key into the bump-allocated CST.
+///
+/// Equality and hashing are by *address* of the underlying
+/// [`SyntaxNode`], not by structural value — distinct CST nodes with
+/// identical content compare unequal. The bump arena guarantees stable
+/// addresses for the lifetime `'a`, so a `NodePtr` is a safe map key
+/// for as long as the arena lives.
+///
+/// Lives in `gw_ast` so that downstream crates which need to key into
+/// side-tables built by typeck (MIR's `comptime_values` reads,
+/// `gw_comptime`'s `BindingEnv` lookups) can do so without
+/// depending on `gw_typeck` (which would create a dep cycle for
+/// `gw_comptime`).
+#[derive(Copy, Clone)]
+pub struct NodePtr<'a>(pub &'a SyntaxNode<'a>);
+
+impl<'a> PartialEq for NodePtr<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+impl<'a> Eq for NodePtr<'a> {}
+
+impl<'a> std::hash::Hash for NodePtr<'a> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (self.0 as *const SyntaxNode<'a>).hash(state);
+    }
+}
+
+impl<'a> std::fmt::Debug for NodePtr<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NodePtr({:p})", self.0)
+    }
+}
+
 /// Helper used by the parser to construct CST nodes incrementally.
 ///
 /// Tracks one open node at a time on a stack; child elements (tokens or

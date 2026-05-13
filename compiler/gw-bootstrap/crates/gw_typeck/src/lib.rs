@@ -25,13 +25,14 @@
 //! always returns a `TypedModule` even if checking failed, so MIR
 //! lowering can still produce best-effort output.
 
+pub use gw_ast::cst::NodePtr;
 use gw_ast::{
     AstNode, BinaryExpr, Block, BreakExpr, CallExpr, CastExpr, ClassDecl, ComptimeExpr,
     ContinueExpr, Expr, ExprStmt, FieldExpr, FnDecl, ForExpr, IfExpr, LetStmt, LiteralExpr,
     MatchExpr, Module, MustExpr, ParenExpr, PathExpr, PathType, Pattern, ReturnExpr, Stmt,
-    StructLitExpr, SyntaxKind, SyntaxNode, Type, UnaryExpr, WhileExpr,
+    StructLitExpr, SyntaxKind, Type, UnaryExpr, WhileExpr,
 };
-use gw_comptime::{eval_comptime_block, EvalCx, EvalError};
+use gw_comptime::{eval_comptime_block, BindingEnv, EvalCx, EvalError};
 use gw_lex::{DiagBag, Diagnostic, FileId, Label, SourceMap, Span};
 use gw_resolve::{primitive_type_name, DefId, DefKind, ResolvedModule};
 use rustc_hash::FxHashMap;
@@ -360,34 +361,6 @@ pub struct TypedModule<'a> {
     /// this map to materialise an `Operand::Const` at the use site
     /// without re-lowering the comptime block's body.
     pub comptime_values: FxHashMap<NodePtr<'a>, gw_comptime::CtValue>,
-}
-
-/// Pointer-identity key into the bump-allocated CST.
-///
-/// Equality and hashing are by *address* of the underlying
-/// [`SyntaxNode`], not by structural value — distinct CST nodes with
-/// identical content compare unequal. The bump arena guarantees stable
-/// addresses for the lifetime `'a`.
-#[derive(Copy, Clone)]
-pub struct NodePtr<'a>(pub &'a SyntaxNode<'a>);
-
-impl<'a> PartialEq for NodePtr<'a> {
-    fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self.0, other.0)
-    }
-}
-impl<'a> Eq for NodePtr<'a> {}
-
-impl<'a> std::hash::Hash for NodePtr<'a> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (self.0 as *const SyntaxNode<'a>).hash(state);
-    }
-}
-
-impl<'a> std::fmt::Debug for NodePtr<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NodePtr({:p})", self.0)
-    }
 }
 
 /// Identifies a parameter or local within a function. Indices are
@@ -1458,8 +1431,19 @@ fn synth_comptime<'a>(c: ComptimeExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
         ));
         return Ty::Error;
     }
-    let mut ecx = EvalCx::new(cx.sm);
-    match eval_comptime_block(block, &mut ecx) {
+    // Borrow the binding maps immutably through a small adapter so
+    // gw_comptime stays independent of gw_typeck's BindingId. The
+    // borrow is scoped to the eval call so we can mutate
+    // comptime_values right after.
+    let result = {
+        let env = TypeckBindingEnv {
+            pat: &cx.tm.pat_bindings,
+            path: &cx.tm.path_bindings,
+        };
+        let mut ecx = EvalCx::new(cx.sm, &env);
+        eval_comptime_block(block, &mut ecx)
+    };
+    match result {
         Ok(v) => {
             cx.tm.comptime_values.insert(NodePtr(c.syntax()), v);
             inner_ty
@@ -1472,6 +1456,23 @@ fn synth_comptime<'a>(c: ComptimeExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
             ));
             Ty::Error
         }
+    }
+}
+
+/// Adapter exposing typeck's binding maps to `gw_comptime`'s
+/// [`BindingEnv`] interface without leaking the [`BindingId`]
+/// newtype across the crate boundary.
+struct TypeckBindingEnv<'a, 'tm> {
+    pat: &'tm FxHashMap<NodePtr<'a>, BindingId>,
+    path: &'tm FxHashMap<NodePtr<'a>, BindingId>,
+}
+
+impl<'a, 'tm> BindingEnv<'a> for TypeckBindingEnv<'a, 'tm> {
+    fn lookup_pat(&self, node: NodePtr<'a>) -> Option<u32> {
+        self.pat.get(&node).map(|b| b.0)
+    }
+    fn lookup_path(&self, node: NodePtr<'a>) -> Option<u32> {
+        self.path.get(&node).map(|b| b.0)
     }
 }
 

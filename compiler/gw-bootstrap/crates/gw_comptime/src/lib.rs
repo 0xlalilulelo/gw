@@ -16,18 +16,31 @@
 //! raise the new [`EvalError::IntegerOverflow`] /
 //! [`EvalError::DivisionByZero`] variants.
 //!
-//! CT.2b (this sub-bundle) — comparisons + booleans. `CtValue` gains
-//! the [`CtValue::Bool`] arm. `eval_binary` is reorganised around
+//! CT.2b — comparisons + booleans. `CtValue` gains the
+//! [`CtValue::Bool`] arm. `eval_binary` is reorganised around
 //! op-first dispatch with three groups: integer arithmetic (CT.2a),
 //! integer ordering (`< <= > >=`), and equality (`==` / `!=`,
 //! overloaded for both integer and bool operands). Bool ordering
 //! (`true < false`) and logical `&&` / `||` ride a later sub-bundle.
 //! Operand-type checks go through [`expect_int`] so non-integer
 //! operands of arithmetic / ordering ops produce a clear diagnostic
-//! rather than a wrong answer. CT.2c will add `if`/`else` +
-//! let-bindings + locals env.
+//! rather than a wrong answer.
+//!
+//! CT.2c (this sub-bundle) — let-bindings + locals env. The
+//! evaluator gains a [`BindingEnv`] trait that abstracts CST-node →
+//! binding-index lookup so `gw_comptime` doesn't need to depend on
+//! `gw_typeck` (which would form a cycle). [`EvalCx`] carries a
+//! `Vec<Option<CtValue>>` indexed by `BindingId.0` (decision Q5 ⇒
+//! option (a) — dense vector, mirrors runtime MIR's `Local`
+//! indexing). `eval_comptime_block_inner` now walks statements:
+//! `Stmt::Let` evaluates the initialiser and stores it in `locals`
+//! at the index supplied by the binding env. A new `Expr::Path`
+//! arm in `eval_expr` reads the same env to materialise a local
+//! reference. `if`/`else` and logical `&&` / `||` ride CT.2d /
+//! CT.2e.
 
-use gw_ast::ast::{AstNode, BinaryExpr, Block, Expr, LiteralExpr};
+use gw_ast::ast::{AstNode, BinaryExpr, Block, Expr, LetStmt, LiteralExpr, Pattern, Stmt};
+use gw_ast::cst::NodePtr;
 use gw_ast::SyntaxKind;
 use gw_lex::{SourceMap, Span};
 
@@ -42,6 +55,39 @@ pub enum CtValue {
     Int(i128),
     /// Boolean constant. Added in CT.2b alongside the comparison ops.
     Bool(bool),
+}
+
+/// Resolver from CST node → binding index. Implemented by typeck via a
+/// thin adapter over `TypedModule`'s `pat_bindings` / `path_bindings`
+/// maps. The evaluator only needs the numeric `u32` index (== the
+/// `pub` field of typeck's `BindingId`), keeping `gw_comptime`
+/// independent of `gw_typeck`'s `BindingId` newtype so there is no
+/// dep cycle (typeck calls into `gw_comptime`, not the other way
+/// round).
+pub trait BindingEnv<'a> {
+    /// The local index assigned to a `let` pattern (`IdentPat`).
+    /// Returns `None` if the pattern was never registered (e.g.
+    /// typeck rejected this `let` before allocating a binding).
+    fn lookup_pat(&self, node: NodePtr<'a>) -> Option<u32>;
+    /// The local index a path expression resolved to. Returns
+    /// `None` if the path doesn't resolve to a local (top-level
+    /// fn, unresolved name, …).
+    fn lookup_path(&self, node: NodePtr<'a>) -> Option<u32>;
+}
+
+/// Empty binding env that resolves nothing. Use this for evaluating
+/// CT.1 / CT.2a / CT.2b shapes (no `let`, no path refs to locals)
+/// and for unit tests that don't need typeck's resolver.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct NoBindings;
+
+impl<'a> BindingEnv<'a> for NoBindings {
+    fn lookup_pat(&self, _: NodePtr<'a>) -> Option<u32> {
+        None
+    }
+    fn lookup_path(&self, _: NodePtr<'a>) -> Option<u32> {
+        None
+    }
 }
 
 /// Error raised by the evaluator. Spans point into the original source
@@ -112,31 +158,47 @@ impl Default for Budget {
 }
 
 /// Mutable per-invocation state. A single `EvalCx` owns one comptime
-/// invocation's step counter, recursion depth, and a borrow of the
-/// source map (for slicing integer-literal text).
-pub struct EvalCx<'sm> {
+/// invocation's step counter, recursion depth, a borrow of the source
+/// map (for slicing integer-literal text), a borrow of the binding
+/// env (for resolving `let`-patterns and path expressions), and a
+/// dense `Vec` of `let`-bound local values indexed by binding index.
+///
+/// The `'sm` lifetime ties the cx to the source map; `'env` ties it
+/// to the binding resolver; `'a` ties it to the bump-allocated CST.
+pub struct EvalCx<'sm, 'env, 'a> {
     sm: &'sm SourceMap,
+    bindings: &'env dyn BindingEnv<'a>,
+    /// Dense locals env indexed by `BindingId.0 as usize`. `None`
+    /// for indices not yet assigned by a `let`; the evaluator
+    /// treats a `Some(_)` read after the binding's `let` has run
+    /// as the only legal path. Reading `None` raises Unsupported
+    /// (defensive — typeck's name-resolution should make this
+    /// unreachable for well-typed programs).
+    locals: Vec<Option<CtValue>>,
     budget: Budget,
     steps: u64,
     depth: u32,
 }
 
-impl<'sm> EvalCx<'sm> {
-    /// Fresh context with default budgets.
-    pub fn new(sm: &'sm SourceMap) -> Self {
-        Self {
-            sm,
-            budget: Budget::default(),
-            steps: 0,
-            depth: 0,
-        }
+impl<'sm, 'env, 'a> EvalCx<'sm, 'env, 'a> {
+    /// Fresh context with default budgets. Pass `&NoBindings` when
+    /// evaluating shapes that have no `let` / path-to-local
+    /// references (CT.1, CT.2a, CT.2b corpus).
+    pub fn new(sm: &'sm SourceMap, bindings: &'env dyn BindingEnv<'a>) -> Self {
+        Self::with_budget(sm, bindings, Budget::default())
     }
 
     /// Override the default budget. Used by tests; pipeline callers
     /// should accept the defaults.
-    pub fn with_budget(sm: &'sm SourceMap, budget: Budget) -> Self {
+    pub fn with_budget(
+        sm: &'sm SourceMap,
+        bindings: &'env dyn BindingEnv<'a>,
+        budget: Budget,
+    ) -> Self {
         Self {
             sm,
+            bindings,
+            locals: Vec::new(),
             budget,
             steps: 0,
             depth: 0,
@@ -163,21 +225,57 @@ impl<'sm> EvalCx<'sm> {
     fn exit(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }
+
+    /// Store a value at local index `idx`, growing the env as needed
+    /// so the binding-index → local-slot mapping is dense from
+    /// position 0. CT.2c only ever appends in BindingId order
+    /// (typeck allocates sequentially), but the resize lets a
+    /// future shadow / branch interleaving land without an extra
+    /// invariant.
+    fn store_local(&mut self, idx: u32, value: CtValue) {
+        let i = idx as usize;
+        if self.locals.len() <= i {
+            self.locals.resize(i + 1, None);
+        }
+        self.locals[i] = Some(value);
+    }
+
+    /// Read a local at `idx`. Returns `EvalError::Unsupported` at
+    /// `span` if the slot was never assigned — defensive, since
+    /// typeck's name-resolution should make a use-before-`let`
+    /// unreachable from well-typed programs.
+    fn load_local(&self, idx: u32, span: Span) -> Result<CtValue, EvalError> {
+        let i = idx as usize;
+        self.locals
+            .get(i)
+            .copied()
+            .flatten()
+            .ok_or(EvalError::Unsupported {
+                span,
+                what: "comptime read of an uninitialised local",
+            })
+    }
 }
 
 /// Evaluate the body of a `comptime { … }` block.
 ///
-/// CT.1 + CT.2a + CT.2b surface: the block must consist of zero
-/// statements and a single tail expression. The tail expression
+/// CT.1 + CT.2a + CT.2b + CT.2c surface: the block may contain zero
+/// or more `let` statements followed by a single tail expression.
+/// `let` patterns are limited to `IdentPat` (single name); the
+/// initialiser must be a supported expression. The tail expression
 /// may be an integer literal (CT.1), `true` / `false` (CT.2b), a
 /// unary minus on an integer (CT.1), a parenthesised expression
-/// (CT.1), a nested block (CT.1), a binary arithmetic expression
+/// (CT.1), a nested block (CT.1), a path reference to a previously
+/// `let`-bound local (CT.2c), a binary arithmetic expression
 /// `+ - * / %` over integer operands (CT.2a), an integer ordering
 /// comparison `< <= > >=` (CT.2b), or an `==` / `!=` over matching
-/// integer-or-bool operands (CT.2b). let-bindings, control flow,
-/// logical `&&` / `||`, and other shapes are rejected with
-/// [`EvalError::Unsupported`] until CT.2c.
-pub fn eval_comptime_block(block: Block<'_>, cx: &mut EvalCx<'_>) -> Result<CtValue, EvalError> {
+/// integer-or-bool operands (CT.2b). Expression statements, `if` /
+/// `else`, logical `&&` / `||`, and other shapes are rejected with
+/// [`EvalError::Unsupported`] until CT.2d / CT.2e.
+pub fn eval_comptime_block<'a>(
+    block: Block<'a>,
+    cx: &mut EvalCx<'_, '_, 'a>,
+) -> Result<CtValue, EvalError> {
     let span = block.syntax().span;
     cx.step(span)?;
     cx.enter(span)?;
@@ -186,16 +284,34 @@ pub fn eval_comptime_block(block: Block<'_>, cx: &mut EvalCx<'_>) -> Result<CtVa
     result
 }
 
-fn eval_comptime_block_inner(
-    block: Block<'_>,
+fn eval_comptime_block_inner<'a>(
+    block: Block<'a>,
     span: Span,
-    cx: &mut EvalCx<'_>,
+    cx: &mut EvalCx<'_, '_, 'a>,
 ) -> Result<CtValue, EvalError> {
-    if block.stmts().next().is_some() {
-        return Err(EvalError::Unsupported {
-            span,
-            what: "statements inside a `comptime` block are not yet supported (CT.2)",
-        });
+    for stmt in block.stmts() {
+        cx.step(span)?;
+        match stmt {
+            Stmt::Let(l) => eval_let(l, cx)?,
+            Stmt::Expr(e) => {
+                return Err(EvalError::Unsupported {
+                    span: e.syntax().span,
+                    what: "expression statements inside a `comptime` block are not yet supported (CT.2d will add `if`/`else`)",
+                });
+            }
+            Stmt::Stub(s) => {
+                return Err(EvalError::Unsupported {
+                    span: s.span,
+                    what: "this statement kind is not supported in a `comptime` block",
+                });
+            }
+            Stmt::Error(s) => {
+                return Err(EvalError::Unsupported {
+                    span: s.span,
+                    what: "parse error inside `comptime` block",
+                });
+            }
+        }
     }
     let Some(tail) = block.tail_expr() else {
         return Err(EvalError::Unsupported {
@@ -206,11 +322,51 @@ fn eval_comptime_block_inner(
     eval_expr(tail, cx)
 }
 
-fn eval_expr(expr: Expr<'_>, cx: &mut EvalCx<'_>) -> Result<CtValue, EvalError> {
+/// Evaluate a `let pat = init;` statement. CT.2c accepts only
+/// `IdentPat` patterns; wildcards and structural patterns reject
+/// with [`EvalError::Unsupported`]. The initialiser must be a
+/// supported expression shape. On success, the value lands in
+/// `cx.locals[bid as usize]` where `bid` is the typeck-assigned
+/// binding index.
+fn eval_let<'a>(l: LetStmt<'a>, cx: &mut EvalCx<'_, '_, 'a>) -> Result<(), EvalError> {
+    let span = l.syntax().span;
+    let Some(init) = l.init() else {
+        return Err(EvalError::Unsupported {
+            span,
+            what: "`let` without an initialiser is not supported in a `comptime` block",
+        });
+    };
+    let value = eval_expr(init, cx)?;
+    let Some(Pattern::Ident(p)) = l.pattern() else {
+        return Err(EvalError::Unsupported {
+            span,
+            what: "only simple `let <name>` patterns are supported in a `comptime` block (CT.2c)",
+        });
+    };
+    let Some(idx) = cx.bindings.lookup_pat(NodePtr(p.syntax())) else {
+        return Err(EvalError::Unsupported {
+            span,
+            what: "comptime `let`-binding could not be resolved to a local index",
+        });
+    };
+    cx.store_local(idx, value);
+    Ok(())
+}
+
+fn eval_expr<'a>(expr: Expr<'a>, cx: &mut EvalCx<'_, '_, 'a>) -> Result<CtValue, EvalError> {
     let span = expr.syntax().span;
     cx.step(span)?;
     match expr {
         Expr::Literal(l) => eval_literal(l, cx),
+        Expr::Path(p) => {
+            let Some(idx) = cx.bindings.lookup_path(NodePtr(p.syntax())) else {
+                return Err(EvalError::Unsupported {
+                    span,
+                    what: "path expression in a `comptime` block did not resolve to a local",
+                });
+            };
+            cx.load_local(idx, span)
+        }
         Expr::Paren(p) => {
             let inner = p.inner().ok_or(EvalError::Unsupported {
                 span,
@@ -246,7 +402,7 @@ fn eval_expr(expr: Expr<'_>, cx: &mut EvalCx<'_>) -> Result<CtValue, EvalError> 
         }
         _ => Err(EvalError::Unsupported {
             span,
-            what: "this expression shape is not yet supported by the CT.2 evaluator",
+            what: "this expression shape is not yet supported by the comptime evaluator",
         }),
     }
 }
@@ -265,10 +421,10 @@ fn eval_expr(expr: Expr<'_>, cx: &mut EvalCx<'_>) -> Result<CtValue, EvalError> 
 /// matching `(Int, Int)` or `(Bool, Bool)` pairs and rejects mixed
 /// pairs explicitly so the user sees the type-mismatch rather than
 /// an arbitrary dominant-type rule.
-fn eval_binary(
-    expr: BinaryExpr<'_>,
+fn eval_binary<'a>(
+    expr: BinaryExpr<'a>,
     span: Span,
-    cx: &mut EvalCx<'_>,
+    cx: &mut EvalCx<'_, '_, 'a>,
 ) -> Result<CtValue, EvalError> {
     let lhs = expr.lhs().ok_or(EvalError::Unsupported {
         span,
@@ -363,7 +519,7 @@ fn expect_int(v: CtValue, span: Span) -> Result<i128, EvalError> {
     }
 }
 
-fn eval_literal(l: LiteralExpr<'_>, cx: &mut EvalCx<'_>) -> Result<CtValue, EvalError> {
+fn eval_literal<'a>(l: LiteralExpr<'a>, cx: &mut EvalCx<'_, '_, 'a>) -> Result<CtValue, EvalError> {
     let (kind, span) = l.token().ok_or(EvalError::Unsupported {
         span: l.syntax().span,
         what: "literal expression without a token child",
@@ -441,8 +597,10 @@ mod tests {
     }
 
     /// Parse `src`, locate the first comptime block, and evaluate it
-    /// with the given budget. Returns `(SourceMap, result)` so callers
-    /// can inspect spans embedded in errors if needed.
+    /// with the given budget. Uses a `NoBindings` env — so any test
+    /// source that exercises `let` or path-to-local would reject as
+    /// Unsupported; the dedicated let-binding tests below use the
+    /// dual-walk helper [`eval_with_bindings`] instead.
     fn eval(src: &str, budget: Budget) -> Result<CtValue, EvalError> {
         let mut sm = SourceMap::new();
         let file = sm.add_file("t.gw", src);
@@ -452,7 +610,7 @@ mod tests {
         let (root, _diags) = parse(file, bytes, &arena);
         let block =
             find_comptime_block(root).expect("test source must contain a `comptime { ... }` block");
-        let mut cx = EvalCx::with_budget(&sm, budget);
+        let mut cx = EvalCx::with_budget(&sm, &NoBindings, budget);
         eval_comptime_block(block, &mut cx)
     }
 
@@ -510,11 +668,29 @@ mod tests {
     }
 
     #[test]
-    fn statement_in_block_is_unsupported() {
+    fn let_without_resolver_rejects() {
+        // Under `NoBindings` the let-pattern lookup returns None, so
+        // the evaluator can't store the value into a local slot.
+        // Useful only as a contract check on the rejection path —
+        // typeck supplies a real resolver and the end-to-end let
+        // shape is covered by the phase2_comptime corpus.
         let err = eval_default("fn t() -> i32 { return comptime { let x = 1; x }; }").unwrap_err();
         assert!(
             matches!(err, EvalError::Unsupported { .. }),
-            "expected Unsupported, got {err:?}",
+            "expected Unsupported (NoBindings can't resolve the let-pattern), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn path_without_resolver_rejects() {
+        // Same shape as above but exercises the eval_expr path-expr
+        // arm directly: a path that didn't resolve to a local
+        // produces a clear rejection rather than a wrong answer or
+        // a panic.
+        let err = eval_default("fn t() -> i32 { return comptime { x }; }").unwrap_err();
+        assert!(
+            matches!(err, EvalError::Unsupported { .. }),
+            "expected Unsupported (NoBindings can't resolve the path), got {err:?}",
         );
     }
 
