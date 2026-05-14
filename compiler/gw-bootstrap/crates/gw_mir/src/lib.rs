@@ -1042,7 +1042,7 @@ fn lower_expr<'a>(
         Expr::Cast(c) => lower_cast(b, c, lcx),
         Expr::Match(m) => lower_match(b, m, lcx),
         Expr::Must(m) => lower_must(b, m, lcx),
-        Expr::Comptime(c) => lower_comptime(c, lcx),
+        Expr::Comptime(c) => lower_comptime(b, c, lcx),
         Expr::Stub(_) | Expr::Error(_) => Operand::Const(Const::Error),
     }
 }
@@ -1526,8 +1526,12 @@ fn lower_coalesce<'a>(
 /// Const::Bool(b)` arm; this is the first comptime sub-bundle whose
 /// materialisation shape changes since CT.1, so the dual-backend
 /// invariant gets a fresh check at the new arm.
-fn lower_comptime<'a>(c: ComptimeExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>) -> Operand {
-    let Some(value) = lcx.typed.comptime_values.get(&NodePtr(c.syntax())).copied() else {
+fn lower_comptime<'a>(
+    b: &mut Builder,
+    c: ComptimeExpr<'a>,
+    lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
+) -> Operand {
+    let Some(value) = lcx.typed.comptime_values.get(&NodePtr(c.syntax())).cloned() else {
         // Typeck rejected the block; emit an error operand so any
         // surrounding lowering keeps progressing.
         return Operand::Const(Const::Error);
@@ -1538,12 +1542,13 @@ fn lower_comptime<'a>(c: ComptimeExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>
         .get(&NodePtr(c.syntax()))
         .copied()
         .unwrap_or(Ty::Error);
+    let span = c.syntax().span;
     match (value, ty) {
         (gw_comptime::CtValue::Int(n), Ty::Int(int_ty)) => Operand::Const(Const::Int {
             value: n,
             ty: int_ty,
         }),
-        (gw_comptime::CtValue::Bool(b), Ty::Bool) => Operand::Const(Const::Bool(b)),
+        (gw_comptime::CtValue::Bool(bv), Ty::Bool) => Operand::Const(Const::Bool(bv)),
         // CT.3a: narrow the evaluator's canonical f64 to the
         // surrounding `Ty::Float` width — mirrors the runtime
         // `FloatLit` path in `lower_literal` (f64 → bits direct,
@@ -1557,6 +1562,38 @@ fn lower_comptime<'a>(c: ComptimeExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>
                 bits,
                 ty: float_ty,
             })
+        }
+        // CT.3b: materialise as the same `[]u8` slice aggregate that
+        // `lower_string_literal` builds for runtime string literals.
+        // Bytes get interned into `lcx.string_literals` (the
+        // program-level rodata table); a fresh aggregate local holds
+        // `{data: Const::DataAddr(id), len: bytes.len() as USize}`.
+        // The decoded bytes already account for escape sequences —
+        // `gw_comptime::decode_string_literal` mirrors
+        // `gw_mir::decode_string_literal` so the comptime path and
+        // the runtime path produce identical payloads.
+        (gw_comptime::CtValue::Str(bytes), Ty::Slice(IntTy::U8)) => {
+            let id = StringLitId(lcx.string_literals.len() as u32);
+            let len = bytes.len();
+            lcx.string_literals.push(bytes);
+            let dst = b.alloc_local(LocalDecl {
+                ty: Ty::Slice(IntTy::U8),
+                span,
+            });
+            b.push_stmt(MirStmt::AssignField {
+                dst,
+                field_idx: 0,
+                value: Rvalue::Use(Operand::Const(Const::DataAddr(id))),
+            });
+            b.push_stmt(MirStmt::AssignField {
+                dst,
+                field_idx: 1,
+                value: Rvalue::Use(Operand::Const(Const::Int {
+                    value: len as i128,
+                    ty: IntTy::USize,
+                })),
+            });
+            Operand::Local(dst)
         }
         _ => Operand::Const(Const::Error),
     }

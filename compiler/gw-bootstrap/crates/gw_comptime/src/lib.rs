@@ -52,17 +52,29 @@
 //! or another `IfExpr` (chained `else if`) — and both shapes are
 //! already dispatched by `eval_expr`.
 //!
-//! CT.2e (this sub-bundle) — short-circuit `&&` / `||`. Pure
-//! recombination of CT.2b's `CtValue::Bool` + CT.2d's
-//! branch-eval discipline applied at the operator level rather
-//! than the statement level. `eval_binary` intercepts
-//! `SyntaxKind::AmpAmp` / `PipePipe` *before* its eager RHS eval
-//! and dispatches to [`eval_logical_short_circuit`], which
-//! evaluates the LHS, pins it to bool via [`expect_bool`], and
-//! evaluates the RHS only when the LHS doesn't determine the
-//! result (`false` for `&&`, `true` for `||`). The RHS therefore
-//! never runs when it would short-circuit — `false && (1 / 0 ==
-//! 0)` returns false rather than raising `DivisionByZero`.
+//! CT.2e — short-circuit `&&` / `||`. Pure recombination of
+//! CT.2b's `CtValue::Bool` + CT.2d's branch-eval discipline
+//! applied at the operator level rather than the statement level.
+//! `eval_binary` intercepts `SyntaxKind::AmpAmp` / `PipePipe`
+//! *before* its eager RHS eval and dispatches to
+//! [`eval_logical_short_circuit`], which evaluates the LHS, pins
+//! it to bool via [`expect_bool`], and evaluates the RHS only
+//! when the LHS doesn't determine the result (`false` for `&&`,
+//! `true` for `||`). The RHS therefore never runs when it would
+//! short-circuit — `false && (1 / 0 == 0)` returns false rather
+//! than raising `DivisionByZero`.
+//!
+//! CT.3b (this sub-bundle) — string literals. `CtValue` gains
+//! `Str(Vec<u8>)` (owned-inline; `CtValue` loses its `Copy`
+//! impl here because `Vec<u8>` isn't `Copy`). `eval_literal`
+//! recognises `SyntaxKind::StringLit` and decodes via a new
+//! [`decode_string_literal`] helper kept in lockstep with
+//! `gw_mir::decode_string_literal`. No comptime operations on
+//! strings (concat, `==`, `.len`) yet — they ride a future
+//! sub-bundle motivated by corpus need. Materialisation at MIR
+//! time produces the same `{data, len}` `[]u8` slice aggregate
+//! that `lower_string_literal` builds for runtime literals, so
+//! the rodata path is shared between the two.
 
 use gw_ast::ast::{AstNode, BinaryExpr, Block, Expr, IfExpr, LetStmt, LiteralExpr, Pattern, Stmt};
 use gw_ast::cst::NodePtr;
@@ -77,7 +89,12 @@ use gw_lex::{SourceMap, Span};
 /// at `f64`; MIR narrows to `f32` at materialisation time if the
 /// surrounding expression's type is `Ty::Float(F32)` (same pattern as
 /// the runtime `FloatLit` lowering in `gw_mir::lower_literal`).
-#[derive(Copy, Clone, Debug)]
+/// `Str` carries the decoded bytes of a string literal — owned
+/// inline, with no `Copy` because `Vec<u8>` isn't `Copy`. Materialises
+/// at MIR time as a `[]u8` slice aggregate: bytes get interned into
+/// `MirProgram::string_literals`, then a fresh aggregate local holds
+/// `{data: Const::DataAddr(id), len: bytes.len() as USize}`.
+#[derive(Clone, Debug)]
 pub enum CtValue {
     /// Integer constant in two's-complement i128 representation.
     Int(i128),
@@ -87,6 +104,13 @@ pub enum CtValue {
     /// `FloatLit` recognition and the float arithmetic / ordering
     /// dispatch in [`eval_binary`].
     Float(f64),
+    /// String literal bytes (decoded; no NUL terminator). Added in
+    /// CT.3b; `CtValue` lost its `Copy` impl here because owning the
+    /// payload inline is simpler than threading a `&mut` storage
+    /// borrow through every `EvalCx` consumer. Comptime operations
+    /// on strings (concat, `==`, `.len`) ride a future sub-bundle —
+    /// CT.3b only handles literal evaluation + slice materialisation.
+    Str(Vec<u8>),
 }
 
 /// Resolver from CST node → binding index. Implemented by typeck via a
@@ -283,8 +307,8 @@ impl<'sm, 'env, 'a> EvalCx<'sm, 'env, 'a> {
         let i = idx as usize;
         self.locals
             .get(i)
-            .copied()
-            .flatten()
+            .and_then(|slot| slot.as_ref())
+            .cloned()
             .ok_or(EvalError::Unsupported {
                 span,
                 what: "comptime read of an uninitialised local",
@@ -429,6 +453,10 @@ fn eval_expr<'a>(expr: Expr<'a>, cx: &mut EvalCx<'_, '_, 'a>) -> Result<CtValue,
                 CtValue::Bool(_) => Err(EvalError::Unsupported {
                     span,
                     what: "unary `-` requires a numeric operand, found `bool`",
+                }),
+                CtValue::Str(_) => Err(EvalError::Unsupported {
+                    span,
+                    what: "unary `-` requires a numeric operand, found `string`",
                 }),
             }
         }
@@ -697,6 +725,10 @@ fn expect_bool(v: CtValue, span: Span) -> Result<bool, EvalError> {
             span,
             what: "this operator requires a bool operand, found `float`",
         }),
+        CtValue::Str(_) => Err(EvalError::Unsupported {
+            span,
+            what: "this operator requires a bool operand, found `string`",
+        }),
     }
 }
 
@@ -718,6 +750,17 @@ fn eval_literal<'a>(l: LiteralExpr<'a>, cx: &mut EvalCx<'_, '_, 'a>) -> Result<C
                 .map(CtValue::Float)
                 .ok_or(EvalError::BadFloatLiteral(span))
         }
+        SyntaxKind::StringLit => {
+            let raw = cx.sm.slice(span).unwrap_or("");
+            Ok(CtValue::Str(decode_string_literal(raw)))
+        }
+        // `RawStringLit` (`\\…\\` GW syntax) deliberately not handled
+        // here — the runtime `gw_mir::decode_string_literal` would
+        // mis-decode the `\\` delimiter as the `\\` escape sequence,
+        // a latent bug that no corpus program exercises. CT.3b stays
+        // in lockstep with the validated runtime path; a corpus
+        // motivation for raw strings would fix the decoder in both
+        // places in lockstep.
         SyntaxKind::KwTrue => Ok(CtValue::Bool(true)),
         SyntaxKind::KwFalse => Ok(CtValue::Bool(false)),
         _ => Err(EvalError::Unsupported {
@@ -752,6 +795,48 @@ fn parse_int_literal(raw: &str) -> Option<i128> {
 /// `gw_mir::lower_comptime`, not here.
 fn parse_float_literal(raw: &str) -> Option<f64> {
     raw.replace('_', "").parse::<f64>().ok()
+}
+
+/// Decode a `"..."` string literal token into its raw bytes. Mirrors
+/// `gw_mir::decode_string_literal` exactly so the comptime evaluator
+/// and the runtime lowering produce identical bytes for the same
+/// source. Strips the surrounding double quotes the lexer leaves on
+/// the token text and processes the small set of Phase-1-supported
+/// escape sequences: `\n`, `\t`, `\r`, `\0`, `\\`, `\"`, `\'`.
+/// Unknown escapes pass through literally (the leading backslash +
+/// the following byte). Raw-string (`\\…\\`) tokens go through a
+/// different lex shape and are deliberately not handled here — see
+/// the `eval_literal` arm comment for why.
+fn decode_string_literal(raw: &str) -> Vec<u8> {
+    let inner = raw
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(raw);
+    let mut out = Vec::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push(b'\n'),
+            Some('t') => out.push(b'\t'),
+            Some('r') => out.push(b'\r'),
+            Some('0') => out.push(0),
+            Some('\\') => out.push(b'\\'),
+            Some('"') => out.push(b'"'),
+            Some('\'') => out.push(b'\''),
+            Some(other) => {
+                out.push(b'\\');
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            }
+            None => out.push(b'\\'),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1471,5 +1556,95 @@ mod tests {
     #[test]
     fn parse_float_literal_rejects_garbage() {
         assert_eq!(parse_float_literal("not-a-float"), None);
+    }
+
+    // ---- CT.3b: String literals ----
+
+    fn assert_str(v: CtValue) -> Vec<u8> {
+        match v {
+            CtValue::Str(b) => b,
+            other => panic!("expected CtValue::Str, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_literal_decodes() {
+        let bytes = assert_str(
+            eval_default("fn t() -> []u8 { return comptime { \"hello\" }; }").unwrap(),
+        );
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn string_literal_empty() {
+        let bytes = assert_str(
+            eval_default("fn t() -> []u8 { return comptime { \"\" }; }").unwrap(),
+        );
+        assert_eq!(bytes, b"");
+    }
+
+    #[test]
+    fn string_literal_with_newline_escape() {
+        // Pins the lockstep with `gw_mir::decode_string_literal` —
+        // `\n` decodes to byte 0x0A, not the two characters `\` `n`.
+        let bytes = assert_str(
+            eval_default("fn t() -> []u8 { return comptime { \"hi\\n\" }; }").unwrap(),
+        );
+        assert_eq!(bytes, b"hi\n");
+    }
+
+    #[test]
+    fn string_literal_with_tab_and_backslash_escapes() {
+        // Exercises three of the seven supported escapes in one
+        // payload — covers the canonical lockstep set without
+        // duplicating per-escape boilerplate.
+        let bytes = assert_str(
+            eval_default(
+                "fn t() -> []u8 { return comptime { \"a\\tb\\\\c\\\"d\" }; }",
+            )
+            .unwrap(),
+        );
+        assert_eq!(bytes, b"a\tb\\c\"d");
+    }
+
+    #[test]
+    fn string_literal_unknown_escape_passes_through() {
+        // Mirrors `gw_mir::decode_string_literal`'s "unknown escapes
+        // pass through literally" rule. `\q` is not in the supported
+        // set, so the decoder emits backslash + 'q'.
+        let bytes = assert_str(
+            eval_default("fn t() -> []u8 { return comptime { \"\\q\" }; }").unwrap(),
+        );
+        assert_eq!(bytes, b"\\q");
+    }
+
+    #[test]
+    fn arithmetic_on_string_rejects() {
+        // No comptime operations on strings yet — concat / `==` /
+        // `.len` ride a future sub-bundle. This pins the tuple-
+        // dispatch's catch-all rejection so future scope expansions
+        // don't silently start accepting an undefined shape.
+        let err = eval_default(
+            "fn t() -> []u8 { return comptime { \"a\" + \"b\" }; }",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, EvalError::Unsupported { .. }),
+            "expected Unsupported (string + string), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn decode_string_literal_matches_runtime() {
+        // The canonical lockstep assertion: every byte the comptime
+        // evaluator decodes must match what `gw_mir`'s runtime
+        // decoder produces for the same token text. If this test
+        // ever fails, either both decoders need updating in
+        // lockstep, or `gw_comptime` and `gw_mir` have drifted.
+        assert_eq!(decode_string_literal("\"hello\""), b"hello");
+        assert_eq!(decode_string_literal("\"hi\\n\""), b"hi\n");
+        assert_eq!(decode_string_literal("\"\\t\\r\\0\""), b"\t\r\0");
+        assert_eq!(decode_string_literal("\"\\\\\""), b"\\");
+        assert_eq!(decode_string_literal("\"\""), b"");
     }
 }

@@ -1,0 +1,7 @@
+extern fn write(fd: i32, buf: *u8, count: usize) -> isize;
+
+fn main() -> i32 {
+    let s: []u8 = comptime { "hi\n" };
+    write(1, s.data, s.len);
+    return 0;
+}

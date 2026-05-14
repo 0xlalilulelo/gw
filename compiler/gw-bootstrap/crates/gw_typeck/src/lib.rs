@@ -1426,17 +1426,21 @@ fn synth_comptime<'a>(c: ComptimeExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     }
     // CT.1 + CT.2a realised integer-valued comptime blocks; CT.2b
     // added `Ty::Bool` alongside the comparison ops; CT.3a adds
-    // `Ty::Float(_)` alongside float literals and the float
-    // arithmetic / ordering / equality dispatch in
-    // `gw_comptime::eval_binary`. Wider inners (strings, classes,
-    // optionals, error unions, …) ride later CT.3 sub-bundles as the
-    // corpus motivates them.
-    if !matches!(inner_ty, Ty::Int(_) | Ty::Bool | Ty::Float(_)) {
+    // `Ty::Float(_)` alongside float literals; CT.3b adds
+    // `Ty::Slice(IntTy::U8)` for string literal blocks (the
+    // evaluator returns `CtValue::Str(bytes)`; MIR materialises as
+    // a slice aggregate). Wider inners (classes, optionals, error
+    // unions, …) ride later CT.3 sub-bundles as the corpus
+    // motivates them.
+    if !matches!(
+        inner_ty,
+        Ty::Int(_) | Ty::Bool | Ty::Float(_) | Ty::Slice(IntTy::U8)
+    ) {
         cx.diags.push(Diagnostic::error(
             ec::UNSUPPORTED_CONSTRUCT,
             Label::new(c.syntax().span, ""),
             format!(
-                "`comptime` blocks producing `{inner_ty}` are not yet supported (CT.3a handles `int`, `bool`, and `float` blocks only)"
+                "`comptime` blocks producing `{inner_ty}` are not yet supported (CT.3b handles `int`, `bool`, `float`, and `[]u8` string blocks only)"
             ),
         ));
         return Ty::Error;
