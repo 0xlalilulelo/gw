@@ -409,6 +409,19 @@ fn define_fn(
                 layout.align.trailing_zeros() as u8,
             ));
             local_slot.insert(local, slot);
+        } else if f.address_taken_locals.contains(&local) {
+            // Phase 3 increment B.0: a primitive local with `&local`
+            // taken elsewhere in the body needs a stable memory
+            // address, so it lives in a `StackSlot` rather than an
+            // SSA `Variable`. The slot is sized for the primitive
+            // type via `primitive_size_align`.
+            let (size, align) = primitive_size_align(decl.ty, ptr_bytes);
+            let slot = builder.create_sized_stack_slot(ir::StackSlotData::new(
+                ir::StackSlotKind::ExplicitSlot,
+                size.max(1),
+                align.max(1).trailing_zeros() as u8,
+            ));
+            local_slot.insert(local, slot);
         } else {
             let var = Variable::from_u32(i as u32);
             if let Some(clt) = clif_ty(decl.ty, module) {
@@ -809,6 +822,12 @@ fn lower_assign_stmt(
     let val = lower_rvalue(fb, module, f, value, cx, want);
     if let Some(var) = cx.local_var.get(&dst) {
         fb.def_var(*var, val);
+    } else if let Some(slot) = cx.local_slot.get(&dst) {
+        // Phase 3 increment B.0: address-taken primitive lives in a
+        // `StackSlot` rather than an SSA `Variable`. Writes go
+        // through `stack_store` so future `Rvalue::Ref { target }`
+        // sees the up-to-date value at the stable address.
+        fb.ins().stack_store(val, *slot, 0);
     }
 }
 
@@ -883,6 +902,34 @@ fn lower_rvalue(
                 CastKind::FloatBitcast => v,
             }
         }
+        // Phase 3 increment B.0: `&local` lowers to a `stack_addr`
+        // of the borrowed local's slot. The local has been forced
+        // into `StackSlot` storage during the allocation pass (see
+        // `address_taken_locals`), so its slot is guaranteed to
+        // exist in `cx.local_slot`.
+        Rvalue::Ref {
+            target,
+            pointee_ty: _,
+        } => {
+            let Some(&slot) = cx.local_slot.get(target) else {
+                return fb.ins().iconst(want_ty, 0);
+            };
+            fb.ins().stack_addr(want_ty, slot, 0)
+        }
+        // Phase 3 increment B.0: `*ptr` lowers to a `load` through
+        // the pointer value. `ty` carries the result width so the
+        // load uses the right Cranelift type. The pointer-typed
+        // operand is read as `ptr_clt` (pointer-width).
+        Rvalue::Deref { ptr, ty } => {
+            let ptr_clt = match cx.ptr_bytes {
+                8 => ir::types::I64,
+                4 => ir::types::I32,
+                _ => ir::types::I64,
+            };
+            let ptr_val = read_operand(fb, f, ptr, cx, ptr_clt);
+            let load_clif = clif_ty(*ty, module).unwrap_or(want_ty);
+            fb.ins().load(load_clif, MemFlags::new(), ptr_val, 0)
+        }
     }
 }
 
@@ -899,9 +946,15 @@ fn read_operand(
             // Aggregate-typed locals (class, slice) can't be "read" as a
             // single value. Phase 1 paths that try to are caught by
             // `lower_assign_stmt`'s aggregate-dst branch and don't reach
-            // here. For primitives, use_var.
+            // here. For primitives, use_var — or stack_load if the local
+            // is address-taken (Phase 3 increment B.0). The `want` type
+            // is the requested Cranelift width, which is also the
+            // primitive's storage width since the slot was sized for
+            // exactly this primitive.
             if let Some(var) = cx.local_var.get(l) {
                 fb.use_var(*var)
+            } else if let Some(slot) = cx.local_slot.get(l) {
+                fb.ins().stack_load(want, *slot, 0)
             } else {
                 // Fallback so codegen stays sound on unexpected paths.
                 let _ = f;

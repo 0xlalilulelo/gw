@@ -670,6 +670,40 @@ fn lower_rvalue<'ctx>(
             let v = read_operand(builder, cx, operand, *src_ty)?;
             lower_cast(builder, cx, *kind, v, *src_ty, *dst_ty)
         }
+        // Phase 3 increment B.0: `&local` — return the alloca's
+        // pointer directly. LLVM codegen already gives every local
+        // an alloca (see `allocas: FxHashMap<Local, PointerValue>`
+        // setup in `define_fn`), so the local has a stable address
+        // by construction; the `address_taken_locals` set is only
+        // consulted by the Cranelift backend.
+        Rvalue::Ref {
+            target,
+            pointee_ty: _,
+        } => {
+            let ptr = *cx.allocas.get(target).ok_or_else(|| {
+                CodegenError::Builder(format!(
+                    "fn `{}` borrows local {target:?} that has no alloca",
+                    cx.f.name
+                ))
+            })?;
+            Ok(ptr.into())
+        }
+        // Phase 3 increment B.0: `*ptr` — load through a reference.
+        // `ty` is the result width; the pointer operand is loaded
+        // via the usual `read_operand` path which understands
+        // `Ty::Ref(_)` as a pointer-typed value.
+        Rvalue::Deref { ptr, ty } => {
+            let ptr_val = read_operand(builder, cx, ptr, Ty::Ptr(IntTy::U8))?;
+            let lty = llvm_basic_type(cx.context, *ty).ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "Rvalue::Deref with result ty {:?} — no scalar LLVM type",
+                    ty
+                ))
+            })?;
+            builder
+                .build_load(lty, ptr_val.into_pointer_value(), "deref")
+                .map_err(be)
+        }
     }
 }
 
@@ -1363,6 +1397,11 @@ fn llvm_basic_type<'ctx>(context: &'ctx Context, ty: Ty) -> Option<BasicTypeEnum
         // allocas; `llvm_basic_type` is for *scalar* type lookup only.
         Ty::Class(_) | Ty::Slice(_) => None,
         Ty::Rune | Ty::Error => None,
+        // `&T` (Phase 3 increment B.0): same opaque `ptr` shape as
+        // `Ty::Ptr(_)`. The static distinction lives at the typeck
+        // layer (for the future borrow checker); codegen treats
+        // both as plain pointers.
+        Ty::Ref(_) => Some(context.ptr_type(AddressSpace::default()).into()),
         // `Ty` is non-exhaustive (Phase 2 will add `?T`, `!T`, etc.);
         // anything new lands here as Unsupported until handled.
         _ => None,

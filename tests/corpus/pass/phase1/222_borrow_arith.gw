@@ -1,0 +1,7 @@
+fn main() -> i32 {
+    let a: i32 = 10;
+    let b: i32 = 20;
+    let ra: &i32 = &a;
+    let rb: &i32 = &b;
+    return *ra + *rb;
+}

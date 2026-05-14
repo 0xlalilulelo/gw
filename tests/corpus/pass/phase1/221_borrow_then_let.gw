@@ -1,0 +1,6 @@
+fn main() -> i32 {
+    let x: i32 = 42;
+    let r: &i32 = &x;
+    let y: i32 = *r;
+    return y;
+}

@@ -22,7 +22,7 @@ use gw_resolve::{DefId, DefKind, ResolvedModule};
 use gw_typeck::{
     BindingId, ClassLayout, FloatTy, FnSig, IntTy, NodePtr, OptInner, Ty, TypedModule,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// The whole Phase-1 program: a flat list of functions, the class
 /// layout table copied from typeck, and any string-literal payloads
@@ -74,6 +74,13 @@ pub struct MirFn {
     /// Whether this function has a body in this translation unit.
     /// `false` for `extern fn name(...) -> T;` declarations.
     pub is_extern: bool,
+    /// Locals whose address is taken via `Rvalue::Ref { target, .. }`
+    /// somewhere in this fn's body. Codegen forces these locals into
+    /// `StackSlot` storage (Cranelift) / `alloca` storage (LLVM)
+    /// regardless of their type, so the pointer the `Ref` produces
+    /// has a stable memory address to point at. Phase 3 increment
+    /// B.0 — empty for fns that don't take a borrow.
+    pub address_taken_locals: FxHashSet<Local>,
 }
 
 /// A local slot.
@@ -152,6 +159,25 @@ pub enum Rvalue {
         src_ty: Ty,
         dst_ty: Ty,
     },
+    /// `&local` — take the address of a local's storage slot.
+    /// Phase 3 increment B.0: `target` must be a let-binding local
+    /// (typeck restricts the operand of `&` to a path-to-local at
+    /// this stage). The resulting operand is pointer-typed; the
+    /// target local is automatically promoted from SSA Variable to
+    /// `StackSlot` storage at codegen time via the MirFn's
+    /// `address_taken_locals` set. `pointee_ty` is the type of the
+    /// borrowed place (== the local's type), recorded here so
+    /// codegen has the load width available without re-reading
+    /// `locals[target].ty`.
+    Ref { target: Local, pointee_ty: Ty },
+    /// `*ptr` — load through a reference. Phase 3 increment B.0:
+    /// `ptr` is an operand of type `Ty::Ref(_)`; `ty` is the
+    /// result type (== the reference's inner). Codegen emits a
+    /// load of width `ty` from the pointer value. Raw pointer
+    /// (`Ty::Ptr(_)`) deref is **not** routed here — that's an
+    /// unsafe-tier surface (Phase 3 increment B.8); for now, only
+    /// `&T` participates in deref.
+    Deref { ptr: Operand, ty: Ty },
 }
 
 /// Kind of a [`Rvalue::Cast`].
@@ -434,6 +460,7 @@ fn synthesise_write_extern() -> MirFn {
         ],
         blocks: Vec::new(),
         is_extern: true,
+        address_taken_locals: FxHashSet::default(),
     }
 }
 
@@ -589,6 +616,7 @@ fn lower_synthetic_main<'a>(
         locals: b.locals,
         blocks: b.blocks.into_iter().map(|x| x.into_block()).collect(),
         is_extern: false,
+        address_taken_locals: b.address_taken,
     }
 }
 
@@ -719,6 +747,7 @@ fn lower_fn<'a>(
         locals: b.locals,
         blocks: b.blocks.into_iter().map(|x| x.into_block()).collect(),
         is_extern,
+        address_taken_locals: b.address_taken,
     }
 }
 
@@ -734,6 +763,12 @@ struct Builder {
     /// enclosing loops. Pushed on entering a `while`/`for` body and
     /// popped on exit; consumed by `lower_break` / `lower_continue`.
     loop_targets: Vec<LoopTarget>,
+    /// Locals whose address gets taken via `Rvalue::Ref { target, .. }`.
+    /// Populated as the builder lowers `&local` expressions; consumed
+    /// when the builder is converted to `MirFn` at end-of-lowering.
+    /// Codegen reads `MirFn::address_taken_locals` and forces those
+    /// locals into stable-address storage.
+    address_taken: FxHashSet<Local>,
 }
 
 /// Where `break` and `continue` jump within the current loop.
@@ -775,6 +810,7 @@ impl Builder {
             blocks: Vec::new(),
             cur: BlockId(0),
             loop_targets: Vec::new(),
+            address_taken: FxHashSet::default(),
         }
     }
 
@@ -1751,33 +1787,92 @@ fn lower_unary<'a>(
     u: UnaryExpr<'a>,
     lcx: &mut LowerCx<'a, '_, '_, '_, '_>,
 ) -> Operand {
-    let operand = u
-        .operand()
-        .map(|e| lower_expr(b, e, lcx))
-        .unwrap_or(Operand::Const(Const::Error));
     let result_ty = lcx
         .typed
         .expr_types
         .get(&NodePtr(u.syntax()))
         .copied()
         .unwrap_or(Ty::Error);
-    let op = match u.op_kind() {
-        Some(SyntaxKind::Minus) => UnOp::Neg,
-        Some(SyntaxKind::Bang) => UnOp::Not,
-        Some(SyntaxKind::Tilde) => UnOp::BitNot,
-        _ => return Operand::Const(Const::Error),
-    };
-    let value = Rvalue::UnOp {
-        op,
-        operand,
-        ty: result_ty,
-    };
-    let local = b.alloc_local(LocalDecl {
-        ty: result_ty,
-        span: u.syntax().span,
-    });
-    b.push_stmt(MirStmt::Assign { dst: local, value });
-    Operand::Local(local)
+    let span = u.syntax().span;
+    match u.op_kind() {
+        // Phase 3 increment B.0: `&local` — produce a pointer to
+        // the borrowed local's storage slot. typeck has already
+        // restricted the operand to a path-to-local, so we look up
+        // the binding directly. The target gets recorded in
+        // `address_taken` so codegen forces it into stable-address
+        // storage.
+        Some(SyntaxKind::Amp) => {
+            let Some(Expr::Path(p)) = u.operand() else {
+                return Operand::Const(Const::Error);
+            };
+            let Some(binding) = lcx.typed.path_bindings.get(&NodePtr(p.syntax())).copied() else {
+                return Operand::Const(Const::Error);
+            };
+            let Some(&target) = lcx.binding_to_local.get(&binding) else {
+                return Operand::Const(Const::Error);
+            };
+            let pointee_ty = lcx
+                .typed
+                .expr_types
+                .get(&NodePtr(p.syntax()))
+                .copied()
+                .unwrap_or(Ty::Error);
+            b.address_taken.insert(target);
+            let dst = b.alloc_local(LocalDecl {
+                ty: result_ty,
+                span,
+            });
+            b.push_stmt(MirStmt::Assign {
+                dst,
+                value: Rvalue::Ref { target, pointee_ty },
+            });
+            Operand::Local(dst)
+        }
+        // Phase 3 increment B.0: `*ref` — load through the
+        // reference. typeck has already checked the operand is
+        // `Ty::Ref(_)`; codegen consults `ty` for load width.
+        Some(SyntaxKind::Star) => {
+            let ptr = u
+                .operand()
+                .map(|e| lower_expr(b, e, lcx))
+                .unwrap_or(Operand::Const(Const::Error));
+            let dst = b.alloc_local(LocalDecl {
+                ty: result_ty,
+                span,
+            });
+            b.push_stmt(MirStmt::Assign {
+                dst,
+                value: Rvalue::Deref { ptr, ty: result_ty },
+            });
+            Operand::Local(dst)
+        }
+        Some(kind @ (SyntaxKind::Minus | SyntaxKind::Bang | SyntaxKind::Tilde)) => {
+            let operand = u
+                .operand()
+                .map(|e| lower_expr(b, e, lcx))
+                .unwrap_or(Operand::Const(Const::Error));
+            let op = match kind {
+                SyntaxKind::Minus => UnOp::Neg,
+                SyntaxKind::Bang => UnOp::Not,
+                SyntaxKind::Tilde => UnOp::BitNot,
+                _ => unreachable!("outer match guarantees minus/bang/tilde"),
+            };
+            let local = b.alloc_local(LocalDecl {
+                ty: result_ty,
+                span,
+            });
+            b.push_stmt(MirStmt::Assign {
+                dst: local,
+                value: Rvalue::UnOp {
+                    op,
+                    operand,
+                    ty: result_ty,
+                },
+            });
+            Operand::Local(local)
+        }
+        _ => Operand::Const(Const::Error),
+    }
 }
 
 /// Lower `expr as Type` to a [`Rvalue::Cast`].

@@ -677,9 +677,19 @@ fn infix_bp(op: TokenKind) -> Option<(u8, u8)> {
 /// Returns the unary-operator binding power (right-side only — prefix
 /// unary has no left side). `None` means the token is not a unary
 /// operator.
+///
+/// `Amp` (borrow `&expr`) and `Star` (deref `*expr`) live here at
+/// the same precedence as `-`, `!`, `~` (Phase 3 increment B.0).
+/// The Pratt loop reserves `Amp` / `Star` as infix operators
+/// (bitwise-AND / multiplication respectively) — the prefix vs
+/// infix disambiguation falls out naturally because `parse_atom`
+/// consults `prefix_bp` at the start of an expression, while
+/// `parse_expr_bp`'s infix loop consults `bp` after parsing an
+/// operand.
 fn prefix_bp(op: TokenKind) -> Option<u8> {
     Some(match op {
         TokenKind::Minus | TokenKind::Bang | TokenKind::Tilde => 23,
+        TokenKind::Amp | TokenKind::Star => 23,
         _ => return None,
     })
 }

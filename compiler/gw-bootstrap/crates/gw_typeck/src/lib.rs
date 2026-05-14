@@ -142,10 +142,61 @@ pub enum Ty {
     /// (`?T` doesn't coerce to `!T` and vice versa), and the `!`
     /// postfix asserts on `!T` only.
     ErrorUnion(OptInner),
+    /// `&T` — shared reference (Phase 3 increment B.0). At the value
+    /// level it's a pointer to the borrowed place; the static
+    /// distinction from `Ty::Ptr(_)` is what enables the
+    /// borrow-checker layer (B.4+) to track loans and lifetimes
+    /// without confusing checked refs with raw FFI pointers. B.0
+    /// only realises shared refs (immutable borrow); B.1 will add a
+    /// `mut: bool` flag for `&mut T`. Inner is closed via
+    /// [`RefInner`] so `Ty` stays `Copy`; wider inners (slices,
+    /// classes, optionals) ride later sub-bundles motivated by
+    /// corpus need.
+    Ref(RefInner),
     /// Synthetic placeholder when type checking failed for an
     /// expression. Treated as compatible with any expected type so a
     /// single failure does not cascade.
     Error,
+}
+
+/// The inner of a [`Ty::Ref`]. Closed enum to keep `Ty` `Copy`
+/// (same shape as [`OptInner`]). Phase 3 increment B.0 realises
+/// only the integer and bool primitives; wider inners arrive as
+/// the corpus motivates.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum RefInner {
+    /// `&i32`, `&u64`, etc.
+    Int(IntTy),
+    /// `&bool`.
+    Bool,
+}
+
+impl RefInner {
+    /// Promote the closed inner to a full [`Ty`].
+    pub fn to_ty(self) -> Ty {
+        match self {
+            Self::Int(t) => Ty::Int(t),
+            Self::Bool => Ty::Bool,
+        }
+    }
+
+    /// Try to demote a [`Ty`] to its [`RefInner`] form. Returns
+    /// `None` for any non-supported inner; `resolve_type` rejects
+    /// wider inners at the source, but the helper is convenient
+    /// for MIR / codegen consultation.
+    pub fn from_ty(ty: Ty) -> Option<Self> {
+        match ty {
+            Ty::Int(t) => Some(Self::Int(t)),
+            Ty::Bool => Some(Self::Bool),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RefInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_ty().fmt(f)
+    }
 }
 
 /// The inner of a [`Ty::Optional`]. Closed enum to keep `Ty` Copy.
@@ -284,6 +335,7 @@ impl std::fmt::Display for Ty {
             }
             Self::Optional(inner) => write!(f, "?{}", inner),
             Self::ErrorUnion(inner) => write!(f, "!{}", inner),
+            Self::Ref(inner) => write!(f, "&{}", inner),
             Self::Error => f.write_str("<error>"),
         }
     }
@@ -645,6 +697,33 @@ fn resolve_type(
                         Label::new(opt.syntax().span, ""),
                         format!(
                             "Phase 2 only supports `?T` for primitive integer or `bool` inner types; `?{inner_ty}` is not yet supported"
+                        ),
+                    ));
+                    Ty::Error
+                }
+            };
+        }
+        Type::Ref(r) => {
+            // Phase 3 increment B.0: `&T` for primitive T only,
+            // mirroring `?T` / `!T`'s closed-inner constraint. Wider
+            // inner types (slices, classes, optionals) ride later
+            // sub-bundles motivated by corpus need. The static
+            // distinction from `Ty::Ptr(_)` is what enables the
+            // borrow-checker layer (B.4+) to track loans; the
+            // value-level representation is just a pointer.
+            let inner_ty = r
+                .pointee()
+                .map(|t| resolve_type(t, resolved, sm, diags))
+                .unwrap_or(Ty::Error);
+            return match RefInner::from_ty(inner_ty) {
+                Some(ri) => Ty::Ref(ri),
+                None if inner_ty == Ty::Error => Ty::Error,
+                None => {
+                    diags.push(Diagnostic::error(
+                        ec::UNSUPPORTED_CONSTRUCT,
+                        Label::new(r.syntax().span, ""),
+                        format!(
+                            "Phase 3 only supports `&T` for primitive integer or `bool` inner types; `&{inner_ty}` is not yet supported"
                         ),
                     ));
                     Ty::Error
@@ -1612,6 +1691,64 @@ fn synth_unary<'a>(u: UnaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
                 Ty::Error
             }
         }
+        // Phase 3 increment B.0: `&expr` borrow. Today's scope
+        // restricts the operand to a path-to-local — anything else
+        // (literal, call result, `&expr` again, field access)
+        // rejects with `BAD_OPERAND` so future sub-bundles widening
+        // the borrowable surface (e.g. `&x.f`) are forced through
+        // an explicit decision.
+        Amp => {
+            let operand_node = match u.operand() {
+                Some(e) => e,
+                None => return Ty::Error,
+            };
+            let is_path_to_local = matches!(operand_node, Expr::Path(p)
+                if cx
+                    .tm
+                    .path_bindings
+                    .contains_key(&NodePtr(p.syntax())));
+            if !is_path_to_local {
+                if operand != Ty::Error {
+                    cx.diags.push(Diagnostic::error(
+                        ec::BAD_OPERAND,
+                        Label::new(u.syntax().span, ""),
+                        "Phase 3 increment B.0 only supports `&` on a path to a local binding",
+                    ));
+                }
+                return Ty::Error;
+            }
+            match RefInner::from_ty(operand) {
+                Some(ri) => Ty::Ref(ri),
+                None if operand == Ty::Error => Ty::Error,
+                None => {
+                    cx.diags.push(Diagnostic::error(
+                        ec::UNSUPPORTED_CONSTRUCT,
+                        Label::new(u.syntax().span, ""),
+                        format!(
+                            "Phase 3 increment B.0 only supports `&T` for primitive integer or `bool` inner types; `&{operand}` is not yet supported"
+                        ),
+                    ));
+                    Ty::Error
+                }
+            }
+        }
+        // Phase 3 increment B.0: `*expr` deref. Operand must be
+        // `Ty::Ref(_)`; result is the inner type. Raw pointers
+        // (`Ty::Ptr(_)`) deliberately do *not* deref through this
+        // arm — that's an extern-FFI surface, and a `*p` on a raw
+        // pointer is unsafe-tier work (B.8).
+        Star => match operand {
+            Ty::Ref(ri) => ri.to_ty(),
+            Ty::Error => Ty::Error,
+            _ => {
+                cx.diags.push(Diagnostic::error(
+                    ec::BAD_OPERAND,
+                    Label::new(u.syntax().span, ""),
+                    format!("unary `*` requires a `&T` operand, found `{operand}`"),
+                ));
+                Ty::Error
+            }
+        },
         _ => Ty::Error,
     }
 }
