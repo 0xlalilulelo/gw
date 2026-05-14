@@ -1544,6 +1544,20 @@ fn lower_comptime<'a>(c: ComptimeExpr<'a>, lcx: &mut LowerCx<'a, '_, '_, '_, '_>
             ty: int_ty,
         }),
         (gw_comptime::CtValue::Bool(b), Ty::Bool) => Operand::Const(Const::Bool(b)),
+        // CT.3a: narrow the evaluator's canonical f64 to the
+        // surrounding `Ty::Float` width — mirrors the runtime
+        // `FloatLit` path in `lower_literal` (f64 → bits direct,
+        // f32 → cast then bits).
+        (gw_comptime::CtValue::Float(f), Ty::Float(float_ty)) => {
+            let bits = match float_ty {
+                FloatTy::F64 => f.to_bits(),
+                FloatTy::F32 => (f as f32).to_bits() as u64,
+            };
+            Operand::Const(Const::Float {
+                bits,
+                ty: float_ty,
+            })
+        }
         _ => Operand::Const(Const::Error),
     }
 }

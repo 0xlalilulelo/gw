@@ -18,13 +18,14 @@
 //!
 //! CT.2b — comparisons + booleans. `CtValue` gains the
 //! [`CtValue::Bool`] arm. `eval_binary` is reorganised around
-//! op-first dispatch with three groups: integer arithmetic (CT.2a),
-//! integer ordering (`< <= > >=`), and equality (`==` / `!=`,
-//! overloaded for both integer and bool operands). Bool ordering
+//! op-first dispatch with three groups: arithmetic, ordering
+//! (`< <= > >=`), and equality (`==` / `!=`). Bool ordering
 //! (`true < false`) and logical `&&` / `||` ride a later sub-bundle.
-//! Operand-type checks go through [`expect_int`] so non-integer
-//! operands of arithmetic / ordering ops produce a clear diagnostic
-//! rather than a wrong answer.
+//! As of CT.3a, the three op groups dispatch on the operand-value
+//! tuple rather than routing through a canonical `expect_int`
+//! helper — both `(Int, Int)` and `(Float, Float)` pairs are
+//! accepted, while mixed and Bool-in-arithmetic pairs reject
+//! explicitly so the user sees the type mismatch directly.
 //!
 //! CT.2c — let-bindings + locals env. The evaluator gains a
 //! [`BindingEnv`] trait that abstracts CST-node → binding-index
@@ -72,13 +73,20 @@ use gw_lex::{SourceMap, Span};
 /// `Int` is left to the typed AST: typeck records the surrounding
 /// expression's `Ty` in `expr_types`, and MIR uses that to pick the
 /// `IntTy` for the materialised `Const::Int`. `Bool` has no width
-/// — MIR lowers it directly to `Const::Bool(b)`.
+/// — MIR lowers it directly to `Const::Bool(b)`. `Float` is canonical
+/// at `f64`; MIR narrows to `f32` at materialisation time if the
+/// surrounding expression's type is `Ty::Float(F32)` (same pattern as
+/// the runtime `FloatLit` lowering in `gw_mir::lower_literal`).
 #[derive(Copy, Clone, Debug)]
 pub enum CtValue {
     /// Integer constant in two's-complement i128 representation.
     Int(i128),
     /// Boolean constant. Added in CT.2b alongside the comparison ops.
     Bool(bool),
+    /// IEEE-754 floating-point constant. Added in CT.3a alongside
+    /// `FloatLit` recognition and the float arithmetic / ordering
+    /// dispatch in [`eval_binary`].
+    Float(f64),
 }
 
 /// Resolver from CST node → binding index. Implemented by typeck via a
@@ -133,6 +141,8 @@ pub enum EvalError {
     StackOverflow(Span),
     /// An integer literal could not be parsed as i128.
     BadIntLiteral(Span),
+    /// A float literal could not be parsed as `f64`. Added in CT.3a.
+    BadFloatLiteral(Span),
     /// A checked integer operation overflowed `i128`. CT.2's
     /// evaluator works in i128 arbitrary precision (decision Q1 in
     /// the HANDOFF's CT.2 plan); overflow here means the comptime
@@ -154,6 +164,7 @@ impl EvalError {
             | Self::BudgetExceeded(span)
             | Self::StackOverflow(span)
             | Self::BadIntLiteral(span)
+            | Self::BadFloatLiteral(span)
             | Self::IntegerOverflow(span)
             | Self::DivisionByZero(span) => *span,
         }
@@ -412,8 +423,14 @@ fn eval_expr<'a>(expr: Expr<'a>, cx: &mut EvalCx<'_, '_, 'a>) -> Result<CtValue,
             cx.enter(span)?;
             let v = eval_expr(operand, cx);
             cx.exit();
-            let n = expect_int(v?, span)?;
-            Ok(CtValue::Int(n.wrapping_neg()))
+            match v? {
+                CtValue::Int(n) => Ok(CtValue::Int(n.wrapping_neg())),
+                CtValue::Float(f) => Ok(CtValue::Float(-f)),
+                CtValue::Bool(_) => Err(EvalError::Unsupported {
+                    span,
+                    what: "unary `-` requires a numeric operand, found `bool`",
+                }),
+            }
         }
         Expr::Block(b) => {
             cx.enter(span)?;
@@ -487,16 +504,19 @@ fn eval_if<'a>(
 /// `/`, `%`) over `i128` operands; CT.2b adds the four integer
 /// ordering comparisons (`<`, `<=`, `>`, `>=`) and overloaded
 /// equality (`==`, `!=`) for both integer and boolean operands.
-/// Bool ordering (`true < false`) and logical `&&` / `||` are
-/// deferred. Arithmetic uses `i128` checked ops per decision Q1
-/// (arbitrary-precision evaluator, narrow at materialisation): an
-/// overflow during compile-time eval is a distinct error from a
-/// materialisation-time narrowing overflow. Op-first dispatch
-/// keeps each operator's operand-type contract local — arithmetic
-/// and ordering route through [`expect_int`]; equality accepts
-/// matching `(Int, Int)` or `(Bool, Bool)` pairs and rejects mixed
-/// pairs explicitly so the user sees the type-mismatch rather than
-/// an arbitrary dominant-type rule.
+/// **CT.3a** widens arithmetic, ordering, and equality to admit
+/// `(Float, Float)` operand pairs alongside `(Int, Int)`. Mixed
+/// `(Int, Float)` / `(Float, Int)` pairs reject explicitly so the
+/// user sees the type mismatch rather than an arbitrary
+/// dominant-type rule (matches the runtime requirement of an
+/// explicit `as` cast). Bool ordering (`true < false`) and logical
+/// `&&` / `||` are still deferred. Integer arithmetic uses `i128`
+/// checked ops per decision Q1; float arithmetic uses Rust's
+/// IEEE-754 ops directly — `+ - * /` are total, division by `0.0`
+/// yields `±∞` / `NaN`, `%` is `f64::rem`. Float ordering / equality
+/// use Rust's `<` / `<=` / `>` / `>=` / `==` which already implement
+/// the IEEE-754 partial-order contract (any comparison involving
+/// `NaN` returns `false`, including `NaN == NaN`).
 fn eval_binary<'a>(
     expr: BinaryExpr<'a>,
     span: Span,
@@ -529,45 +549,86 @@ fn eval_binary<'a>(
         | SyntaxKind::Minus
         | SyntaxKind::Star
         | SyntaxKind::Slash
-        | SyntaxKind::Percent => {
-            let l = expect_int(lv, span)?;
-            let r = expect_int(rv, span)?;
-            let result = match op {
-                SyntaxKind::Plus => l.checked_add(r).ok_or(EvalError::IntegerOverflow(span))?,
-                SyntaxKind::Minus => l.checked_sub(r).ok_or(EvalError::IntegerOverflow(span))?,
-                SyntaxKind::Star => l.checked_mul(r).ok_or(EvalError::IntegerOverflow(span))?,
-                SyntaxKind::Slash => {
-                    if r == 0 {
-                        return Err(EvalError::DivisionByZero(span));
+        | SyntaxKind::Percent => match (lv, rv) {
+            (CtValue::Int(l), CtValue::Int(r)) => {
+                let result = match op {
+                    SyntaxKind::Plus => l.checked_add(r).ok_or(EvalError::IntegerOverflow(span))?,
+                    SyntaxKind::Minus => {
+                        l.checked_sub(r).ok_or(EvalError::IntegerOverflow(span))?
                     }
-                    l.checked_div(r).ok_or(EvalError::IntegerOverflow(span))?
-                }
-                SyntaxKind::Percent => {
-                    if r == 0 {
-                        return Err(EvalError::DivisionByZero(span));
+                    SyntaxKind::Star => l.checked_mul(r).ok_or(EvalError::IntegerOverflow(span))?,
+                    SyntaxKind::Slash => {
+                        if r == 0 {
+                            return Err(EvalError::DivisionByZero(span));
+                        }
+                        l.checked_div(r).ok_or(EvalError::IntegerOverflow(span))?
                     }
-                    l.checked_rem(r).ok_or(EvalError::IntegerOverflow(span))?
-                }
-                _ => unreachable!("outer match guarantees arithmetic op"),
-            };
-            Ok(CtValue::Int(result))
-        }
+                    SyntaxKind::Percent => {
+                        if r == 0 {
+                            return Err(EvalError::DivisionByZero(span));
+                        }
+                        l.checked_rem(r).ok_or(EvalError::IntegerOverflow(span))?
+                    }
+                    _ => unreachable!("outer match guarantees arithmetic op"),
+                };
+                Ok(CtValue::Int(result))
+            }
+            // CT.3a: IEEE-754 arithmetic over `f64`. `+ - * / %` are
+            // total operations — `Slash` / `Percent` by `0.0` yield
+            // `±∞` / `NaN` per IEEE-754, no `DivisionByZero` error
+            // (matches runtime semantics; the integer arms above are
+            // the only path that traps on divide-by-zero).
+            (CtValue::Float(l), CtValue::Float(r)) => {
+                let result = match op {
+                    SyntaxKind::Plus => l + r,
+                    SyntaxKind::Minus => l - r,
+                    SyntaxKind::Star => l * r,
+                    SyntaxKind::Slash => l / r,
+                    SyntaxKind::Percent => l % r,
+                    _ => unreachable!("outer match guarantees arithmetic op"),
+                };
+                Ok(CtValue::Float(result))
+            }
+            _ => Err(EvalError::Unsupported {
+                span,
+                what: "arithmetic operands must both be int or both be float in a comptime block",
+            }),
+        },
         SyntaxKind::Lt | SyntaxKind::LtEq | SyntaxKind::Gt | SyntaxKind::GtEq => {
-            let l = expect_int(lv, span)?;
-            let r = expect_int(rv, span)?;
-            let result = match op {
-                SyntaxKind::Lt => l < r,
-                SyntaxKind::LtEq => l <= r,
-                SyntaxKind::Gt => l > r,
-                SyntaxKind::GtEq => l >= r,
-                _ => unreachable!("outer match guarantees ordering op"),
+            // Float ordering: Rust's `<`, `<=`, `>`, `>=` on f64
+            // return false for any operand pair involving NaN, which
+            // is the IEEE-754 partial-order contract we want.
+            let result = match (lv, rv) {
+                (CtValue::Int(l), CtValue::Int(r)) => match op {
+                    SyntaxKind::Lt => l < r,
+                    SyntaxKind::LtEq => l <= r,
+                    SyntaxKind::Gt => l > r,
+                    SyntaxKind::GtEq => l >= r,
+                    _ => unreachable!("outer match guarantees ordering op"),
+                },
+                (CtValue::Float(l), CtValue::Float(r)) => match op {
+                    SyntaxKind::Lt => l < r,
+                    SyntaxKind::LtEq => l <= r,
+                    SyntaxKind::Gt => l > r,
+                    SyntaxKind::GtEq => l >= r,
+                    _ => unreachable!("outer match guarantees ordering op"),
+                },
+                _ => {
+                    return Err(EvalError::Unsupported {
+                        span,
+                        what: "ordering operands must both be int or both be float in a comptime block",
+                    });
+                }
             };
             Ok(CtValue::Bool(result))
         }
         SyntaxKind::EqEq | SyntaxKind::BangEq => {
+            // Float equality: `NaN == NaN` is false per IEEE-754
+            // (Rust's `==` on f64 implements this directly).
             let equal = match (lv, rv) {
                 (CtValue::Int(l), CtValue::Int(r)) => l == r,
                 (CtValue::Bool(l), CtValue::Bool(r)) => l == r,
+                (CtValue::Float(l), CtValue::Float(r)) => l == r,
                 _ => {
                     return Err(EvalError::Unsupported {
                         span,
@@ -618,29 +679,23 @@ fn eval_logical_short_circuit<'a>(
     Ok(CtValue::Bool(r))
 }
 
-/// Pin a `CtValue` to its integer payload, or report an Unsupported
-/// diagnostic at `span`. Used by every arithmetic and ordering op so
-/// the operand-shape contract lives in exactly one place.
-fn expect_int(v: CtValue, span: Span) -> Result<i128, EvalError> {
-    match v {
-        CtValue::Int(n) => Ok(n),
-        CtValue::Bool(_) => Err(EvalError::Unsupported {
-            span,
-            what: "this operator requires an integer operand, found `bool`",
-        }),
-    }
-}
-
 /// Pin a `CtValue` to its boolean payload, or report an Unsupported
 /// diagnostic at `span`. Used by `if`-condition evaluation and (in
-/// CT.2e) by logical `&&` / `||` operand checks. Symmetric to
-/// [`expect_int`].
+/// CT.2e) by logical `&&` / `||` operand checks. The binary
+/// arithmetic / ordering arms in [`eval_binary`] dispatch on the
+/// operand tuple directly (since CT.3a accepts both `(Int, Int)`
+/// and `(Float, Float)` pairs) rather than routing through a
+/// canonical `expect_int` helper.
 fn expect_bool(v: CtValue, span: Span) -> Result<bool, EvalError> {
     match v {
         CtValue::Bool(b) => Ok(b),
         CtValue::Int(_) => Err(EvalError::Unsupported {
             span,
             what: "this operator requires a bool operand, found `int`",
+        }),
+        CtValue::Float(_) => Err(EvalError::Unsupported {
+            span,
+            what: "this operator requires a bool operand, found `float`",
         }),
     }
 }
@@ -656,6 +711,12 @@ fn eval_literal<'a>(l: LiteralExpr<'a>, cx: &mut EvalCx<'_, '_, 'a>) -> Result<C
             parse_int_literal(raw)
                 .map(CtValue::Int)
                 .ok_or(EvalError::BadIntLiteral(span))
+        }
+        SyntaxKind::FloatLit => {
+            let raw = cx.sm.slice(span).unwrap_or("");
+            parse_float_literal(raw)
+                .map(CtValue::Float)
+                .ok_or(EvalError::BadFloatLiteral(span))
         }
         SyntaxKind::KwTrue => Ok(CtValue::Bool(true)),
         SyntaxKind::KwFalse => Ok(CtValue::Bool(false)),
@@ -681,6 +742,16 @@ fn parse_int_literal(raw: &str) -> Option<i128> {
     } else {
         s.parse::<i128>().ok()
     }
+}
+
+/// Parse a float literal in its source form as `f64`. Mirrors the
+/// runtime path in `gw_mir::lower_literal`'s `FloatLit` arm
+/// (`raw.replace('_', "").parse::<f64>()`), kept in lockstep so the
+/// comptime evaluator and the runtime lowering decode identical bit
+/// patterns. Materialisation-time narrowing to `f32` lives in
+/// `gw_mir::lower_comptime`, not here.
+fn parse_float_literal(raw: &str) -> Option<f64> {
+    raw.replace('_', "").parse::<f64>().ok()
 }
 
 #[cfg(test)]
@@ -1200,5 +1271,205 @@ mod tests {
             matches!(err, EvalError::StackOverflow(_)),
             "expected StackOverflow, got {err:?}",
         );
+    }
+
+    // ---- CT.3a: Float ----
+
+    fn assert_float(v: CtValue) -> f64 {
+        match v {
+            CtValue::Float(f) => f,
+            other => panic!("expected CtValue::Float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn float_literal_parses() {
+        let f = assert_float(
+            eval_default("fn t() -> f64 { return comptime { 3.14 }; }").unwrap(),
+        );
+        assert_eq!(f, 3.14);
+    }
+
+    #[test]
+    fn float_literal_with_underscores() {
+        // Mirrors gw_mir's `raw.replace('_', "").parse::<f64>()`.
+        let f = assert_float(
+            eval_default("fn t() -> f64 { return comptime { 1_000.5 }; }").unwrap(),
+        );
+        assert_eq!(f, 1000.5);
+    }
+
+    #[test]
+    fn float_negation() {
+        let f = assert_float(
+            eval_default("fn t() -> f64 { return comptime { -2.5 }; }").unwrap(),
+        );
+        assert_eq!(f, -2.5);
+    }
+
+    #[test]
+    fn float_addition() {
+        let f = assert_float(
+            eval_default("fn t() -> f64 { return comptime { 1.5 + 2.25 }; }").unwrap(),
+        );
+        assert_eq!(f, 3.75);
+    }
+
+    #[test]
+    fn float_subtraction() {
+        let f = assert_float(
+            eval_default("fn t() -> f64 { return comptime { 5.0 - 1.25 }; }").unwrap(),
+        );
+        assert_eq!(f, 3.75);
+    }
+
+    #[test]
+    fn float_multiplication() {
+        let f = assert_float(
+            eval_default("fn t() -> f64 { return comptime { 1.5 * 4.0 }; }").unwrap(),
+        );
+        assert_eq!(f, 6.0);
+    }
+
+    #[test]
+    fn float_division() {
+        let f = assert_float(
+            eval_default("fn t() -> f64 { return comptime { 7.5 / 2.5 }; }").unwrap(),
+        );
+        assert_eq!(f, 3.0);
+    }
+
+    #[test]
+    fn float_modulo() {
+        let f = assert_float(
+            eval_default("fn t() -> f64 { return comptime { 5.5 % 2.0 }; }").unwrap(),
+        );
+        assert_eq!(f, 1.5);
+    }
+
+    #[test]
+    fn float_division_by_zero_yields_infinity() {
+        // IEEE-754: `1.0 / 0.0 = +∞`; no `DivisionByZero` error
+        // (distinct from the integer path, which raises). This is the
+        // canonical assertion of float division semantics.
+        let f = assert_float(
+            eval_default("fn t() -> f64 { return comptime { 1.0 / 0.0 }; }").unwrap(),
+        );
+        assert!(f.is_infinite() && f.is_sign_positive(), "expected +inf, got {f}");
+    }
+
+    #[test]
+    fn float_zero_divided_by_zero_yields_nan() {
+        // IEEE-754: `0.0 / 0.0 = NaN`. Used as the canonical NaN
+        // source by the comptime corpus's NaN-ordering fixture.
+        let f = assert_float(
+            eval_default("fn t() -> f64 { return comptime { 0.0 / 0.0 }; }").unwrap(),
+        );
+        assert!(f.is_nan(), "expected NaN, got {f}");
+    }
+
+    #[test]
+    fn float_precedence_threads_evaluator() {
+        // Pratt precedence already pre-shapes the binary tree; the
+        // evaluator just walks it. `2.0 + 3.0 * 4.0` → 14.0 confirms
+        // the float path observes the same precedence as the int path.
+        let f = assert_float(
+            eval_default("fn t() -> f64 { return comptime { 2.0 + 3.0 * 4.0 }; }").unwrap(),
+        );
+        assert_eq!(f, 14.0);
+    }
+
+    #[test]
+    fn float_lt_true() {
+        let b = assert_bool(
+            eval_default("fn t() -> bool { return comptime { 1.5 < 2.5 }; }").unwrap(),
+        );
+        assert!(b);
+    }
+
+    #[test]
+    fn float_lt_false() {
+        let b = assert_bool(
+            eval_default("fn t() -> bool { return comptime { 2.5 < 1.5 }; }").unwrap(),
+        );
+        assert!(!b);
+    }
+
+    #[test]
+    fn float_eq_true() {
+        let b = assert_bool(
+            eval_default("fn t() -> bool { return comptime { 1.25 == 1.25 }; }").unwrap(),
+        );
+        assert!(b);
+    }
+
+    #[test]
+    fn float_nan_equality_is_false() {
+        // IEEE-754: `NaN == NaN` is `false`. This is the most-cited
+        // float foot-gun in real code; the comptime evaluator must
+        // mirror runtime semantics here.
+        let b = assert_bool(
+            eval_default("fn t() -> bool { return comptime { (0.0 / 0.0) == (0.0 / 0.0) }; }")
+                .unwrap(),
+        );
+        assert!(!b);
+    }
+
+    #[test]
+    fn float_nan_ordering_is_false() {
+        // IEEE-754: any ordering comparison involving NaN returns
+        // `false`. The CT.2d-style `if` then takes the `else` arm.
+        // This is the regression-proof that `<` on NaN doesn't
+        // accidentally trip a Rust-side panic or wrong answer.
+        let b = assert_bool(
+            eval_default("fn t() -> bool { return comptime { (0.0 / 0.0) < 1.0 }; }").unwrap(),
+        );
+        assert!(!b);
+    }
+
+    #[test]
+    fn mixed_int_float_arithmetic_rejects() {
+        // Runtime requires an explicit `as f64` cast for the int side;
+        // the comptime evaluator mirrors that rule rather than
+        // inventing an int-to-float coercion.
+        let err = eval_default("fn t() -> f64 { return comptime { 1 + 1.0 }; }").unwrap_err();
+        assert!(
+            matches!(err, EvalError::Unsupported { .. }),
+            "expected Unsupported (mixed int+float), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn mixed_int_float_equality_rejects() {
+        let err =
+            eval_default("fn t() -> bool { return comptime { 1 == 1.0 }; }").unwrap_err();
+        assert!(
+            matches!(err, EvalError::Unsupported { .. }),
+            "expected Unsupported (mixed int==float), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn float_arith_with_bool_rejects() {
+        // Bool can't participate in float arithmetic; this checks the
+        // tuple-dispatch's catch-all rejection path rather than the
+        // (now-removed) expect_int helper.
+        let err =
+            eval_default("fn t() -> f64 { return comptime { 1.0 + true }; }").unwrap_err();
+        assert!(
+            matches!(err, EvalError::Unsupported { .. }),
+            "expected Unsupported (float+bool), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn parse_float_literal_handles_underscores() {
+        assert_eq!(parse_float_literal("3.14"), Some(3.14));
+        assert_eq!(parse_float_literal("1_000.5"), Some(1000.5));
+    }
+
+    #[test]
+    fn parse_float_literal_rejects_garbage() {
+        assert_eq!(parse_float_literal("not-a-float"), None);
     }
 }

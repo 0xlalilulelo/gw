@@ -1425,15 +1425,18 @@ fn synth_comptime<'a>(c: ComptimeExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
         return Ty::Error;
     }
     // CT.1 + CT.2a realised integer-valued comptime blocks; CT.2b
-    // adds `Ty::Bool` alongside the new comparison ops. Wider inners
-    // (float, classes, …) ride later sub-bundles where the
-    // evaluator's CtValue gains the corresponding arms.
-    if !matches!(inner_ty, Ty::Int(_) | Ty::Bool) {
+    // added `Ty::Bool` alongside the comparison ops; CT.3a adds
+    // `Ty::Float(_)` alongside float literals and the float
+    // arithmetic / ordering / equality dispatch in
+    // `gw_comptime::eval_binary`. Wider inners (strings, classes,
+    // optionals, error unions, …) ride later CT.3 sub-bundles as the
+    // corpus motivates them.
+    if !matches!(inner_ty, Ty::Int(_) | Ty::Bool | Ty::Float(_)) {
         cx.diags.push(Diagnostic::error(
             ec::UNSUPPORTED_CONSTRUCT,
             Label::new(c.syntax().span, ""),
             format!(
-                "`comptime` blocks producing `{inner_ty}` are not yet supported (CT.2b handles `int` and `bool` blocks only)"
+                "`comptime` blocks producing `{inner_ty}` are not yet supported (CT.3a handles `int`, `bool`, and `float` blocks only)"
             ),
         ));
         return Ty::Error;
@@ -1496,6 +1499,9 @@ fn comptime_error_message(err: &EvalError) -> String {
         }
         EvalError::BadIntLiteral(_) => {
             "comptime evaluation could not parse this integer literal".to_string()
+        }
+        EvalError::BadFloatLiteral(_) => {
+            "comptime evaluation could not parse this float literal".to_string()
         }
         EvalError::IntegerOverflow(_) => {
             "comptime arithmetic overflowed `i128` during evaluation".to_string()
