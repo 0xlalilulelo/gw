@@ -655,15 +655,30 @@ fn lower_fn<'a>(
                 fn_return_ty: sig.ret,
             };
             let op = lower_block(&mut b, body, &mut lcx);
-            // Capture the operand only when the body's tail
-            // expression was actually a bare-Expr tail (the CT.1
-            // parser shape used by implicit-tail-return). If the
-            // block ended with an `ExprStmt` instead, `lower_block`
-            // returns `Operand::Const(Const::Unit)`, which we
-            // don't want to install as the fn's return value —
-            // the existing fallthrough handles u0/non-u0 fns
-            // correctly in that case.
-            if fn_decl.body().and_then(|b| b.tail_expr()).is_some() {
+            // Capture the operand only when the body's tail expression
+            // contributes a value to the fn's return slot. Two
+            // divergent-tail cases skip the wire-up:
+            //   (a) The block ended with an `ExprStmt` (no tail_expr)
+            //       — `lower_block` returns `Const::Unit`, which we
+            //       don't want to install as the fn's return value;
+            //       the existing fallthrough handles u0 / non-u0 fns
+            //       correctly in that case.
+            //   (b) The tail_expr typed as `Ty::U0` while the fn
+            //       returns non-u0 — typeck's divergent-tail discard
+            //       rule (see `check_fn_body`). The canonical case
+            //       is `if c { return 1; } else { return 2; }` at fn
+            //       body tail: both arms `return`, the if-expression's
+            //       type is `u0`, the if's join is unreachable.
+            //       Installing `Return(Const::Unit)` here would be a
+            //       type-incoherent terminator for a non-u0 fn; the
+            //       existing `Unreachable` fallback is the correct
+            //       outcome.
+            let tail_node = body.tail_expr();
+            let tail_ty =
+                tail_node.and_then(|t| typed.expr_types.get(&NodePtr(t.syntax())).copied());
+            let discard_u0_tail =
+                matches!(tail_ty, Some(Ty::U0)) && !matches!(sig.ret, Ty::U0 | Ty::Error);
+            if tail_node.is_some() && !discard_u0_tail {
                 Some(op)
             } else {
                 None

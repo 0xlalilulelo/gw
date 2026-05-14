@@ -1,0 +1,7 @@
+fn pick(x: i32) -> i32 {
+    if x > 0 { return 11; } else { return 22; }
+}
+
+fn main() -> i32 {
+    return pick(-5);
+}

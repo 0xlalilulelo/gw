@@ -537,10 +537,25 @@ fn parse_stmt(p: &mut Parser<'_, '_, '_>) {
         TokenKind::KwReturn => parse_expr_stmt(p, /* leading_kw */ true),
         TokenKind::KwIf | TokenKind::KwWhile | TokenKind::KwFor | TokenKind::LBrace => {
             // Block-like expressions used as statements; they may stand
-            // without a trailing `;`.
+            // without a trailing `;`. Mirror `parse_expr_stmt`'s
+            // tail-expression checkpoint trick (CT.1): if the source
+            // omitted `;` and we're at the enclosing block's `}`,
+            // leave a bare `Expr` child rather than wrapping in
+            // `ExprStmt`. Block consumers consult `Block::tail_expr`,
+            // which then returns this expression. typeck's
+            // `check_fn_body` applies a "discard u0 tails when the fn
+            // returns non-u0" rule to preserve the existing semantics
+            // of `25_if_else.gw`-style programs (both arms `return`,
+            // if-expression types as u0, fn returns non-u0). Top-level
+            // statements close at `Eof`, not `}`, so module-level
+            // behaviour is unchanged.
             let start = p.cur_byte_start();
-            p.builder.start_node(SyntaxKind::ExprStmt, start);
+            let cp = p.builder.checkpoint();
             parse_expr(p);
+            if p.at(TokenKind::RBrace) {
+                return;
+            }
+            p.builder.start_node_at(cp, SyntaxKind::ExprStmt, start);
             let _ = p.eat(TokenKind::Semi);
             let end = p.cur_byte_start();
             p.builder.finish_node(end);

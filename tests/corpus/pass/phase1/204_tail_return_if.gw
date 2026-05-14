@@ -1,0 +1,7 @@
+fn classify(x: i32) -> i32 {
+    if x < 0 { 10 } else if x == 0 { 20 } else { 30 }
+}
+
+fn main() -> i32 {
+    return classify(7);
+}

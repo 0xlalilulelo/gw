@@ -886,22 +886,30 @@ fn check_fn_body<'a>(
     };
     check_block(body, sig.ret, &mut cx);
     // Phase 2 / implicit-tail-return: when CT.1's parser widening
-    // leaves a bare expression at the end of the fn body (no `;`
-    // before `}`), check that expression against the declared
-    // return type. `check_expr` runs the bidirectional narrowing
-    // already wired for `let` initialisers and `return` operands
+    // (extended to block-like statements at block tail) leaves a
+    // bare expression at the end of the fn body (no `;` before
+    // `}`), check that expression against the declared return
+    // type. `check_expr` runs the bidirectional narrowing already
+    // wired for `let` initialisers and `return` operands
     // (decision #16), so `fn add(a: i32, b: i32) -> i32 { a + b }`
     // and `fn f() -> i64 { 42 }` work without explicit annotation.
-    // Scope is deliberately limited to bare-expression tails: the
-    // parser still wraps block-like statements (`if` / `while` /
-    // `for` / `{ … }`) in `ExprStmt`, so `fn f() -> i32 { if c
-    // { 1 } else { 2 } }` stays in its pre-CT.1 typing (no
-    // tail_expr, no implicit return). That widening rides a
-    // future sub-bundle so the corpus-regression handling
-    // (divergent tails, u0-discard policy) can be designed
-    // separately.
+    //
+    // Divergent-tail discard rule: when the tail naturally types
+    // as `Ty::U0` (e.g. an `if`/`else` where both arms `return`,
+    // or a `while` / `for` loop) but the fn returns non-u0, treat
+    // the tail as if it were an `ExprStmt` — discard it without
+    // a type-mismatch diagnostic. This preserves existing corpus
+    // shapes like `fn f() -> i32 { if c { return 1; } else
+    // { return 2; } }` whose if-expression has type `u0` because
+    // both arms diverge via `return`. GW doesn't track `!`
+    // (never) explicitly; the u0-discard rule covers the same
+    // ground for the cases that show up in practice.
     if let Some(tail) = body.tail_expr() {
-        check_expr(tail, sig.ret, &mut cx);
+        let tail_ty = synth_expr(tail, &mut cx);
+        let discard_u0_tail = matches!(tail_ty, Ty::U0) && !matches!(sig.ret, Ty::U0);
+        if !discard_u0_tail {
+            check_expr(tail, sig.ret, &mut cx);
+        }
     }
 }
 
@@ -3176,5 +3184,43 @@ mod tests {
         // `ExprStmt`; the bare-Expr tail lives *inside* the comptime
         // block, not in the fn body.
         assert_eq!(check("fn main() -> i32 { return comptime { 4 }; }"), 0);
+    }
+
+    #[test]
+    fn fn_body_with_if_tail_value_accepts() {
+        // Block-like-tail widening: `if … { v1 } else { v2 }` at fn
+        // body tail (no `;`). Both arms produce i32 values, the
+        // if-expression types as i32, and check_expr accepts it
+        // against the declared i32 return.
+        assert_eq!(
+            check("fn classify(x: i32) -> i32 { if x < 0 { 1 } else { 2 } }"),
+            0
+        );
+    }
+
+    #[test]
+    fn fn_body_with_divergent_if_tail_accepts() {
+        // Divergent-tail discard rule: the if-expression types as u0
+        // because both arms `return`. The fn returns i32. Without the
+        // discard rule this would diagnose TYPE_MISMATCH; with it, the
+        // tail is treated as ExprStmt-discarded and the two explicit
+        // `return`s carry the actual return values.
+        assert_eq!(
+            check("fn pick(x: i32) -> i32 { if x > 0 { return 1; } else { return 2; } }"),
+            0
+        );
+    }
+
+    #[test]
+    fn fn_body_with_while_tail_in_u0_accepts() {
+        // `while … { … }` at fn body tail of a u0-returning fn. The
+        // while produces u0; sig.ret is u0; the same-type path runs
+        // through check_expr cleanly without invoking the discard
+        // rule. This shape predates the widening (existing corpus
+        // program `163_print_padding.gw`); the test pins the
+        // post-widening typeck behaviour explicitly.
+        let src = "extern fn putchar(c: i32) -> i32;\n\
+                   fn dots(n: i32) -> u0 { let i: i32 = 0; while i < n { putchar(46); i = i + 1; } }";
+        assert_eq!(check(src), 0);
     }
 }
