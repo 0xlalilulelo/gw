@@ -15,13 +15,17 @@ This document is the entry point for the next development session. Read it first
 > are mechanically derivable. See the original rename plan in the
 > session transcript and commits 1–6 on `main`.
 
-> **Last updated:** 2026-05-13, after closing implicit-tail-return
-> for bare-expression tails (commit `579c4f0`) on top of CT.2's
-> closure. The CT.2 sub-bundle is entirely closed; the canonical
-> `fn add(a, b) -> i32 { a + b }` shape now compiles cleanly.
+> **Last updated:** 2026-05-14, after closing block-like-tail
+> parser widening + divergent-tail discard (commit `9ac51a1`) on
+> top of implicit-tail-return for bare-Expr tails (commit
+> `579c4f0`) and CT.2's closure. The canonical
+> `fn add(a, b) -> i32 { a + b }` shape AND
+> `fn classify(x: i32) -> i32 { if x < 0 { 1 } else { 2 } }` shape
+> now both compile cleanly; CT.2d's comptime paren-wrap workaround
+> is retired.
 > **Repo root:** `/Users/silmaril/Documents/GitHub/gw`
-> **Workspace tests:** 261 unit + integration, all green.
-> **Corpus:** 62 Phase-0 lex+parse snapshots + 245 Phase-1 + 23
+> **Workspace tests:** 264 unit + integration, all green.
+> **Corpus:** 62 Phase-0 lex+parse snapshots + 248 Phase-1 + 24
 > Phase-2 comptime single-file run-tests + 4 Phase-2 multi-file
 > projects.
 
@@ -35,7 +39,7 @@ resolve → typeck → MIR → codegen → link to a native executable.
 Two backends ship in the same workspace: `gw build --backend=fast`
 (Cranelift, default) and `gw build --backend=llvm` (LLVM 18 via
 `inkwell`). Both consume the same MIR and agree bit-exactly across
-the 245-program Phase-1 corpus + 4 multi-file projects + the 23
+the 248-program Phase-1 corpus + 4 multi-file projects + the 24
 Phase-2 comptime tracers. Phase 0, Phase 1, Phase 13 (LLVM), and
 the Phase-2 entry (c-strings, `match`, `?T`/`!T`, modules) are
 closed. **Phase 2 / CT.2 is now entirely closed** across five
@@ -51,23 +55,29 @@ through `expect_int`), CT.2c (let-bindings + locals env — dense
 `gw_ast::cst`), CT.2d (`if`/`else` branch-eval discipline — only
 the taken arm evaluates), and CT.2e (short-circuit `&&` / `||`
 — LHS first, RHS only when LHS doesn't determine the result).
-**Implicit-tail-return for bare-expression tails** also landed:
+**Implicit-tail-return for bare-expression tails** landed first:
 `fn add(a, b) -> i32 { a + b }` and `fn answer() -> i32 { 42 }`
-now compile cleanly — typeck checks the tail against the
-declared return type via the existing bidirectional narrowing,
-and MIR wires the tail operand into `Terminator::Return`. Scope
-deliberately limited to bare-Expr tails (CT.1's parser
-widening); `parse_stmt`'s block-like-statement arm stays
-unchanged, so `fn classify(x: i32) -> i32 { if x < 0 { -1 }
-else { 1 } }` still requires explicit `return`, and CT.2d's
-comptime paren-wrap workaround stays in place. The remaining
-Phase-2 work is CT.3 (wider types) plus the parser widening +
-divergent-tail handling as a separate future sub-bundle. The
-decl-level `comptime fn foo() -> T { ... }` form is *deferred
-to Phase 5* (where the evaluator becomes a stack VM on MIR and
-`comptime fn` is a one-bit annotation rather than synthesised
-AST-inlining); module-level `let CONSTANT: T = comptime { ...
-};` covers the shared-constant use case in Phase 2.
+compile cleanly — typeck checks the tail against the declared
+return type via the existing bidirectional narrowing, and MIR
+wires the tail operand into `Terminator::Return`. **Block-like-
+tail parser widening + divergent-tail discard** then extended
+the shape: `parse_stmt`'s `KwIf | KwWhile | KwFor | LBrace` arm
+now uses the same checkpoint trick as `parse_expr_stmt`, so
+`fn classify(x: i32) -> i32 { if x < 0 { 1 } else { 2 } }` and
+`fn dots(n: i32) -> u0 { while … }` work end-to-end. Typeck's
+divergent-tail rule ("discard u0 tails when fn returns non-u0")
+preserves the pre-existing semantics of `25_if_else.gw` /
+`27_else_if.gw` / `163_print_padding.gw` — programs whose
+block-like tail types as `u0` because all arms `return`. MIR
+mirrors the discard via `expr_types` lookup. CT.2d's comptime
+paren-wrap workaround is retired (one parser change, two
+unblocked surfaces). The remaining Phase-2 work is CT.3 (wider
+types). The decl-level `comptime fn foo() -> T { ... }` form is
+*deferred to Phase 5* (where the evaluator becomes a stack VM
+on MIR and `comptime fn` is a one-bit annotation rather than
+synthesised AST-inlining); module-level
+`let CONSTANT: T = comptime { ... };` covers the shared-constant
+use case in Phase 2.
 
 ---
 
@@ -97,7 +107,7 @@ gw/
 │   └── HANDOFF.md               (this file)
 ├── tests/corpus/
 │   ├── pass/lexparse/           (61 .gw + insta snapshots — Phase 0)
-│   ├── pass/phase1/             (226 .gw + .expected_exit / .expected_stdout)
+│   ├── pass/phase1/             (248 .gw + .expected_exit / .expected_stdout)
 │   └── fail/lexparse/           (5 .gw + .expected_diagnostics)
 ├── compiler/gw-bootstrap/       (Cargo workspace — host = Rust 1.95+)
 │   └── crates/
@@ -127,10 +137,10 @@ gw/
 |---|---|---|
 | `gw_lex` | 0 | UTF-8 lexer state machine. 108-variant `TokenKind`, phf keyword table, `Span`/`SourceMap`/`Diagnostic`/`DiagBag` types. |
 | `gw_ast` | 0 | Hand-rolled rowan-style CST + typed AST. Single unified `SyntaxKind` enum (189 variants — `RangePat` added in M.3). Typed views for ~38 Phase-1 / Phase-2 node kinds; `Stub` variants for the rest. `Module::stmts()` exposes top-level stmts (11a). `CastExpr` typed view added in A.1. **`SentinelPtrType` typed view (C.2)** with `element()` + `sentinel()` accessors. **`Expr::Match` (M.1)** + `MatchExpr::scrutinee()` / `arms()`, `MatchArmList::arms()`, `MatchArm::pattern()` / `body()`. **`Pattern::Literal` (M.1) / `Range` (M.3) / `Or` (M.3)** promoted from `Stub`; views expose `value()` / `lo()` + `hi()` / `alternatives()` respectively. **`Expr::Comptime(ComptimeExpr)` (CT.1)** promoted from `Stub` with a `block()` accessor returning the single inner `Block`. The pre-existing `Block::tail_expr()` accessor is now reachable for the first time — CT.1's parser change populates the bare-Expr tail slot it consults. **`NodePtr<'a>` (CT.2c)** moved here from `gw_typeck` so downstream crates (`gw_comptime`'s `BindingEnv` lookups, `gw_mir`'s `comptime_values` reads) can key into typeck's side-tables without depending on `gw_typeck` (which would form a dep cycle for `gw_comptime`). `gw_typeck` keeps a `pub use gw_ast::cst::NodePtr` so existing consumers' import paths still work. Bumpalo arena per file. Pretty-printer for `gw dump`. |
-| `gw_parse` | 0 | Recursive-descent + Pratt expression precedence. Error-recovering. Produces both CST and AST. No parser generator. `parse_module` forks on `peek_item_keyword` between item and stmt (11a). `parse_type` handles `*T` / `[]T` / `&T` / `?T` / `[N]T` / **`[*:S]T` (C.2 — sentinel many-pointer; peek-at-1 of `Star` distinguishes from slice / array)**. **Postfix `as Type` (A.1)** at left binding power 22 — between `*`/`/`/`%` (19/20) and prefix unary (23), matching Rust precedence so `-1 as u32` parses as `(-1) as u32`. **Match (M.1–M.3)**: `parse_match_expr` invoked from `parse_primary` on `KwMatch`; scrutinee parsed with `struct_literals_allowed = false`. New `parse_match_pattern` separate from `parse_pattern` (used by `let` / `for in`) — match-arm patterns accept `_` / `Ident` / `IntLit` / `Minus IntLit` / `KwTrue` / `KwFalse` / `lo..=hi` / `a \| b \| c` chains; the literal-side parsing uses a custom `parse_pattern_literal_value` instead of `parse_expr` so `\|` (bp 9, bitwise OR) and `..=` stay available for the pattern grammar. Or-pattern wrapping uses `start_node_at` checkpoint; range-pattern wrapping uses the same trick. **Comptime (CT.1)**: new `parse_comptime_expr` invoked from `parse_atom` on `KwComptime`; consumes `comptime` + a single `Block`. **Tail-expression widening (CT.1)**: `parse_expr_stmt` now uses a checkpoint — if the next token after the parsed expression is `}`, it leaves a bare `Expr` child rather than wrapping in `ExprStmt`. The `parse_stmt:538` LBrace / KwIf / KwWhile / KwFor arm is *unchanged* (block-like statements still wrap in `ExprStmt`), so existing `if cond { foo() }` patterns retain their pre-CT.1 typing. Top-level statements close at `Eof` not `}`, so module-level behaviour is unchanged. |
+| `gw_parse` | 0 | Recursive-descent + Pratt expression precedence. Error-recovering. Produces both CST and AST. No parser generator. `parse_module` forks on `peek_item_keyword` between item and stmt (11a). `parse_type` handles `*T` / `[]T` / `&T` / `?T` / `[N]T` / **`[*:S]T` (C.2 — sentinel many-pointer; peek-at-1 of `Star` distinguishes from slice / array)**. **Postfix `as Type` (A.1)** at left binding power 22 — between `*`/`/`/`%` (19/20) and prefix unary (23), matching Rust precedence so `-1 as u32` parses as `(-1) as u32`. **Match (M.1–M.3)**: `parse_match_expr` invoked from `parse_primary` on `KwMatch`; scrutinee parsed with `struct_literals_allowed = false`. New `parse_match_pattern` separate from `parse_pattern` (used by `let` / `for in`) — match-arm patterns accept `_` / `Ident` / `IntLit` / `Minus IntLit` / `KwTrue` / `KwFalse` / `lo..=hi` / `a \| b \| c` chains; the literal-side parsing uses a custom `parse_pattern_literal_value` instead of `parse_expr` so `\|` (bp 9, bitwise OR) and `..=` stay available for the pattern grammar. Or-pattern wrapping uses `start_node_at` checkpoint; range-pattern wrapping uses the same trick. **Comptime (CT.1)**: new `parse_comptime_expr` invoked from `parse_atom` on `KwComptime`; consumes `comptime` + a single `Block`. **Tail-expression widening (CT.1 + block-like-tail)**: `parse_expr_stmt` uses a checkpoint — if the next token after the parsed expression is `}`, it leaves a bare `Expr` child rather than wrapping in `ExprStmt`. The block-like-tail sub-bundle (commit `9ac51a1`) extends the same trick to `parse_stmt`'s `LBrace | KwIf | KwWhile | KwFor` arm: at the enclosing `}` the block-like expression becomes the block's tail-expr; otherwise it still wraps in `ExprStmt`. Top-level statements close at `Eof` not `}`, so module-level behaviour is unchanged. One parser change unblocks both fn-body block-like tails and CT.2d's comptime paren-wrap workaround. |
 | `gw_resolve` | 1 / 2 | Walks the AST, registers top-level fn + class defs, exports `primitive_type_name()`. `DefKind::SyntheticMain` is registered when top-level stmts coexist without explicit `fn main` (11a). **F.1 cross-file**: new `resolve_modules(primary, extras, ...)` accepts a primary module plus zero or more secondary modules; all defs go into one flat namespace by default. **F.2 modules**: each file's `mod <name>;` puts its items in `module_tables[name]` instead of the flat pool; `use foo;` imports those items. **F.3 per-file scoping**: `ResolvedModule` gains `file_scopes: FxHashMap<FileId, FxHashMap<String, DefId>>`; each file's effective scope = flat pool + own items + items from modules the file `use`s. New `lookup_in_file(file, name)` consults the per-file scope; backwards-compat `lookup(name)` falls back to flat for AST-test contexts. |
-| `gw_typeck` | 1 / 2 | Bidirectional checker. `Ty` enum: `U0`/`Bool`/`Int(IntTy)`/`Float(FloatTy)`/`Rune`/`Class(DefId)`/`Slice(IntTy)`/`Ptr(IntTy)`/**`SentinelPtr { elem: IntTy, sentinel: u64 }` (C.2)**/**`Optional(OptInner)` (O.1)**/**`ErrorUnion(OptInner)` (O.3)** where `OptInner = Int(IntTy) \| Bool` is a closed enum/`Error`. Emits a `TypedModule` with per-CST-node `expr_types`, `path_bindings`, `pat_bindings`, `call_targets`, `sigs`, `classes`. Slice + raw-pointer surface (11b/11c) are FFI-restricted; sentinel-pointer surface (C.2) is *not* — `[*:0]u8` flows through non-extern fn signatures because the producer-side sentinel guarantee gives the safety raw `*T` lacks. **Bidirectional literal narrowing (12d/12h)**: `check_expr` calls `try_narrow_literal` first — bare `IntLit`/`FloatLit`, `Unary(Minus, Literal)`, and `Paren(...)` shapes adopt the expected width when the value fits; out-of-range diagnoses against the literal span. `synth_binop_operands` extends the same rule across binary operators so `n < 2` (with `n: i64`) types cleanly. **`synth_cast` (A.1/A.2)** accepts the full numeric matrix `(Int\|Float, Int\|Float)`; non-numeric pairs reject with `UNSUPPORTED_CONSTRUCT`. **Class-/slice-typed fn params and returns (A.3/A.4)** are accepted via the by-pointer ABI; the `UNSUPPORTED_CONSTRUCT` rejections in `check_fn_signature` were dropped. **C.1 / C.2**: `synth_literal` types `c"..."` as `Ty::SentinelPtr { U8, 0 }`; `ty_assignable` adds the lone coercion `[*:S]T → *T` so the C.1 tracer's `puts(c"hi")` shape works without an explicit cast; missing return type defaults to `Ty::U0` (cleanup #1) instead of diagnosing — error code 307 is retired. **Match (M.1–M.3)**: `synth_match` synthesises the scrutinee, validates each arm's pattern via `check_match_pattern`, unifies arm bodies (first non-Error arm sets the result type, subsequent arms are checked against it). `check_match_pattern` accepts wildcards everywhere, integer-typed literal patterns + integer ranges (`Range`) when scrutinee is `Ty::Int(_)` (re-using the bidirectional narrowing for both bounds), `true`/`false` patterns when scrutinee is `Ty::Bool`, and `Or` patterns by recursing on each alternative. Exhaustiveness rule: every `match` requires either a `_` arm or — for bool scrutinees — both `true` and `false` literal patterns at top-level arms. Identifier patterns and other shapes still diagnose with UNSUPPORTED_CONSTRUCT until later widenings. **Optional (O.1)**: `Type::Opt(inner)` resolves to `Ty::Optional(OptInner)` when inner is integer/bool primitive (other inners reject); `try_narrow_literal` recognises `nil` in any `?T` context and adopts the expected Optional; `synth_literal` for `nil` outside an Optional context now diagnoses TYPE_MISMATCH (used to fall through silently to `Ty::Error` and pass any check); `ty_assignable` adds the lone `T → ?T` coercion edge — value-level distinct (the wrap below) but uniform at the source. Reverse direction (`?T → T`) is rejected; the user must unwrap. `synth_binary` dispatches `??` to `synth_coalesce`: LHS must be Optional, RHS checks against the inner, result type is the inner. **Match-on-?T (O.2)**: `check_match_pattern`'s Literal arm gains an Optional-scrutinee branch — `nil` accepts (records `expr_types[value] = scrut_ty`), other literals reject with a "use `_` to match the some side" hint. New `is_nil_literal` helper recurses through parens. The exhaustiveness rule fires unchanged for Optional scrutinees because they're not bool. **Error union (O.3)**: `Type::ErrorUnion(inner)` resolves to `Ty::ErrorUnion(OptInner)` with the same primitive-only constraint as O.1. `ty_assignable` adds a `T → !T` coercion edge parallel to `T → ?T`; `?T` and `!T` stay type-distinct (no exchange in either direction). New `synth_must` for `expr!`: LHS must be `Ty::ErrorUnion(_)`, result is the unwrapped inner. **Per-file scoping (F.3)**: `Cx` gains a `current_file: FileId` field set by `check_fn_body` from the fn's syntax span and by `check_synthetic_main_body` from the module's. Three name-lookup sites (`synth_path`'s top-level fn check, `synth_struct_lit`'s class lookup, `synth_call`'s callee resolution) switch from `cx.tm.resolved.lookup(name)` to `cx.tm.resolved.lookup_in_file(cx.current_file, name)`; `resolve_type`'s class-lookup site reads the file from the path's syntax span directly. **Comptime (CT.1 + CT.2a + CT.2b + CT.2c + CT.2d + CT.2e)**: new `synth_comptime` synthesises the inner block's type (so subexpressions populate `expr_types`), then runs `gw_comptime::eval_comptime_block`. CT.2d's `if`/`else` flows through the existing `synth_if` path — both arms synthesise to confirm their types match — without any CT.2d-specific typeck change; the divergence between typeck's walk-both-arms shape and the evaluator's walk-one-arm shape is contained inside `gw_comptime::eval_if`. CT.2e similarly adds no typeck-side code — `synth_binary`'s `AmpAmp` / `PipePipe` arm already eagerly synthesises both operands (both must be `Ty::Bool`), and the runtime / comptime divergence ("evaluate both" vs "short-circuit") is contained inside `gw_comptime::eval_logical_short_circuit`. On success, the resulting `CtValue` is stashed in new `TypedModule::comptime_values: FxHashMap<NodePtr, CtValue>`; on failure, new error code E0314 `COMPTIME_EVAL_FAILED` is pushed at the offending span. CT.1 realises integer-valued comptime blocks only; **CT.2b** widens the inner-type gate to `Ty::Int(_) | Ty::Bool` so the new ordering / equality comparisons (which produce `Ty::Bool`) flow through the same materialisation path. Wider inners (float, classes, …) still reject with `UNSUPPORTED_CONSTRUCT`, naming the supported set ("`int` and `bool` blocks only"). **CT.2a** adds two error-message arms in `comptime_error_message` for the new `EvalError::IntegerOverflow` and `EvalError::DivisionByZero` variants — user-facing strings "comptime arithmetic overflowed `i128` during evaluation" and "comptime evaluation attempted division or modulo by zero" route through the same E0314 diagnostic. **CT.2c** adds a `TypeckBindingEnv<'a, 'tm>` adapter that borrows the typed module's `pat_bindings` / `path_bindings` maps and exposes them through `gw_comptime`'s `BindingEnv` trait, converting `BindingId` to its inner `u32` at the trait boundary. The adapter borrow is scoped so it releases before `synth_comptime` mutates `comptime_values`. The crate also gains a `pub use gw_ast::cst::NodePtr` re-export (NodePtr moved to `gw_ast::cst` in CT.2c — see the `gw_ast` row); existing `use gw_typeck::NodePtr` consumers (like `gw_mir`) see no API change. **Implicit-tail-return (replaces the CT.1 E0315 guard rail)**: `check_fn_body`'s post-`check_block` arm now calls `check_expr(tail, sig.ret, &mut cx)` when `body.tail_expr()` is set. The bidirectional narrowing already running for `let` initialisers and `return` operands (decision #16) handles literal-width adoption (`fn f() -> i64 { 42 }`) without new typeck machinery. A non-matching tail type (e.g. `fn f() -> u0 { 42 }`) diagnoses as the ordinary `TYPE_MISMATCH` (E0300). The CT.1-era E0315 `TAIL_EXPR_IN_FN_BODY` constant is retired (comment-only in `ec`) — the regular type-mismatch path carries the user-facing fix without special-casing. Scope is deliberately limited to bare-Expr tails (`parse_expr_stmt`'s CT.1 widening); `parse_stmt`'s block-like-statement arm stays unchanged, so `fn f() -> i32 { if c { 1 } else { 2 } }` still requires an explicit `return` and CT.2d's comptime paren-wrap workaround stays in place. The parser widening + divergent-tail handling rides a separate future sub-bundle. |
-| `gw_mir` | 1 / 2 | CFG of basic blocks; primitive locals + aggregate stack-slot locals (class + slice); `Assign`/`AssignField` statements; `Use`/`BinOp`/`UnOp`/`Field`/`Cast` rvalues; `Goto`/`Branch`/`Return`/`Call`/`Unreachable` terminators. Loop-target stack for break/continue. `lower_for` desugar. `Const::DataAddr` + program-level `string_literals` table for `.rodata` payloads (11b). Implicit Print at stmt-position string lits desugars to `write(1, slice.data, slice.len)`; auto-injects `extern fn write` if user didn't declare one (11c). **Short-circuit `&&` / `\|\|` (12b)**: `lower_short_circuit` emits a 3-block control-flow shape (rhs-eval / short-circuit / join) and bypasses `lower_binary` so the RHS is only evaluated when the LHS doesn't determine the result. **`Rvalue::Cast` (A.1/A.2)** carries `kind: CastKind`, `operand`, `src_ty`, `dst_ty`; the closed `CastKind` enum has 7 variants, each maps to one Cranelift op. `select_cast_kind` factors the kind selection out of `lower_cast`. **`def_to_fn` fix (A.3)**: pre-A.3 the map stored each def's position in `resolved.defs` (including class defs); A.3 only counts `Fn`/`SyntheticMain` defs when assigning indices, matching the order `functions` is populated. **C.1 / C.2**: `Const::CStrAddr(CStrLitId)` + program-level `cstring_literals` table parallel to `string_literals` (no shared dedup keys — slice payloads and c-string payloads carry different semantics). `lower_cstring_literal` interns the decoded bytes (no NUL terminator stored — codegen appends it) and returns the operand directly without materialising a slice aggregate. **Match (M.1–M.3)**: `lower_match` allocates `body_bb` + `next_bb` per arm, calls the recursive `lower_pattern_test` helper, lowers the body in `body_bb`, restores cursor to `next_bb` for the next arm. `lower_pattern_test` emits `Goto(body_bb)` for wildcards, `cmp = Eq; Branch` for literals, two short-circuit `Ge` / `Le` tests for inclusive ranges, and recursive chains (each alternative threads through a fresh `alt_next_bb`) for or-patterns. The chain-of-Branch shape is the same control flow already used by short-circuit `&&` / `\|\|`, so codegen needs zero new arms across the entire match sub-bundle. **Optional (O.1)**: new `let_ty_from_ast` helper resolves `?T` annotations so `lower_let` allocates the binding local at the correct Optional aggregate type. `wrap_to_optional_if_needed` materialises the implicit `T → ?T` coercion at let-init time — allocates a fresh aggregate temp, writes tag = 1 + payload via `AssignField`, returns `Operand::Local`. `lower_nil_literal` mirrors the shape for `nil`: tag = 0, no payload write (the tag distinguishes empty). `lower_coalesce` emits the 3-block decision: read tag → compare tag == 0 → `Branch` into nil-default-block (lazy RHS evaluation, assign result) or some-payload-block (read field 1 directly into result). Both arms `Goto` a shared join. **Match-on-?T (O.2)**: `lower_pattern_test`'s Literal arm gains an Optional-scrutinee branch — read tag (`Rvalue::Field` with `field_idx = 0`), compare `tag == 0`, `Branch`. New helpers `pattern_value_is_nil` (recognise nil-literal patterns) and `ensure_scrut_local` (materialise an aggregate temp if `scrut_op` isn't already a `Local`). **Error union (O.3)**: `let_ty_from_ast` also resolves `!T` annotations. `wrap_to_optional_if_needed` generalised to `Ty::Optional(_) \| Ty::ErrorUnion(_)` — both share the `{tag, payload}` layout, so the wrap shape is identical. New `lower_must` for `expr!`: read tag, branch on `tag == 0` into a trap block (`Terminator::Unreachable`, which both backends lower as a hardware trap), read payload field on success. **The wrap helper now fires at three sites** — `lower_let`, `lower_return` (uses new `LowerCx::fn_return_ty`), and `lower_call` (consults `typed.sigs` for each callee param). **Comptime (CT.1 + CT.2b)**: new `lower_comptime` pulls the pre-evaluated `CtValue` from `typed.comptime_values` (keyed by NodePtr) and emits `Operand::Const(_)` directly. The comptime block's body is *never* lowered — MIR sees only the constant. Two arms today: `(CtValue::Int(n), Ty::Int(int_ty)) → Const::Int { value: n, ty: int_ty }` (CT.1) and `(CtValue::Bool(b), Ty::Bool) → Const::Bool(b)` (CT.2b — the first comptime materialisation arm to land since CT.1). The catch-all `_` fires when typeck rejected the block (no stash) or when value-vs-type pairing is inconsistent; both fall back to `Const::Error`. **Implicit-tail-return**: `lower_fn` captures `lower_block`'s returned operand; when `body.tail_expr().is_some()` and the trailing block has no terminator, sets `Terminator::Return(tail_operand)`. The existing fall-through (`Return(Unit)` for u0/Error returns; `Unreachable` for non-u0 with no tail and no explicit `return`) stays unchanged for blocks without a tail expression. Literal width flows automatically: `lower_literal` reads `typed.expr_types[NodePtr(lit)]` for the `IntTy`, and typeck's `check_expr(tail, sig.ret, …)` populates that entry with sig.ret. |
+| `gw_typeck` | 1 / 2 | Bidirectional checker. `Ty` enum: `U0`/`Bool`/`Int(IntTy)`/`Float(FloatTy)`/`Rune`/`Class(DefId)`/`Slice(IntTy)`/`Ptr(IntTy)`/**`SentinelPtr { elem: IntTy, sentinel: u64 }` (C.2)**/**`Optional(OptInner)` (O.1)**/**`ErrorUnion(OptInner)` (O.3)** where `OptInner = Int(IntTy) \| Bool` is a closed enum/`Error`. Emits a `TypedModule` with per-CST-node `expr_types`, `path_bindings`, `pat_bindings`, `call_targets`, `sigs`, `classes`. Slice + raw-pointer surface (11b/11c) are FFI-restricted; sentinel-pointer surface (C.2) is *not* — `[*:0]u8` flows through non-extern fn signatures because the producer-side sentinel guarantee gives the safety raw `*T` lacks. **Bidirectional literal narrowing (12d/12h)**: `check_expr` calls `try_narrow_literal` first — bare `IntLit`/`FloatLit`, `Unary(Minus, Literal)`, and `Paren(...)` shapes adopt the expected width when the value fits; out-of-range diagnoses against the literal span. `synth_binop_operands` extends the same rule across binary operators so `n < 2` (with `n: i64`) types cleanly. **`synth_cast` (A.1/A.2)** accepts the full numeric matrix `(Int\|Float, Int\|Float)`; non-numeric pairs reject with `UNSUPPORTED_CONSTRUCT`. **Class-/slice-typed fn params and returns (A.3/A.4)** are accepted via the by-pointer ABI; the `UNSUPPORTED_CONSTRUCT` rejections in `check_fn_signature` were dropped. **C.1 / C.2**: `synth_literal` types `c"..."` as `Ty::SentinelPtr { U8, 0 }`; `ty_assignable` adds the lone coercion `[*:S]T → *T` so the C.1 tracer's `puts(c"hi")` shape works without an explicit cast; missing return type defaults to `Ty::U0` (cleanup #1) instead of diagnosing — error code 307 is retired. **Match (M.1–M.3)**: `synth_match` synthesises the scrutinee, validates each arm's pattern via `check_match_pattern`, unifies arm bodies (first non-Error arm sets the result type, subsequent arms are checked against it). `check_match_pattern` accepts wildcards everywhere, integer-typed literal patterns + integer ranges (`Range`) when scrutinee is `Ty::Int(_)` (re-using the bidirectional narrowing for both bounds), `true`/`false` patterns when scrutinee is `Ty::Bool`, and `Or` patterns by recursing on each alternative. Exhaustiveness rule: every `match` requires either a `_` arm or — for bool scrutinees — both `true` and `false` literal patterns at top-level arms. Identifier patterns and other shapes still diagnose with UNSUPPORTED_CONSTRUCT until later widenings. **Optional (O.1)**: `Type::Opt(inner)` resolves to `Ty::Optional(OptInner)` when inner is integer/bool primitive (other inners reject); `try_narrow_literal` recognises `nil` in any `?T` context and adopts the expected Optional; `synth_literal` for `nil` outside an Optional context now diagnoses TYPE_MISMATCH (used to fall through silently to `Ty::Error` and pass any check); `ty_assignable` adds the lone `T → ?T` coercion edge — value-level distinct (the wrap below) but uniform at the source. Reverse direction (`?T → T`) is rejected; the user must unwrap. `synth_binary` dispatches `??` to `synth_coalesce`: LHS must be Optional, RHS checks against the inner, result type is the inner. **Match-on-?T (O.2)**: `check_match_pattern`'s Literal arm gains an Optional-scrutinee branch — `nil` accepts (records `expr_types[value] = scrut_ty`), other literals reject with a "use `_` to match the some side" hint. New `is_nil_literal` helper recurses through parens. The exhaustiveness rule fires unchanged for Optional scrutinees because they're not bool. **Error union (O.3)**: `Type::ErrorUnion(inner)` resolves to `Ty::ErrorUnion(OptInner)` with the same primitive-only constraint as O.1. `ty_assignable` adds a `T → !T` coercion edge parallel to `T → ?T`; `?T` and `!T` stay type-distinct (no exchange in either direction). New `synth_must` for `expr!`: LHS must be `Ty::ErrorUnion(_)`, result is the unwrapped inner. **Per-file scoping (F.3)**: `Cx` gains a `current_file: FileId` field set by `check_fn_body` from the fn's syntax span and by `check_synthetic_main_body` from the module's. Three name-lookup sites (`synth_path`'s top-level fn check, `synth_struct_lit`'s class lookup, `synth_call`'s callee resolution) switch from `cx.tm.resolved.lookup(name)` to `cx.tm.resolved.lookup_in_file(cx.current_file, name)`; `resolve_type`'s class-lookup site reads the file from the path's syntax span directly. **Comptime (CT.1 + CT.2a + CT.2b + CT.2c + CT.2d + CT.2e)**: new `synth_comptime` synthesises the inner block's type (so subexpressions populate `expr_types`), then runs `gw_comptime::eval_comptime_block`. CT.2d's `if`/`else` flows through the existing `synth_if` path — both arms synthesise to confirm their types match — without any CT.2d-specific typeck change; the divergence between typeck's walk-both-arms shape and the evaluator's walk-one-arm shape is contained inside `gw_comptime::eval_if`. CT.2e similarly adds no typeck-side code — `synth_binary`'s `AmpAmp` / `PipePipe` arm already eagerly synthesises both operands (both must be `Ty::Bool`), and the runtime / comptime divergence ("evaluate both" vs "short-circuit") is contained inside `gw_comptime::eval_logical_short_circuit`. On success, the resulting `CtValue` is stashed in new `TypedModule::comptime_values: FxHashMap<NodePtr, CtValue>`; on failure, new error code E0314 `COMPTIME_EVAL_FAILED` is pushed at the offending span. CT.1 realises integer-valued comptime blocks only; **CT.2b** widens the inner-type gate to `Ty::Int(_) | Ty::Bool` so the new ordering / equality comparisons (which produce `Ty::Bool`) flow through the same materialisation path. Wider inners (float, classes, …) still reject with `UNSUPPORTED_CONSTRUCT`, naming the supported set ("`int` and `bool` blocks only"). **CT.2a** adds two error-message arms in `comptime_error_message` for the new `EvalError::IntegerOverflow` and `EvalError::DivisionByZero` variants — user-facing strings "comptime arithmetic overflowed `i128` during evaluation" and "comptime evaluation attempted division or modulo by zero" route through the same E0314 diagnostic. **CT.2c** adds a `TypeckBindingEnv<'a, 'tm>` adapter that borrows the typed module's `pat_bindings` / `path_bindings` maps and exposes them through `gw_comptime`'s `BindingEnv` trait, converting `BindingId` to its inner `u32` at the trait boundary. The adapter borrow is scoped so it releases before `synth_comptime` mutates `comptime_values`. The crate also gains a `pub use gw_ast::cst::NodePtr` re-export (NodePtr moved to `gw_ast::cst` in CT.2c — see the `gw_ast` row); existing `use gw_typeck::NodePtr` consumers (like `gw_mir`) see no API change. **Implicit-tail-return (replaces the CT.1 E0315 guard rail) + block-like-tail discard**: `check_fn_body`'s post-`check_block` arm now synthesises the tail's type when `body.tail_expr()` is set; if `tail_ty == Ty::U0` and `sig.ret` is non-u0, the tail is discarded (treated as if it were an `ExprStmt`) to preserve the `25_if_else.gw` / `27_else_if.gw` / `163_print_padding.gw` shapes whose if-expression types as u0 because all arms `return`. Otherwise it calls `check_expr(tail, sig.ret, &mut cx)` — the bidirectional narrowing already running for `let` initialisers and `return` operands (decision #16) handles literal-width adoption (`fn f() -> i64 { 42 }`) without new typeck machinery. A non-matching tail type (e.g. `fn f() -> u0 { 42 }`) diagnoses as the ordinary `TYPE_MISMATCH` (E0300). The CT.1-era E0315 `TAIL_EXPR_IN_FN_BODY` constant is retired (comment-only in `ec`) — the regular type-mismatch path carries the user-facing fix without special-casing. The bare-Expr surface landed first (commit `579c4f0`); the block-like-tail extension (commit `9ac51a1`) covers `KwIf` / `KwWhile` / `KwFor` / `LBrace` tails via the parser widening (see `gw_parse` row), and the divergent-tail discard rule ships in the same sub-bundle. CT.2d's comptime paren-wrap workaround is retired as a second consequence of the parser change. |
+| `gw_mir` | 1 / 2 | CFG of basic blocks; primitive locals + aggregate stack-slot locals (class + slice); `Assign`/`AssignField` statements; `Use`/`BinOp`/`UnOp`/`Field`/`Cast` rvalues; `Goto`/`Branch`/`Return`/`Call`/`Unreachable` terminators. Loop-target stack for break/continue. `lower_for` desugar. `Const::DataAddr` + program-level `string_literals` table for `.rodata` payloads (11b). Implicit Print at stmt-position string lits desugars to `write(1, slice.data, slice.len)`; auto-injects `extern fn write` if user didn't declare one (11c). **Short-circuit `&&` / `\|\|` (12b)**: `lower_short_circuit` emits a 3-block control-flow shape (rhs-eval / short-circuit / join) and bypasses `lower_binary` so the RHS is only evaluated when the LHS doesn't determine the result. **`Rvalue::Cast` (A.1/A.2)** carries `kind: CastKind`, `operand`, `src_ty`, `dst_ty`; the closed `CastKind` enum has 7 variants, each maps to one Cranelift op. `select_cast_kind` factors the kind selection out of `lower_cast`. **`def_to_fn` fix (A.3)**: pre-A.3 the map stored each def's position in `resolved.defs` (including class defs); A.3 only counts `Fn`/`SyntheticMain` defs when assigning indices, matching the order `functions` is populated. **C.1 / C.2**: `Const::CStrAddr(CStrLitId)` + program-level `cstring_literals` table parallel to `string_literals` (no shared dedup keys — slice payloads and c-string payloads carry different semantics). `lower_cstring_literal` interns the decoded bytes (no NUL terminator stored — codegen appends it) and returns the operand directly without materialising a slice aggregate. **Match (M.1–M.3)**: `lower_match` allocates `body_bb` + `next_bb` per arm, calls the recursive `lower_pattern_test` helper, lowers the body in `body_bb`, restores cursor to `next_bb` for the next arm. `lower_pattern_test` emits `Goto(body_bb)` for wildcards, `cmp = Eq; Branch` for literals, two short-circuit `Ge` / `Le` tests for inclusive ranges, and recursive chains (each alternative threads through a fresh `alt_next_bb`) for or-patterns. The chain-of-Branch shape is the same control flow already used by short-circuit `&&` / `\|\|`, so codegen needs zero new arms across the entire match sub-bundle. **Optional (O.1)**: new `let_ty_from_ast` helper resolves `?T` annotations so `lower_let` allocates the binding local at the correct Optional aggregate type. `wrap_to_optional_if_needed` materialises the implicit `T → ?T` coercion at let-init time — allocates a fresh aggregate temp, writes tag = 1 + payload via `AssignField`, returns `Operand::Local`. `lower_nil_literal` mirrors the shape for `nil`: tag = 0, no payload write (the tag distinguishes empty). `lower_coalesce` emits the 3-block decision: read tag → compare tag == 0 → `Branch` into nil-default-block (lazy RHS evaluation, assign result) or some-payload-block (read field 1 directly into result). Both arms `Goto` a shared join. **Match-on-?T (O.2)**: `lower_pattern_test`'s Literal arm gains an Optional-scrutinee branch — read tag (`Rvalue::Field` with `field_idx = 0`), compare `tag == 0`, `Branch`. New helpers `pattern_value_is_nil` (recognise nil-literal patterns) and `ensure_scrut_local` (materialise an aggregate temp if `scrut_op` isn't already a `Local`). **Error union (O.3)**: `let_ty_from_ast` also resolves `!T` annotations. `wrap_to_optional_if_needed` generalised to `Ty::Optional(_) \| Ty::ErrorUnion(_)` — both share the `{tag, payload}` layout, so the wrap shape is identical. New `lower_must` for `expr!`: read tag, branch on `tag == 0` into a trap block (`Terminator::Unreachable`, which both backends lower as a hardware trap), read payload field on success. **The wrap helper now fires at three sites** — `lower_let`, `lower_return` (uses new `LowerCx::fn_return_ty`), and `lower_call` (consults `typed.sigs` for each callee param). **Comptime (CT.1 + CT.2b)**: new `lower_comptime` pulls the pre-evaluated `CtValue` from `typed.comptime_values` (keyed by NodePtr) and emits `Operand::Const(_)` directly. The comptime block's body is *never* lowered — MIR sees only the constant. Two arms today: `(CtValue::Int(n), Ty::Int(int_ty)) → Const::Int { value: n, ty: int_ty }` (CT.1) and `(CtValue::Bool(b), Ty::Bool) → Const::Bool(b)` (CT.2b — the first comptime materialisation arm to land since CT.1). The catch-all `_` fires when typeck rejected the block (no stash) or when value-vs-type pairing is inconsistent; both fall back to `Const::Error`. **Implicit-tail-return + block-like-tail discard**: `lower_fn` captures `lower_block`'s returned operand; when `body.tail_expr().is_some()` and the trailing block has no terminator, sets `Terminator::Return(tail_operand)`. The block-like-tail sub-bundle (commit `9ac51a1`) adds a divergent-tail discard step that mirrors typeck's rule — reads the tail expression's type from `typed.expr_types[NodePtr(tail)]`; if `Ty::U0` while `sig.ret` is non-u0 (and not `Ty::Error`), drops the lowered operand instead of installing it as `Return`. The existing fall-through (`Return(Unit)` for u0/Error returns; `Unreachable` for non-u0 with no tail and no explicit `return`) then governs, which is correct for divergent tails where the if's join is unreachable in the CFG. Literal width flows automatically: `lower_literal` reads `typed.expr_types[NodePtr(lit)]` for the `IntTy`, and typeck's `check_expr(tail, sig.ret, …)` populates that entry with sig.ret. |
 | `gw_comptime` | 2 | **CT.1 + CT.2a + CT.2b + CT.2c + CT.2d + CT.2e** (CT.2 closed): tree-walking interpreter on the typed AST. Public surface: `CtValue::{Int(i128), Bool(bool)}` (closed enum; wider variants ride CT.3+), `BindingEnv<'a>` trait (`lookup_pat` / `lookup_path` returning `Option<u32>`), `NoBindings` zero-sized resolver for shapes with no let / path-to-local references, `EvalCx<'sm, 'env, 'a>` / `Budget` (architecture E.3 caps: 10⁹ steps, 1024 depth), `EvalError::{Unsupported{span, what}, BudgetExceeded, StackOverflow, BadIntLiteral, IntegerOverflow(Span), DivisionByZero(Span)}`, `eval_comptime_block(Block, &mut EvalCx) -> Result<CtValue, EvalError>`. CT.1 accepts integer-valued blocks with zero statements and a tail expression of shape `IntLit / Paren(expr) / Unary(Minus, expr) / Block(of-same)`. **CT.2a** extends the tail shape to include `Binary(lhs, op, rhs)` for `op ∈ {Plus, Minus, Star, Slash, Percent}` over `CtValue::Int` operands. Arithmetic flows through `i128::checked_{add,sub,mul,div,rem}` — overflow raises `IntegerOverflow(span)`; `Slash`/`Percent` short-circuit on `rhs == 0` to `DivisionByZero(span)` so the two failure modes never confuse diagnostically. **CT.2b** adds the `CtValue::Bool(bool)` arm; `eval_literal` recognises `KwTrue` / `KwFalse`; `eval_binary` reorganises around op-first dispatch with three groups: arithmetic (CT.2a), integer ordering (`Lt, LtEq, Gt, GtEq`), and equality (`EqEq, BangEq`, overloaded for both `(Int, Int)` and `(Bool, Bool)` operand pairs — mixed pairs reject explicitly rather than inventing a dominant-type rule). New `expect_int(v, span)` canonical operand-type helper routes arithmetic and ordering ops through a single rejection site; `Unary(Minus, …)` also goes through it. **CT.2c** widens `EvalCx` to carry a `&dyn BindingEnv<'a>` resolver and a dense `Vec<Option<CtValue>>` locals env indexed by `BindingId.0 as usize` (decision Q5 ⇒ option (a) — see decision #50). `eval_comptime_block_inner` walks block statements: `Stmt::Let(l)` evaluates the init, looks up the pattern's binding index via the resolver, and stores the value at that index via `store_local`. New `Expr::Path(p)` arm in `eval_expr` reads `load_local(idx)` for the resolved binding index. **CT.2d** adds an `Expr::If(i)` arm in `eval_expr` calling a new `eval_if` function: condition is evaluated and pinned to `CtValue::Bool` via the new `expect_bool(v, span)` helper (parallels `expect_int` from decision #49), then exactly one arm runs based on the boolean — the un-taken arm is never visited. `else if` chains fall out naturally because `IfExpr::else_branch` returns an `Expr` (either `Block` for terminal `else` or `IfExpr` for chained `else if`), both already dispatched by `eval_expr`. **CT.2e** adds lazy short-circuit `&&` / `||`: `eval_binary` intercepts `SyntaxKind::AmpAmp` / `PipePipe` *before* its eager RHS eval and routes to a new `eval_logical_short_circuit(op, lhs, rhs, span, cx)` helper. The helper evaluates the LHS, pins to bool via `expect_bool`, short-circuits if `l == short_circuit_value` where `short_circuit_value = matches!(op, SyntaxKind::PipePipe)` (the operator's identity element under boolean conjunction / disjunction — `false` for `&&`, `true` for `||`). Otherwise evaluates the RHS and returns its bool value. Mirrors decision #15's runtime 3-block CFG (`lower_short_circuit`) compressed into one Rust function. Bool ordering (`true < false`) still rejects with `Unsupported` since `expect_int` rejects bool operands of ordering ops. Materialisation-time narrowing (when the `i128` result doesn't fit the surrounding runtime `IntTy`) is a separate concern handled in `gw_typeck` / MIR. `parse_int_literal` mirrors `gw_mir`'s decoder so source-form decoding (hex / binary / octal / decimal-with-underscores) stays in lockstep across the two consumers. The crate depends only on `gw_ast` + `gw_lex`; per architecture Part B.11 / E.1 the Phase-5 replacement (stack VM on MIR) keeps the same on-disk semantics (`CtValue`, sandbox budgets, error variants). |
 | `gw_codegen_fast` | 1 / 2 | Cranelift-backed (placeholder until Phase 7 TPDE port). Aggregate (class + slice) layouts → stack slots; field reads/writes → stack_load/stack_store; aggregate-aggregate assigns → field-by-field copy. String literals materialised via `module.declare_data` + `define_data_object` under `__gw_str_<i>` symbols (11b). `*T` raw pointers lower as pointer-sized scalars (11c). **Float comparisons (12a)**: `lower_binop` branches on `ty.is_float()` for `Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge` — floats use `fcmp` with the matching `FloatCC`, ints keep `icmp`. **Cast lowering (A.1/A.2)**: `Rvalue::Cast` arm reads operand at `clif_ty(src_ty)` and applies one Cranelift op per `CastKind` — `sextend`/`uextend`/`ireduce` for ints, `fcvt_from_sint`/`fcvt_from_uint` and saturating `fcvt_to_*_sat` for int↔float, `fpromote`/`fdemote` for floats. Same-width `*Bitcast` variants need no instruction. **Aggregate-by-pointer ABI (A.3/A.4)**: `make_signature` prepends a hidden out-pointer for aggregate returns and substitutes pointer-typed `AbiParam` for aggregate params. `define_fn` defers the entry-block switch until the lower-block loop's first iteration to keep Cranelift's "fill before switching" rule satisfied; aggregate params copy in via `copy_aggregate_from_ptr`, and `Terminator::Return` for an aggregate-returning fn copies out through `copy_aggregate_to_ptr`. `Terminator::Call` prepends `stack_addr(dst_slot)` for aggregate returns and substitutes `stack_addr` for aggregate args. **C.1**: parallel `__gw_cstr_<i>` rodata pass — payload is `bytes ++ "\0"`; `Const::CStrAddr` lowers via `module.declare_data_in_func` + `ins.global_value` exactly like `Const::DataAddr`. **C.2**: explicit `Ty::SentinelPtr { .. }` arms in `clif_ty` / `primitive_size_align` route to pointer-width — same shape as `Ty::Ptr`. **O.1 / O.3**: `is_aggregate_ty` extended to include `Ty::Optional(_)` and `Ty::ErrorUnion(_)`; `aggregate_layout` / `aggregate_field_ty` route both through the shared `optional_layout` formula (tag at offset 0 / 1 byte; payload at the inner's natural alignment; total size aligned to inner align). Local-allocation site + `lower_assign_stmt`'s aggregate-dst branch now both go through `is_aggregate_ty` — fixed two inline `matches!(..., Class \| Slice)` patterns from O.1 that silently routed Optional locals into the wrong storage and the wrong assign path (caught at the first dual-backend run). |
 | `gw_codegen_llvm` | 13 / 2 | LLVM-18-backed via `inkwell` (B.1–B.5). Same `MirProgram → object bytes` contract as `gw_codegen_fast` — driver picks at `--backend=fast\|llvm`. Storage: alloca-per-local in the entry block (clang `-O0` style), `[N x i8]` allocas for aggregates with alignment bumped to the layout's max-field align via `InstructionValue::set_alignment`. Field addressing via byte-offset GEP through `i8` (opaque pointers; no struct types declared to LLVM). Bool stays at LLVM `i1` end-to-end (no i8 storage adapter). Float comparisons use ordered predicates (`OEQ`/`OLT`/etc.); float-→int casts route through the saturating `llvm.fpto{si,ui}.sat` intrinsics for Rust ≥ 1.45 / Cranelift parity. `Const::Float` lowers via `build_bit_cast(int_const, float_ty)` to preserve NaN payloads (a `const_float(f64)` round-trip would lose them on the F32 path). String literals materialise as one private `__gw_str_<i>` global per `MirProgram::string_literals` entry; `Const::DataAddr(id)` returns the global's address as `ptr`. Aggregate ABI: hidden out-pointer for aggregate returns; by-pointer for aggregate user params. `sret`/`byval` attributes intentionally omitted — corpus aggregates flow only between GW fns, plain-`ptr` agrees with Cranelift's manual `stack_addr` convention end-to-end. A small `build.rs` adds Homebrew's `lib` prefix to the linker search path on macOS so LLVM-18's system-libs (zstd, ffi, xml2, curses) resolve without `RUSTFLAGS` rituals. **C.1**: parallel pass for c-string globals — one private `__gw_cstr_<i>` per `MirProgram::cstring_literals` entry, payload `bytes ++ "\0"`; `Const::CStrAddr` returns the global's `as_pointer_value()`. **C.2**: explicit `Ty::SentinelPtr { .. }` arm in `llvm_basic_type` routes to opaque `ptr` — agrees with Cranelift's bit-exact output across all three c-string corpus programs. **O.1 / O.3**: `is_aggregate_ty` / `aggregate_layout` / `aggregate_field_ty` extended for `Ty::Optional(_)` and `Ty::ErrorUnion(_)` — same formula via the shared `optional_layout` helper, so the by-pointer ABI agrees byte-for-byte across backends. **O.3 also fixed `make_fn_type`**: the aggregate-return arm previously had a hardcoded allow-list (`Class \| Slice`) that excluded the new variants; now routes through `is_aggregate_ty` so future aggregate variants auto-handle. |
@@ -186,6 +196,7 @@ Each increment shipped one or more corpus programs and a single commit.
 | F.2 | `mod` + `use` declarations (opt-in modules) | `6969f64` | +1 multi-file project (03) | parser `parse_mod_decl` and `parse_use_decl`; AST `Item::Mod(ModDecl)` and `Item::Use(UseDecl)` promoted from `Stub` with `name()` accessors; resolver `process_module` puts items from `mod foo;` files in `module_tables[foo]` instead of the global flat `by_name`; F.2 globally flattens use'd module items into `by_name` (later refined in F.3); two new error codes E0204 UNKNOWN_MODULE and E0205 DUPLICATE_MOD; renamed fail fixture `f02_unsupported_mod.gw` → `f02_malformed_mod.gw` with refreshed expected diagnostics; +5 resolver unit tests + 1 corpus project (`03_mod_use`) | 0 |
 | F.3 | per-file `use` scoping | `aab3f0b` | +1 multi-file project (04) | `ResolvedModule` gains `file_scopes: FxHashMap<FileId, FxHashMap<String, DefId>>`; new `lookup_in_file(file, name)` consults the per-file scope, falling back to flat `by_name` for AST-test callers without a file context; resolver post-pass builds each file's effective scope = flat pool + own items + items from modules the file `use`s; conflicts within a single file's scope diagnose as DUPLICATE_DEFINITION; F.2's global-import code path is gone — `by_name` is no longer enriched by `use` decls; `register_fn` / `register_class` return `(name, DefId)` so `process_module` can record file-local items; typeck `Cx` gains `current_file: FileId` field set by `check_fn_body` and `check_synthetic_main_body`; four name-lookup sites switch from `cx.tm.resolved.lookup` to `lookup_in_file(cx.current_file, name)`; +1 resolver unit test (`use_only_visible_in_declaring_file`) + 1 corpus project (`04_use_per_file`) | 0 |
 | impl-tail-ret | implicit-tail-return for bare-expression tails (drops E0315; typeck checks tail against declared return type; MIR wires tail operand into `Terminator::Return`) | `579c4f0` | +4 phase1 fixtures (`200_tail_return_arith.gw` → 7, `201_tail_return_literal.gw` → 42, `202_tail_return_let_then_path.gw` → 22, `203_tail_return_widening.gw` → 100) | `gw_typeck` `check_fn_body` replaces the E0315 emission with `check_expr(tail, sig.ret, &mut cx)` — the bidirectional narrowing already running for `let` initialisers and `return` operands (decision #16) handles literal-width adoption (`fn f() -> i64 { 42 }`) without new typeck machinery. A non-matching tail type (e.g. `fn f() -> u0 { 42 }`) diagnoses as the ordinary `TYPE_MISMATCH` (E0300). The CT.1-era `ec::TAIL_EXPR_IN_FN_BODY` (E0315) constant is retired (replaced by a comment-only marker in `ec`). `gw_mir` `lower_fn` captures `lower_block`'s returned operand; if `body.tail_expr().is_some()` and the trailing block has no terminator, sets `Terminator::Return(tail_operand)`. The existing fall-through cases (u0/Error → `Return(Unit)`; non-u0 with no tail → `Unreachable`) stay unchanged for blocks without a tail expression. Literal width flows automatically: `lower_literal` reads `typed.expr_types[NodePtr(lit)]` for the `IntTy`, and typeck's `check_expr(tail, sig.ret, …)` populates that entry with sig.ret. **Scope deliberately limited to bare-Expr tails** (CT.1's `parse_expr_stmt` widening); `parse_stmt`'s block-like-statement arm (`KwIf` / `KwWhile` / `KwFor` / `LBrace`) stays unchanged, so `fn classify(x: i32) -> i32 { if x < 0 { -1 } else { 1 } }` still requires explicit `return`, and CT.2d's comptime paren-wrap workaround stays in place. The parser widening + divergent-tail handling rides a separate future sub-bundle so the corpus-regression handling (the `25_if_else.gw` / `27_else_if.gw` / `163_print_padding.gw` shapes where the if's u0 tail-type would mismatch a non-u0 fn return) can be designed separately — the natural answer is "discard u0 tails when fn returns non-u0" but it's deferred for clean staging. The two old E0315 reject tests in `gw_typeck` are replaced with three new tests: two positive (`fn_body_with_int_tail_accepts`, `fn_body_with_arith_tail_accepts`) and one negative (`fn_body_with_tail_type_mismatch_rejects` asserting TYPE_MISMATCH for `fn f() -> u0 { 42 }`). The pre-existing `_clean` tests stay unchanged. | 0 |
+| block-like-tail | block-like-tail parser widening + divergent-tail discard (widens `parse_stmt`'s block-like arm to leave a bare `Expr` at the enclosing `}`; typeck discards u0 tails when fn returns non-u0; MIR mirrors via `expr_types` lookup) | `9ac51a1` | +3 phase1 fixtures (`204_tail_return_if.gw` → 30, `205_tail_divergent_if.gw` → 22, `206_tail_while_u0.gw` → 0) + 1 phase2_comptime tracer (`ct2d_if_no_paren.gw` → 7, retiring CT.2d's paren-wrap workaround) | `gw_parse` `parse_stmt`'s `KwIf | KwWhile | KwFor | LBrace` arm now mirrors `parse_expr_stmt`'s tail-expression checkpoint trick (CT.1 pattern): parses the expression at a checkpoint and wraps in `ExprStmt` only when the next token is not `RBrace`. At the enclosing block's `}`, the bare `Expr` becomes the block's `tail_expr`. Top-level statements close at `Eof` (not `RBrace`), so module-level shapes are unchanged — only fn-body / nested-block tails are affected. `gw_typeck` `check_fn_body`'s tail handling extends from CT.1's bare-Expr path to all `body.tail_expr()` shapes: synthesise the tail's type; if it's `Ty::U0` and `sig.ret` is non-u0, treat the tail as if it were an `ExprStmt` (discard, no diagnostic). Otherwise run the existing bidirectional `check_expr(tail, sig.ret, &mut cx)`. GW doesn't model `!` (never) explicitly; this rule covers the practical cases — the canonical `if c { return … } else { return … }` whose if-expression naturally types as u0. `gw_mir` `lower_fn` mirrors typeck's discard rule: reads the tail expression's type from `typed.expr_types[NodePtr(tail)]`; if `Ty::U0` while `sig.ret` is non-u0 (and not `Ty::Error`), drops the lowered operand instead of installing it as `Terminator::Return` — the existing `Unreachable` fallback governs, which is correct for divergent tails where the if's join is unreachable in the CFG. Four parse snapshots refreshed (`047_if`, `048_if_else`, `049_else_if`, `050_while`) — the trailing `IfExpr` / `WhileExpr` now appears as a direct child of `Block` (the tail expression) instead of wrapped in `ExprStmt`; the `source:` field also updates from `arsenal_parse` (rename-pass leftover) to `gw_parse`. +3 `gw_typeck` unit tests (`fn_body_with_if_tail_value_accepts`, `fn_body_with_divergent_if_tail_accepts`, `fn_body_with_while_tail_in_u0_accepts`). The existing corpus programs `25_if_else.gw`, `27_else_if.gw`, `163_print_padding.gw` continue to pass — confirms the divergent-tail discard rule preserves their pre-widening semantics. One parser change, two unblocked surfaces — fn-body block-like tails AND CT.2d's comptime paren-wrap workaround (`comptime { if … }` no longer needs the synthetic paren). | 0 |
 | CT.2e | comptime short-circuit `&&` / `||` (lazy RHS evaluation, mirrors decision #15's runtime lowering) | `9d062d3` | +5 phase2_comptime tracers (`ct2e_and_short_circuit.gw` → 0, `ct2e_or_short_circuit.gw` → 1, `ct2e_and_eager_rhs.gw` → 5, `ct2e_or_eager_rhs.gw` → 9, `ct2e_short_circuit_guards_let.gw` → 0) | `gw_comptime` `eval_binary` intercepts `SyntaxKind::AmpAmp` / `PipePipe` *before* its eager RHS eval and routes to the new `eval_logical_short_circuit(op, lhs, rhs, span, &mut EvalCx) -> Result<CtValue, EvalError>` helper. The helper evaluates LHS first, pins to bool via `expect_bool`, short-circuits if `l == matches!(op, SyntaxKind::PipePipe)` (the operator's identity element under boolean conjunction / disjunction: `false` for `&&`, `true` for `||`). Otherwise evaluates RHS and returns its bool value. The pattern mirrors decision #15's runtime 3-block CFG (`lower_short_circuit`) compressed into one Rust function since the evaluator owns its own control flow rather than constructing MIR blocks. **Closes CT.2 entirely.** Bool ordering (`true < false`) still rejects via `expect_int`; wildcard `let _` patterns still reject. `gw_typeck` gains no CT.2e-specific code — the existing `synth_binary` `AmpAmp` / `PipePipe` arm eagerly synthesises both operands as `Ty::Bool`, and the eager-vs-lazy divergence is contained inside `gw_comptime`. +7 `gw_comptime` unit tests covering: `&&` eager path (LHS=true); `&&` short-circuit on false LHS (the canonical regression — RHS contains `1 / 0`); `||` eager path (LHS=false); `||` short-circuit on true LHS; **symmetric error-propagation tests** that catch asymmetric "always short-circuit" miscompiles — `&&` with LHS=true MUST propagate the RHS's `DivisionByZero`; same for `||` with LHS=false; non-bool LHS rejects via `expect_bool`. The corpus's `ct2e_and_short_circuit` and `ct2e_or_short_circuit` fixtures are end-to-end mirrors of the short-circuit unit tests; `ct2e_and_eager_rhs` and `ct2e_or_eager_rhs` mirror the eager-path tests; `ct2e_short_circuit_guards_let` exercises the canonical "guard before divide" composition with CT.2c locals (`let n = 0; n != 0 && (10 / n > 5)` — the LHS=false guards the RHS that would otherwise raise `DivisionByZero`). | 0 |
 | CT.2d | comptime `if`/`else` (branch-eval discipline, only the taken arm evaluates) | `a03c361` | +5 phase2_comptime tracers (`ct2d_if_true.gw` → 7, `ct2d_if_false.gw` → 99, `ct2d_else_if_chain.gw` → 22, `ct2d_un_taken_safe.gw` → 5, `ct2d_if_with_let.gw` → 20) | `gw_comptime` `eval_expr` gains an `Expr::If(i)` arm calling new `eval_if(IfExpr, span, &mut EvalCx) -> Result<CtValue, EvalError>`. The condition is evaluated via the new `expect_bool(v, span)` helper (parallel to CT.2b's `expect_int`, decision #49) and exactly one arm runs depending on the boolean — the un-taken arm is *never visited*, so any latent side effect inside it (a `1 / 0`, a `let`-init that would otherwise fail, a non-arithmetic op that would otherwise raise `Unsupported`) stays inert. **First comptime sub-bundle where the evaluator's control flow shape diverges from the typed AST's syntactic walk** — typeck's `synth_if` synthesises both arms to confirm their types match; the evaluator walks one. The divergence is contained inside `eval_if` and has no typeck-side counterpart. Else-if chains fall out naturally because `IfExpr::else_branch` returns an `Expr` (either a `Block` for terminal `else { ... }` or another `IfExpr` for chained `else if`), and both shapes are already dispatched by `eval_expr` — chained else-if recurses through `eval_if` via the normal expression match. An `if` without `else` used as a value-producing expression reaches a defensive `Unsupported` arm; typeck rejects this shape before the evaluator runs (the if would be `Ty::U0` and the CT.2c inner-type gate already rejects U0 comptime blocks), but the defensive message keeps the failure mode clear. `gw_typeck` gains no CT.2d-specific code — the existing `synth_if` and `synth_block` paths handle the typed-AST side. +7 `gw_comptime` unit tests covering: if-true takes then arm; if-false takes else arm; un-taken else arm with `1 / 0` doesn't evaluate (the canonical assertion of branch-eval discipline); the symmetric un-taken-then-arm variant; else-if chain dispatch; if with bool result type; integer condition rejects via `expect_bool`. The corpus's `ct2d_un_taken_safe` fixture is the end-to-end mirror of the unit test, exercising the same un-taken-arm-side-effect invariant through both backends. | 0 |
 | CT.2c | comptime let-bindings + locals env (`BindingEnv` trait, dense `Vec<Option<CtValue>>` indexed by `BindingId.0`, `NodePtr` moved to `gw_ast::cst`) | `c0d4540` | +4 phase2_comptime tracers (`ct2c_let_simple.gw` → 7, `ct2c_let_chain.gw` → 3, `ct2c_let_shadowing.gw` → 2, `ct2c_let_then_compare.gw` → 4) | **`NodePtr` moved from `gw_typeck` to `gw_ast::cst`** so `gw_comptime` can key into typeck's side-tables without depending on `gw_typeck` (the cycle that would otherwise form: `gw_typeck` → `gw_comptime` → `gw_typeck`). `gw_typeck` keeps a `pub use gw_ast::cst::NodePtr` so existing import paths (e.g. `gw_mir`'s `use gw_typeck::{…, NodePtr, …}`) work unchanged. `gw_comptime` gains a `BindingEnv<'a>` trait with `lookup_pat(NodePtr<'a>) -> Option<u32>` + `lookup_path(NodePtr<'a>) -> Option<u32>` — abstract CST-node → binding-index lookup so the evaluator stays decoupled from `gw_typeck`'s `BindingId` newtype. Zero-sized `NoBindings` resolver provided for CT.1/CT.2a/CT.2b shapes and unit tests. `EvalCx` widened to `EvalCx<'sm, 'env, 'a>` carrying `&dyn BindingEnv<'a>` plus a `Vec<Option<CtValue>>` locals env indexed by `BindingId.0 as usize`. New helpers `store_local(idx, value)` (grows the vec as needed) and `load_local(idx, span)` (returns Unsupported on uninitialised reads — defensive; typeck's name-resolution should make use-before-`let` unreachable). `eval_comptime_block_inner` walks statements: `Stmt::Let` evaluates the init, looks up the pattern's binding index via the resolver, stores. `Stmt::Expr` / `Stmt::Stub` / `Stmt::Error` reject with span-specific Unsupported. New `Expr::Path(p)` arm in `eval_expr` reads from locals via the resolved binding index. `gw_typeck` adds a `TypeckBindingEnv<'a, 'tm>` adapter that borrows the binding maps and converts `BindingId.0` at the trait boundary; borrow scope released before `comptime_values.insert`. +2 net new `gw_comptime` unit tests (`let_without_resolver_rejects` renamed from the old `statement_in_block_is_unsupported`; new `path_without_resolver_rejects` covers the `Expr::Path` rejection arm). | 0 |
@@ -491,9 +502,9 @@ during Phase 1 + the CT.x design phase.
 
 The remaining Phase-2 work is CT.3 (wider types in the
 `CtValue` enum — `Float`, strings, classes, optionals as the
-corpus motivates) and implicit-tail-return (which also
-unblocks the paren-wrapping workaround that CT.2d's corpus
-documents). Both ride later sub-bundles.
+corpus motivates). The block-like-tail parser widening + the
+divergent-tail discard rule landed in commit `9ac51a1`,
+retiring the CT.2d paren-wrap workaround in the same change.
 
 **Implicit-tail-return (bare-Expr scope) lands cleanly.**
 Pre-bundle prediction by the 12/A.x heuristic was ~1:
@@ -529,7 +540,7 @@ shape works end-to-end. **The Phase 2 CT.1 prediction
 "latent-shape risk from parser side-effects" is now
 fully discharged.**
 
-### What 268 corpus programs cover
+### What 272 corpus programs cover
 
 - Phase-0 syntax: every TokenKind variant, every operator precedence
   level, every supported statement form.
@@ -695,16 +706,17 @@ fully discharged.**
   `op ∈ {+, -, *, /, %, <, <=, >, >=, ==, !=, &&, ||}`
   (equality overloaded for both int and bool operands;
   `&& / ||` short-circuit lazily; bool ordering is deferred).
-  `if`/`else` at statement position inside a comptime block
-  still wraps in `ExprStmt` (parser-side limitation; see the
-  paren-wrapping workaround in the corpus design notes below),
-  so all CT.2d fixtures with a top-level `if` inside `comptime
-  { ... }` paren-wrap it. The CT.2e fixtures don't need
-  paren-wrapping because the surrounding `if` is *outside*
-  `comptime`, leaving the binary `&&` / `||` as the block's
-  tail expression. Wildcard `_` patterns in `let`, bool
-  ordering, and expression statements still reject with
-  `EvalError::Unsupported`. The 62-program lex+parse snapshot corpus also
+  `if`/`else` at the comptime block's tail is now accepted
+  directly without paren-wrapping (block-like-tail widening,
+  commit `9ac51a1`); the historical CT.2d paren-wrap workaround
+  is retired and the `ct2d_if_no_paren.gw` fixture pins the new
+  shape. The pre-existing CT.2d paren-wrapped fixtures still
+  parse fine — the new tail shape is additive. CT.2e fixtures
+  did not need paren-wrapping even pre-widening because the
+  surrounding `if` was *outside* `comptime`, leaving the binary
+  `&&` / `||` as the block's tail expression. Wildcard `_`
+  patterns in `let`, bool ordering, and expression statements
+  still reject with `EvalError::Unsupported`. The 62-program lex+parse snapshot corpus also
   has a `062_comptime_tail_expr.gw` fixture (from CT.1) locking
   the `ComptimeExpr` CST shape *and* the bare-Expr tail child
   inside the comptime block; the outer fn body still uses
@@ -826,8 +838,8 @@ Exit code: 1. The match desugars to a chain of compare+branch
 sequences — two range tests (each two compares) for the first arm,
 three equality tests for the second, one equality test for `-1`,
 and a final `Goto` for the wildcard. Both backends produce
-bit-exactly the same value across all 268 single-file corpus
-programs (245 phase1 + 23 phase2_comptime) + 4 multi-file
+bit-exactly the same value across all 272 single-file corpus
+programs (248 phase1 + 24 phase2_comptime) + 4 multi-file
 projects.
 
 The Phase-2 `?T` surface (O.1) brings the canonical optional shape:
@@ -895,10 +907,10 @@ followed by a tail expression of shape `IntLit / KwTrue /
 KwFalse / Path / Paren(expr) / Unary(Minus, expr) /
 Block(of-same) / Binary(lhs, op, rhs) / IfExpr` for `op ∈
 {+, -, *, /, %, <, <=, >, >=, ==, !=, &&, ||}` (`&&` / `||`
-short-circuit lazily). `if` at statement position inside a
-comptime block still requires paren-wrapping (`comptime {
-(if c { a } else { b }) }`) until the parser widening that
-implicit-tail-return needs lands.
+short-circuit lazily). `if` at the comptime block's tail now
+parses directly without paren-wrapping (`comptime { if c { a }
+else { b } }`) following the block-like-tail widening — the
+historical CT.2d paren-wrap workaround is retired.
 
 ### Driver UX
 
@@ -958,7 +970,6 @@ gw 0.0.1
 | Slice-typed class fields | Typeck rejects | Class layout would need to embed the slice's `(data, len)` pair |
 | Non-`u8` slice element types | Typeck rejects `[]i32` etc. (only `[]u8` accepted today) | Generalise the slice arm in `resolve_type`; aggregate_layout already handles arbitrary 8-byte fields, so codegen mostly follows |
 | Generics, `trait`, async | Parser produces `ErrorNode`s | Phases 2–4 |
-| Implicit-tail-return for block-like tails (`fn classify(x: i32) -> i32 { if x < 0 { -1 } else { 1 } }`) | Bare-expression implicit-tail-return is closed (commit `579c4f0`): `fn add(a, b) -> i32 { a + b }` and `fn f() -> i32 { 42 }` compile cleanly. The block-like-tail shape still requires explicit `return` because `parse_stmt`'s `KwIf` / `KwWhile` / `KwFor` / `LBrace` arm wraps in `ExprStmt`, leaving `block.tail_expr()` as `None` for these cases. Same parser-side limitation underpins the CT.2d paren-wrapping workaround. | Future sub-bundle: widen `parse_stmt`'s block-like-statement arm with the same checkpoint trick as `parse_expr_stmt` (leave bare Expr at block end), AND add typeck divergent-tail handling — specifically the "discard u0 tails when the fn returns non-u0" rule so existing corpus programs like `25_if_else.gw` (where both arms `return` and the if-expression's type is `u0`) keep working. One parser change, two unblocked surfaces (fn-body block-like tails + CT.2d comptime if/else without paren-wrap). Estimated yield: ~1 — the divergent-tail policy is new value-level surface. |
 | Comptime bool ordering (`true < false`) + wildcard `let _` patterns | `comptime { true < false }` rejects because `expect_int` rejects bool operands of ordering ops; `comptime { let _ = 1; ... }` rejects with "only simple `let <name>` patterns are supported". | Deliberate Phase-2 scope. Bool ordering has no obvious semantics (lexicographic? `false < true` like Rust's `bool` ordering?) — wait for a corpus motivation. Wildcard `let _` is straightforward (allocate a binding but never read it); add it when the corpus motivates. |
 | Comptime over wider types (`comptime { true }`, `comptime { "..." }`, comptime over classes) | `CtValue::Int(i128)` is the only variant; bool / string / class inners reject | CT.3 sub-bundle: add CtValue arms as the corpus motivates them |
 | `comptime fn foo() -> i32 { ... }` decl-level form | Not parsed as a comptime decoration; `comptime` is only an expression-position keyword (`parse_atom` handles it). **Deferred to Phase 5** per decision #4 above — when the runtime evaluator becomes a stack VM on MIR, `comptime fn` is a one-bit annotation on `MirFn` that the resolver consults at call sites. Building it on today's AST interpreter would fake fn-body inlining + parameter substitution, all thrown away at Phase 5. | Phase 5. **Workaround today**: module-level `let CONSTANT: T = comptime { ... };` (Phase 1 increment 11a's top-level statements) covers every shared-compile-time-constant use case without a callable form. |
@@ -1727,32 +1738,37 @@ The big jump. Phase 2 brings:
   compressed into one function). **Closes CT.2 entirely.**
 
 Estimated cost remaining: dozens of hours, distributed between
-the CT.3 comptime evaluator widenings, the
-block-like-tail parser widening follow-up, and whatever path
-the `comptime fn` decl-level question takes. Bug yield so far
+the CT.3 comptime evaluator widenings and whatever path the
+`comptime fn` decl-level question takes. Bug yield so far
 is **3 caught + 1 deferred-and-now-resolved** across all
-eighteen closed Phase-2 sub-bundles
-(C.1+C.2+M.1+M.2+M.3+O.2+F.1+F.2+F.3+CT.1+CT.2a+CT.2b+CT.2c+CT.2d+CT.2e+impl-tail-ret
+nineteen closed Phase-2 sub-bundles
+(C.1+C.2+M.1+M.2+M.3+O.2+F.1+F.2+F.3+CT.1+CT.2a+CT.2b+CT.2c+CT.2d+CT.2e+impl-tail-ret+block-like-tail
 = 0 caught, O.1 = 1 caught, O.3 = 2 caught, CT.1's E0315
-"deferred" entry now resolved by implicit-tail-return, against
-a 12/A.x prediction of ~13-17 — the recombination
+"deferred" entry resolved by implicit-tail-return, against
+a 12/A.x prediction of ~13-18 — the recombination
 + organisational sub-bundles under-shot prediction because
 they reused already-validated value-level shapes; the
 value-level-novel
 sub-bundles (O.1 and O.3) hit prediction exactly; CT.1's bug
 was *latent in a parser side-effect* rather than the
 evaluator's value-level surface, refining the heuristic to
-weight latent-shape risk independently). The remaining
-comptime sub-bundles introduce brand-new value-level
-machinery (interpreter state, locals env, branching), so the
-prediction stays armed — this will still be the largest bug
-surface in Phase 2 by an order of magnitude.
+weight latent-shape risk independently). The block-like-tail
+sub-bundle's prediction was ~1 (new divergent-tail policy);
+observed yield was 0 because the parser change reused
+`parse_expr_stmt`'s already-validated checkpoint shape, the
+typeck rule had a tight non-overlapping pre-condition, and
+the MIR mirror was structural. The remaining comptime
+sub-bundle (CT.3) introduces brand-new value-level
+machinery (new `CtValue` variants, sibling `expect_*`
+helpers, NaN handling for floats), so the prediction stays
+armed — CT.3 will still be the largest bug surface in
+Phase 2 by an order of magnitude.
 
 The dual-backend test now in place means any Phase 2 codegen change
 is automatically validated against both Cranelift and LLVM; this
 became useful immediately on C.1 and stayed useful through M.3.
 
-#### Remaining Phase-2 sub-bundles: CT.3, block-like-tail widening, possibly `comptime fn`
+#### Remaining Phase-2 sub-bundles: CT.3, possibly `comptime fn`
 
 **CT.2 is closed entirely**: CT.1 the comptime tracer (commit
 `018d4eb`); CT.2a integer arithmetic (commit `ce5ada5`); CT.2b
@@ -1760,9 +1776,15 @@ comparisons + `CtValue::Bool` (commit `d9f8064`); CT.2c
 let-bindings + locals env (commit `c0d4540`); CT.2d
 `if`/`else` branch-eval discipline (commit `a03c361`); CT.2e
 short-circuit `&&` / `||` (commit `9d062d3`). **Implicit-
-tail-return for bare-Expr tails is also closed** (commit
+tail-return for bare-Expr tails is closed** (commit
 `579c4f0`): the canonical `fn add(a, b) -> i32 { a + b }`
-shape compiles cleanly; E0315 is retired. What's left:
+shape compiles cleanly; E0315 is retired. **Block-like-tail
+parser widening + divergent-tail discard is closed** (commit
+`9ac51a1`): `fn classify(x: i32) -> i32 { if x < 0 { 1 }
+else { 2 } }` works end-to-end; the `25_if_else.gw` /
+`27_else_if.gw` / `163_print_padding.gw` divergent-tail
+shapes are preserved by the u0-discard rule; CT.2d's
+comptime paren-wrap workaround is retired. What's left:
 
 - **CT.3 comptime over wider types** — `Float`, strings,
   classes, optionals as the corpus motivates. The `CtValue`
@@ -1778,38 +1800,13 @@ shape compiles cleanly; E0315 is retired. What's left:
   corpus need rather than speculative widening — don't add
   `CtValue::Float` until a corpus program asks for
   `comptime { 3.14 + 0.5 }`.
-- **Block-like-tail parser widening + divergent-tail
-  handling** — widen `parse_stmt`'s `KwIf` / `KwWhile` /
-  `KwFor` / `LBrace` arm with the same checkpoint trick
-  `parse_expr_stmt` uses (leave bare Expr at block end,
-  wrap in `ExprStmt` otherwise). This lets `fn classify(x:
-  i32) -> i32 { if x < 0 { -1 } else { 1 } }` work end-to-end
-  AND unblocks the CT.2d comptime paren-wrap workaround —
-  one parser change, two unblocked surfaces. Critical: the
-  widening must come with a typeck-side divergent-tail
-  policy. Existing phase1 corpus programs `25_if_else.gw`,
-  `27_else_if.gw`, and `163_print_padding.gw` end with a
-  block-like tail whose if-expression types as `u0` (all
-  arms `return`, no value at the if's join) but the fn
-  returns non-`u0`. The natural Rust-style answer is
-  "discard u0 tails when the fn returns non-u0" — treat the
-  tail as if it were an `ExprStmt`. This rule preserves the
-  existing semantics for the at-risk fixtures without adding
-  a `!` (never) type. Bug yield estimate: ~1 (the
-  divergent-tail policy is new value-level surface, and the
-  bidirectional narrowing interaction at the tail position
-  needs care). Corpus growth: at minimum one if-as-tail
-  fixture per return type, plus a regression test pinning
-  the u0-discard policy.
-Suggested ordering: block-like-tail widening whenever a
-user trips on the paren-wrap workaround or asks for the
-cleaner `if`-as-tail fn-body shape; CT.3 when a corpus
-program motivates a new `CtValue` variant. `comptime fn`
-decl-level form is *not* in Phase 2 scope — it rides Phase
-5 alongside the stack-VM evaluator (see resolved open
-question #4 below; shared compile-time constants in Phase
-2 use module-level `let CONSTANT: T = comptime { ... };`
-instead).
+
+Suggested ordering: CT.3 when a corpus program motivates a
+new `CtValue` variant. `comptime fn` decl-level form is *not*
+in Phase 2 scope — it rides Phase 5 alongside the stack-VM
+evaluator (see resolved open question #4 below; shared
+compile-time constants in Phase 2 use module-level
+`let CONSTANT: T = comptime { ... };` instead).
 
 Open questions to resolve at session start:
 
@@ -1947,16 +1944,16 @@ state this doc describes:
 ```bash
 cd /Users/silmaril/Documents/GitHub/gw
 git log --oneline | head -10
-# expect tip: HANDOFF refresh after impl-tail-ret (this
-#             commit), 579c4f0 (implicit-tail-return for
-#             bare-expression tails), b8d8cc5 (HANDOFF refresh
+# expect tip: HANDOFF refresh after block-like-tail (this
+#             commit), 9ac51a1 (block-like-tail parser widening
+#             + divergent-tail discard), c215ce4 (HANDOFF refresh
+#             after impl-tail-ret), 579c4f0 (implicit-tail-return
+#             for bare-expression tails), b8d8cc5 (HANDOFF refresh
 #             after CT.2e), 9d062d3 (CT.2e comptime
 #             short-circuit && / ||), 2611606 (HANDOFF refresh
 #             after CT.2d), a03c361 (CT.2d comptime if/else),
 #             dfe28c9 (HANDOFF refresh after CT.2c), c0d4540
-#             (CT.2c comptime let-bindings + locals env),
-#             3231f19 (HANDOFF refresh after CT.2b), d9f8064
-#             (CT.2b comptime comparisons + booleans) at the
+#             (CT.2c comptime let-bindings + locals env) at the
 #             bottom of head -10.
 
 git status
@@ -1973,14 +1970,15 @@ export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
 
 . "$HOME/.cargo/env"
 cargo test --manifest-path compiler/gw-bootstrap/Cargo.toml --workspace --no-fail-fast 2>&1 | grep "test result" | awk '{p+=$4;f+=$6}END{print p,f}'
-# expect: "261 0"
+# expect: "264 0"
 
 ls tests/corpus/pass/phase1/*.gw | wc -l
-# expect: 245 (was 241; +4 implicit-tail-return fixtures
-#         numbered 200_..203_)
+# expect: 248 (was 245; +3 block-like-tail fixtures numbered
+#         204_..206_ on top of the 4 implicit-tail-return
+#         fixtures 200_..203_)
 
 ls tests/corpus/pass/phase2_comptime/*.gw | wc -l
-# expect: 23 (ct1_tracer + 4 ct2a_* + 4 ct2b_* + 4 ct2c_* + 5 ct2d_* + 5 ct2e_*)
+# expect: 24 (ct1_tracer + 4 ct2a_* + 4 ct2b_* + 4 ct2c_* + 5 ct2d_* + 5 ct2e_* + ct2d_if_no_paren)
 
 ls -d tests/corpus/pass/phase2_multifile/*/ | wc -l
 # expect: 4 (multi-file projects: add_two_files, cross_file_class,
@@ -2195,18 +2193,34 @@ bare-Expr tail. The literal-width plumbing is unchanged —
 `lower_literal` already reads `typed.expr_types` for the
 `IntTy`; typeck's new `check_expr(tail, sig.ret, …)` call
 just populates a new entry in that map. The CT.1 E0315
-guard rail is retired (no diagnostic to emit any more). The
-245-program phase1 corpus + 4 multi-file projects + 23
+guard rail is retired (no diagnostic to emit any more).
+**Block-like-tail parser widening + divergent-tail discard
+(commit `9ac51a1`)** then extends the same triad — the parser
+checkpoint trick from `parse_expr_stmt` is grafted onto
+`parse_stmt`'s `KwIf | KwWhile | KwFor | LBrace` arm so
+block-like expressions at the end of a block become the
+block's `tail_expr` rather than wrapping in `ExprStmt`;
+typeck's `check_fn_body` adds a "discard u0 tails when fn
+returns non-u0" rule (preserves `25_if_else.gw` /
+`27_else_if.gw` / `163_print_padding.gw`); MIR's `lower_fn`
+mirrors the discard via an `expr_types[NodePtr(tail)]`
+lookup. One parser change unblocks two surfaces — fn-body
+block-like tails AND CT.2d's comptime paren-wrap workaround.
+The 248-program phase1 corpus + 4 multi-file projects + 24
 phase2_comptime tracers (`ct1_tracer.gw` → 4; `ct2a_*` 4
 tracers; `ct2b_*` 4 tracers; `ct2c_*` 4 tracers; `ct2d_*` 5
 tracers including the canonical branch-eval regression test
 `ct2d_un_taken_safe.gw` → 5; `ct2e_*` 5 tracers including
 the canonical short-circuit regression test
 `ct2e_and_short_circuit.gw` → 0 where the un-evaluated RHS
-contains `1 / 0` and would crash if evaluated; and 4 new
+contains `1 / 0` and would crash if evaluated; `ct2d_if_no_paren.gw`
+→ 7 retiring CT.2d's paren-wrap workaround; 4
 implicit-tail-return fixtures `200_tail_return_arith.gw` →
 7, `201_tail_return_literal.gw` → 42,
 `202_tail_return_let_then_path.gw` → 22,
-`203_tail_return_widening.gw` → 100) are the direct test
+`203_tail_return_widening.gw` → 100; and 3 new block-like-tail
+fixtures `204_tail_return_if.gw` → 30,
+`205_tail_divergent_if.gw` → 22,
+`206_tail_while_u0.gw` → 0) are the direct test
 surface for every one of those arrows, exercised through
 both backends in CI.
