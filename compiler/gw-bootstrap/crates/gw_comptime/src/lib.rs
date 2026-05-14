@@ -1369,26 +1369,24 @@ mod tests {
 
     #[test]
     fn float_literal_parses() {
-        let f = assert_float(
-            eval_default("fn t() -> f64 { return comptime { 3.14 }; }").unwrap(),
-        );
-        assert_eq!(f, 3.14);
+        // `3.25` is exact in IEEE-754 (no rounding); also avoids the
+        // clippy::approx_constant lint that would flag literals
+        // close to PI (`3.14`).
+        let f = assert_float(eval_default("fn t() -> f64 { return comptime { 3.25 }; }").unwrap());
+        assert_eq!(f, 3.25);
     }
 
     #[test]
     fn float_literal_with_underscores() {
         // Mirrors gw_mir's `raw.replace('_', "").parse::<f64>()`.
-        let f = assert_float(
-            eval_default("fn t() -> f64 { return comptime { 1_000.5 }; }").unwrap(),
-        );
+        let f =
+            assert_float(eval_default("fn t() -> f64 { return comptime { 1_000.5 }; }").unwrap());
         assert_eq!(f, 1000.5);
     }
 
     #[test]
     fn float_negation() {
-        let f = assert_float(
-            eval_default("fn t() -> f64 { return comptime { -2.5 }; }").unwrap(),
-        );
+        let f = assert_float(eval_default("fn t() -> f64 { return comptime { -2.5 }; }").unwrap());
         assert_eq!(f, -2.5);
     }
 
@@ -1410,25 +1408,22 @@ mod tests {
 
     #[test]
     fn float_multiplication() {
-        let f = assert_float(
-            eval_default("fn t() -> f64 { return comptime { 1.5 * 4.0 }; }").unwrap(),
-        );
+        let f =
+            assert_float(eval_default("fn t() -> f64 { return comptime { 1.5 * 4.0 }; }").unwrap());
         assert_eq!(f, 6.0);
     }
 
     #[test]
     fn float_division() {
-        let f = assert_float(
-            eval_default("fn t() -> f64 { return comptime { 7.5 / 2.5 }; }").unwrap(),
-        );
+        let f =
+            assert_float(eval_default("fn t() -> f64 { return comptime { 7.5 / 2.5 }; }").unwrap());
         assert_eq!(f, 3.0);
     }
 
     #[test]
     fn float_modulo() {
-        let f = assert_float(
-            eval_default("fn t() -> f64 { return comptime { 5.5 % 2.0 }; }").unwrap(),
-        );
+        let f =
+            assert_float(eval_default("fn t() -> f64 { return comptime { 5.5 % 2.0 }; }").unwrap());
         assert_eq!(f, 1.5);
     }
 
@@ -1437,19 +1432,20 @@ mod tests {
         // IEEE-754: `1.0 / 0.0 = +∞`; no `DivisionByZero` error
         // (distinct from the integer path, which raises). This is the
         // canonical assertion of float division semantics.
-        let f = assert_float(
-            eval_default("fn t() -> f64 { return comptime { 1.0 / 0.0 }; }").unwrap(),
+        let f =
+            assert_float(eval_default("fn t() -> f64 { return comptime { 1.0 / 0.0 }; }").unwrap());
+        assert!(
+            f.is_infinite() && f.is_sign_positive(),
+            "expected +inf, got {f}"
         );
-        assert!(f.is_infinite() && f.is_sign_positive(), "expected +inf, got {f}");
     }
 
     #[test]
     fn float_zero_divided_by_zero_yields_nan() {
         // IEEE-754: `0.0 / 0.0 = NaN`. Used as the canonical NaN
         // source by the comptime corpus's NaN-ordering fixture.
-        let f = assert_float(
-            eval_default("fn t() -> f64 { return comptime { 0.0 / 0.0 }; }").unwrap(),
-        );
+        let f =
+            assert_float(eval_default("fn t() -> f64 { return comptime { 0.0 / 0.0 }; }").unwrap());
         assert!(f.is_nan(), "expected NaN, got {f}");
     }
 
@@ -1466,17 +1462,15 @@ mod tests {
 
     #[test]
     fn float_lt_true() {
-        let b = assert_bool(
-            eval_default("fn t() -> bool { return comptime { 1.5 < 2.5 }; }").unwrap(),
-        );
+        let b =
+            assert_bool(eval_default("fn t() -> bool { return comptime { 1.5 < 2.5 }; }").unwrap());
         assert!(b);
     }
 
     #[test]
     fn float_lt_false() {
-        let b = assert_bool(
-            eval_default("fn t() -> bool { return comptime { 2.5 < 1.5 }; }").unwrap(),
-        );
+        let b =
+            assert_bool(eval_default("fn t() -> bool { return comptime { 2.5 < 1.5 }; }").unwrap());
         assert!(!b);
     }
 
@@ -1526,8 +1520,7 @@ mod tests {
 
     #[test]
     fn mixed_int_float_equality_rejects() {
-        let err =
-            eval_default("fn t() -> bool { return comptime { 1 == 1.0 }; }").unwrap_err();
+        let err = eval_default("fn t() -> bool { return comptime { 1 == 1.0 }; }").unwrap_err();
         assert!(
             matches!(err, EvalError::Unsupported { .. }),
             "expected Unsupported (mixed int==float), got {err:?}",
@@ -1539,8 +1532,7 @@ mod tests {
         // Bool can't participate in float arithmetic; this checks the
         // tuple-dispatch's catch-all rejection path rather than the
         // (now-removed) expect_int helper.
-        let err =
-            eval_default("fn t() -> f64 { return comptime { 1.0 + true }; }").unwrap_err();
+        let err = eval_default("fn t() -> f64 { return comptime { 1.0 + true }; }").unwrap_err();
         assert!(
             matches!(err, EvalError::Unsupported { .. }),
             "expected Unsupported (float+bool), got {err:?}",
@@ -1549,7 +1541,9 @@ mod tests {
 
     #[test]
     fn parse_float_literal_handles_underscores() {
-        assert_eq!(parse_float_literal("3.14"), Some(3.14));
+        // See `float_literal_parses` for the `3.25` choice rationale
+        // (exact in IEEE-754; avoids `clippy::approx_constant`).
+        assert_eq!(parse_float_literal("3.25"), Some(3.25));
         assert_eq!(parse_float_literal("1_000.5"), Some(1000.5));
     }
 
@@ -1569,17 +1563,15 @@ mod tests {
 
     #[test]
     fn string_literal_decodes() {
-        let bytes = assert_str(
-            eval_default("fn t() -> []u8 { return comptime { \"hello\" }; }").unwrap(),
-        );
+        let bytes =
+            assert_str(eval_default("fn t() -> []u8 { return comptime { \"hello\" }; }").unwrap());
         assert_eq!(bytes, b"hello");
     }
 
     #[test]
     fn string_literal_empty() {
-        let bytes = assert_str(
-            eval_default("fn t() -> []u8 { return comptime { \"\" }; }").unwrap(),
-        );
+        let bytes =
+            assert_str(eval_default("fn t() -> []u8 { return comptime { \"\" }; }").unwrap());
         assert_eq!(bytes, b"");
     }
 
@@ -1587,9 +1579,8 @@ mod tests {
     fn string_literal_with_newline_escape() {
         // Pins the lockstep with `gw_mir::decode_string_literal` —
         // `\n` decodes to byte 0x0A, not the two characters `\` `n`.
-        let bytes = assert_str(
-            eval_default("fn t() -> []u8 { return comptime { \"hi\\n\" }; }").unwrap(),
-        );
+        let bytes =
+            assert_str(eval_default("fn t() -> []u8 { return comptime { \"hi\\n\" }; }").unwrap());
         assert_eq!(bytes, b"hi\n");
     }
 
@@ -1599,10 +1590,7 @@ mod tests {
         // payload — covers the canonical lockstep set without
         // duplicating per-escape boilerplate.
         let bytes = assert_str(
-            eval_default(
-                "fn t() -> []u8 { return comptime { \"a\\tb\\\\c\\\"d\" }; }",
-            )
-            .unwrap(),
+            eval_default("fn t() -> []u8 { return comptime { \"a\\tb\\\\c\\\"d\" }; }").unwrap(),
         );
         assert_eq!(bytes, b"a\tb\\c\"d");
     }
@@ -1612,9 +1600,8 @@ mod tests {
         // Mirrors `gw_mir::decode_string_literal`'s "unknown escapes
         // pass through literally" rule. `\q` is not in the supported
         // set, so the decoder emits backslash + 'q'.
-        let bytes = assert_str(
-            eval_default("fn t() -> []u8 { return comptime { \"\\q\" }; }").unwrap(),
-        );
+        let bytes =
+            assert_str(eval_default("fn t() -> []u8 { return comptime { \"\\q\" }; }").unwrap());
         assert_eq!(bytes, b"\\q");
     }
 
@@ -1624,10 +1611,8 @@ mod tests {
         // `.len` ride a future sub-bundle. This pins the tuple-
         // dispatch's catch-all rejection so future scope expansions
         // don't silently start accepting an undefined shape.
-        let err = eval_default(
-            "fn t() -> []u8 { return comptime { \"a\" + \"b\" }; }",
-        )
-        .unwrap_err();
+        let err =
+            eval_default("fn t() -> []u8 { return comptime { \"a\" + \"b\" }; }").unwrap_err();
         assert!(
             matches!(err, EvalError::Unsupported { .. }),
             "expected Unsupported (string + string), got {err:?}",

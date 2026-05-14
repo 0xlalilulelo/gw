@@ -1558,10 +1558,7 @@ fn lower_comptime<'a>(
                 FloatTy::F64 => f.to_bits(),
                 FloatTy::F32 => (f as f32).to_bits() as u64,
             };
-            Operand::Const(Const::Float {
-                bits,
-                ty: float_ty,
-            })
+            Operand::Const(Const::Float { bits, ty: float_ty })
         }
         // CT.3b: materialise as the same `[]u8` slice aggregate that
         // `lower_string_literal` builds for runtime string literals.
