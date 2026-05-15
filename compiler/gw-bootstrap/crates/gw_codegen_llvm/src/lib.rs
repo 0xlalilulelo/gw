@@ -598,6 +598,14 @@ fn lower_stmt<'ctx>(
             builder.build_store(field_ptr, val).map_err(be)?;
             Ok(())
         }
+        MirStmt::StoreThroughRef { ptr, value, ty } => {
+            let val = read_operand(builder, cx, value, *ty)?;
+            let ptr_val = read_operand(builder, cx, ptr, Ty::Ptr(IntTy::U8))?;
+            builder
+                .build_store(ptr_val.into_pointer_value(), val)
+                .map_err(be)?;
+            Ok(())
+        }
     }
 }
 
@@ -1401,7 +1409,7 @@ fn llvm_basic_type<'ctx>(context: &'ctx Context, ty: Ty) -> Option<BasicTypeEnum
         // `Ty::Ptr(_)`. The static distinction lives at the typeck
         // layer (for the future borrow checker); codegen treats
         // both as plain pointers.
-        Ty::Ref(_) => Some(context.ptr_type(AddressSpace::default()).into()),
+        Ty::Ref { .. } => Some(context.ptr_type(AddressSpace::default()).into()),
         // `Ty` is non-exhaustive (Phase 2 will add `?T`, `!T`, etc.);
         // anything new lands here as Unsupported until handled.
         _ => None,

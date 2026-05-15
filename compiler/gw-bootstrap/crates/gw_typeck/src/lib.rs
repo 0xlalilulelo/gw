@@ -142,17 +142,26 @@ pub enum Ty {
     /// (`?T` doesn't coerce to `!T` and vice versa), and the `!`
     /// postfix asserts on `!T` only.
     ErrorUnion(OptInner),
-    /// `&T` — shared reference (Phase 3 increment B.0). At the value
-    /// level it's a pointer to the borrowed place; the static
-    /// distinction from `Ty::Ptr(_)` is what enables the
-    /// borrow-checker layer (B.4+) to track loans and lifetimes
-    /// without confusing checked refs with raw FFI pointers. B.0
-    /// only realises shared refs (immutable borrow); B.1 will add a
-    /// `mut: bool` flag for `&mut T`. Inner is closed via
-    /// [`RefInner`] so `Ty` stays `Copy`; wider inners (slices,
-    /// classes, optionals) ride later sub-bundles motivated by
-    /// corpus need.
-    Ref(RefInner),
+    /// `&T` / `&mut T` — reference type (Phase 3 increments B.0 +
+    /// B.1). At the value level it's a pointer to the borrowed
+    /// place; the static distinction from `Ty::Ptr(_)` is what
+    /// enables the borrow-checker layer (B.4+) to track loans and
+    /// lifetimes without confusing checked refs with raw FFI
+    /// pointers. The `mutable` bit (added in B.1) gates the
+    /// `*r = value` assignment-through-deref shape: only `&mut T`
+    /// can be written through. Inner is closed via [`RefInner`] so
+    /// `Ty` stays `Copy`; wider inners (slices, classes,
+    /// optionals) ride later sub-bundles motivated by corpus need.
+    Ref {
+        /// `true` for `&mut T`, `false` for `&T`. Today the
+        /// distinction only gates assignment-through-deref; future
+        /// borrow-checker sub-bundles (B.5) use it for the
+        /// aliasing rule (shared loans tolerate other shared
+        /// loans; mutable loans demand exclusivity).
+        mutable: bool,
+        /// Pointee type.
+        inner: RefInner,
+    },
     /// Synthetic placeholder when type checking failed for an
     /// expression. Treated as compatible with any expected type so a
     /// single failure does not cascade.
@@ -335,7 +344,13 @@ impl std::fmt::Display for Ty {
             }
             Self::Optional(inner) => write!(f, "?{}", inner),
             Self::ErrorUnion(inner) => write!(f, "!{}", inner),
-            Self::Ref(inner) => write!(f, "&{}", inner),
+            Self::Ref { mutable, inner } => {
+                if *mutable {
+                    write!(f, "&mut {}", inner)
+                } else {
+                    write!(f, "&{}", inner)
+                }
+            }
             Self::Error => f.write_str("<error>"),
         }
     }
@@ -711,19 +726,23 @@ fn resolve_type(
             // distinction from `Ty::Ptr(_)` is what enables the
             // borrow-checker layer (B.4+) to track loans; the
             // value-level representation is just a pointer.
+            // B.1 adds `&mut T` via the `RefType::is_mut()` shape
+            // bit; both `&T` and `&mut T` share the same closed-
+            // inner constraint.
             let inner_ty = r
                 .pointee()
                 .map(|t| resolve_type(t, resolved, sm, diags))
                 .unwrap_or(Ty::Error);
+            let mutable = r.is_mut();
             return match RefInner::from_ty(inner_ty) {
-                Some(ri) => Ty::Ref(ri),
+                Some(inner) => Ty::Ref { mutable, inner },
                 None if inner_ty == Ty::Error => Ty::Error,
                 None => {
                     diags.push(Diagnostic::error(
                         ec::UNSUPPORTED_CONSTRUCT,
                         Label::new(r.syntax().span, ""),
                         format!(
-                            "Phase 3 only supports `&T` for primitive integer or `bool` inner types; `&{inner_ty}` is not yet supported"
+                            "Phase 3 only supports `&T` / `&mut T` for primitive integer or `bool` inner types; `&{inner_ty}` is not yet supported"
                         ),
                     ));
                     Ty::Error
@@ -1640,11 +1659,52 @@ fn synth_assign<'a>(b: BinaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
     let lhs_ty = match b.lhs() {
         Some(Expr::Path(p)) => synth_path(p, cx),
         Some(Expr::Field(fe)) => synth_field(fe, cx),
+        // Phase 3 increment B.1: `*r = value` — assignment
+        // through a `&mut T` reference. The unary must be a
+        // `Star` (deref) and the operand of the deref must be
+        // `Ty::Ref { mutable: true, .. }`. Reads through `&T`
+        // remain on the read-side `synth_unary` path; writes
+        // through `&T` reject here.
+        Some(Expr::Unary(u)) if matches!(u.op_kind(), Some(SyntaxKind::Star)) => {
+            let inner_operand_ty = u.operand().map(|e| synth_expr(e, cx)).unwrap_or(Ty::Error);
+            let lhs_ty = match inner_operand_ty {
+                Ty::Ref {
+                    mutable: true,
+                    inner,
+                } => inner.to_ty(),
+                Ty::Ref {
+                    mutable: false,
+                    inner,
+                } => {
+                    cx.diags.push(Diagnostic::error(
+                        ec::BAD_OPERAND,
+                        Label::new(u.syntax().span, ""),
+                        format!(
+                            "cannot assign through a shared reference `&{inner}`; use `&mut {inner}` to permit mutation"
+                        ),
+                    ));
+                    Ty::Error
+                }
+                Ty::Error => Ty::Error,
+                other => {
+                    cx.diags.push(Diagnostic::error(
+                        ec::BAD_OPERAND,
+                        Label::new(u.syntax().span, ""),
+                        format!("cannot assign through `*`: operand has type `{other}`, expected `&mut T`"),
+                    ));
+                    Ty::Error
+                }
+            };
+            // Record the deref-LHS type so MIR's `StoreThroughRef`
+            // lowering can read the store width from `expr_types`.
+            cx.tm.expr_types.insert(NodePtr(u.syntax()), lhs_ty);
+            lhs_ty
+        }
         Some(other) => {
             cx.diags.push(Diagnostic::error(
                 ec::BAD_OPERAND,
                 Label::new(expr_span(other), ""),
-                "left side of `=` must be an assignable place (a local variable name or field access)",
+                "left side of `=` must be an assignable place (a local variable name, field access, or `*ref` through a `&mut T`)",
             ));
             Ty::Error
         }
@@ -1717,15 +1777,17 @@ fn synth_unary<'a>(u: UnaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
                 }
                 return Ty::Error;
             }
+            let mutable = u.is_mut_borrow();
             match RefInner::from_ty(operand) {
-                Some(ri) => Ty::Ref(ri),
+                Some(inner) => Ty::Ref { mutable, inner },
                 None if operand == Ty::Error => Ty::Error,
                 None => {
+                    let kw = if mutable { "&mut " } else { "&" };
                     cx.diags.push(Diagnostic::error(
                         ec::UNSUPPORTED_CONSTRUCT,
                         Label::new(u.syntax().span, ""),
                         format!(
-                            "Phase 3 increment B.0 only supports `&T` for primitive integer or `bool` inner types; `&{operand}` is not yet supported"
+                            "Phase 3 increment B.0 only supports `{kw}T` for primitive integer or `bool` inner types; `{kw}{operand}` is not yet supported"
                         ),
                     ));
                     Ty::Error
@@ -1733,12 +1795,16 @@ fn synth_unary<'a>(u: UnaryExpr<'a>, cx: &mut Cx<'a, '_, '_, '_>) -> Ty {
             }
         }
         // Phase 3 increment B.0: `*expr` deref. Operand must be
-        // `Ty::Ref(_)`; result is the inner type. Raw pointers
+        // `Ty::Ref { .. }`; result is the inner type. Raw pointers
         // (`Ty::Ptr(_)`) deliberately do *not* deref through this
         // arm — that's an extern-FFI surface, and a `*p` on a raw
-        // pointer is unsafe-tier work (B.8).
+        // pointer is unsafe-tier work (B.8). B.1 adds the
+        // assignment-through-deref case (`*r = v`) inside
+        // `synth_assign`; this read-side arm doesn't care about
+        // the mutability bit because `&T` and `&mut T` both
+        // produce a readable value.
         Star => match operand {
-            Ty::Ref(ri) => ri.to_ty(),
+            Ty::Ref { inner, .. } => inner.to_ty(),
             Ty::Error => Ty::Error,
             _ => {
                 cx.diags.push(Diagnostic::error(

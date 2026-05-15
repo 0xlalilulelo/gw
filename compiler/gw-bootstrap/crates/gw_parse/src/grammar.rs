@@ -412,7 +412,11 @@ fn parse_type(p: &mut Parser<'_, '_, '_>) {
         TokenKind::Amp => {
             p.builder.start_node(SyntaxKind::RefType, start);
             p.bump_any(); // &
-                          // `&mut T` — `mut` is not a token in Phase 0; ignore.
+                          // `&mut T` (Phase 3 increment B.1): `mut` token sits as
+                          // a child of `RefType` between the `&` and the inner
+                          // type. The AST view `RefType::is_mut()` searches for
+                          // it. Shared refs (`&T`) just have no `mut` child.
+            let _ = p.eat(TokenKind::KwMut);
             parse_type(p);
             let end = p.cur_byte_start();
             p.builder.finish_node(end);
@@ -817,6 +821,14 @@ fn parse_atom(p: &mut Parser<'_, '_, '_>) {
     if let Some(bp) = prefix_bp(k) {
         p.builder.start_node(SyntaxKind::UnaryExpr, start);
         p.bump_any();
+        // `&mut expr` (Phase 3 increment B.1): if the prefix
+        // operator is `&` and the next token is `mut`, consume it
+        // as a child of the `UnaryExpr`. The AST view
+        // `UnaryExpr::is_mut_borrow()` searches for the `KwMut`
+        // token to distinguish `&` from `&mut`.
+        if matches!(k, TokenKind::Amp) {
+            let _ = p.eat(TokenKind::KwMut);
+        }
         parse_expr_bp(p, bp);
         let end = p.cur_byte_start();
         p.builder.finish_node(end);

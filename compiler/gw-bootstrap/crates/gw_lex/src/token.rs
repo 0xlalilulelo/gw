@@ -97,6 +97,7 @@ pub enum TokenKind {
     KwNil,
     KwEnum,
     KwUnsafe,
+    KwMut,
 
     // ───────── Brackets ──────────────────────────────────────────────
     LParen,
@@ -228,6 +229,7 @@ impl TokenKind {
                 | Self::KwNil
                 | Self::KwEnum
                 | Self::KwUnsafe
+                | Self::KwMut
         )
     }
 
@@ -291,6 +293,7 @@ impl TokenKind {
             Self::KwNil => "nil",
             Self::KwEnum => "enum",
             Self::KwUnsafe => "unsafe",
+            Self::KwMut => "mut",
             // Brackets
             Self::LParen => "(",
             Self::RParen => ")",

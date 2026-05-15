@@ -749,6 +749,25 @@ impl<'a> UnaryExpr<'a> {
             _ => None,
         })
     }
+    /// Whether this is `&mut expr` rather than plain `&expr`. The
+    /// `mut` token sits between the `&` and the operand as a direct
+    /// child of `UnaryExpr` (CST shape established in Phase 3
+    /// increment B.1). Returns `true` only for `Amp`-led unaries
+    /// that have a `KwMut` token child.
+    pub fn is_mut_borrow(self) -> bool {
+        if !matches!(self.op_kind(), Some(SyntaxKind::Amp)) {
+            return false;
+        }
+        self.0.children.iter().any(|c| {
+            matches!(
+                c,
+                SyntaxElement::Token {
+                    kind: SyntaxKind::KwMut,
+                    ..
+                }
+            )
+        })
+    }
     /// Operand.
     pub fn operand(self) -> Option<Expr<'a>> {
         self.0.child_nodes().find_map(Expr::cast)
@@ -1386,6 +1405,21 @@ impl<'a> RefType<'a> {
     /// Pointee type.
     pub fn pointee(self) -> Option<Type<'a>> {
         self.0.child_nodes().find_map(Type::cast)
+    }
+    /// Whether this is `&mut T` rather than plain `&T`. The `mut`
+    /// token sits between the `&` and the inner type as a direct
+    /// child of `RefType` (CST shape established in Phase 3
+    /// increment B.1).
+    pub fn is_mut(self) -> bool {
+        self.0.children.iter().any(|c| {
+            matches!(
+                c,
+                SyntaxElement::Token {
+                    kind: SyntaxKind::KwMut,
+                    ..
+                }
+            )
+        })
     }
 }
 

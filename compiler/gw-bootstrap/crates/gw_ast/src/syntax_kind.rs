@@ -81,6 +81,7 @@ pub enum SyntaxKind {
     KwNil,
     KwEnum,
     KwUnsafe,
+    KwMut,
 
     // Brackets
     LParen,
@@ -458,6 +459,7 @@ impl From<TokenKind> for SyntaxKind {
             TokenKind::KwNil => Self::KwNil,
             TokenKind::KwEnum => Self::KwEnum,
             TokenKind::KwUnsafe => Self::KwUnsafe,
+            TokenKind::KwMut => Self::KwMut,
             TokenKind::LParen => Self::LParen,
             TokenKind::RParen => Self::RParen,
             TokenKind::LBrace => Self::LBrace,

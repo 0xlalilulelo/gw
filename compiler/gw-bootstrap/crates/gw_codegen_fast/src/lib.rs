@@ -666,6 +666,12 @@ fn lower_block(
                 let slot = cx.local_slot[dst];
                 fb.ins().stack_store(val, slot, offset as i32);
             }
+            MirStmt::StoreThroughRef { ptr, value, ty } => {
+                let store_clt = clif_ty(*ty, module).unwrap_or(ir::types::I32);
+                let val = read_operand(fb, f, value, cx, store_clt);
+                let ptr_val = read_operand(fb, f, ptr, cx, cx.ptr_ty());
+                fb.ins().store(MemFlags::new(), val, ptr_val, 0);
+            }
         }
     }
     match &block.terminator {

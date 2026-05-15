@@ -50,6 +50,7 @@ pub static KEYWORDS: phf::Map<&'static str, TokenKind> = phf_map! {
     "nil"       => TokenKind::KwNil,
     "enum"      => TokenKind::KwEnum,
     "unsafe"    => TokenKind::KwUnsafe,
+    "mut"       => TokenKind::KwMut,
 };
 
 #[cfg(test)]

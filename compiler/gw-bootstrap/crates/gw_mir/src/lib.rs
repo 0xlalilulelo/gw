@@ -124,6 +124,16 @@ pub enum MirStmt {
         field_idx: u32,
         value: Rvalue,
     },
+    /// `*ptr = value` — store through a `&mut T` reference. Phase 3
+    /// increment B.1: typeck restricts this to LHS `*r` where `r:
+    /// &mut T`. `ty` is the store width (matches the reference's
+    /// inner type and the rhs operand's type). Codegen emits a
+    /// plain pointer-store.
+    StoreThroughRef {
+        ptr: Operand,
+        value: Operand,
+        ty: Ty,
+    },
 }
 
 /// Right-hand side of a [`MirStmt::Assign`].
@@ -1327,6 +1337,30 @@ fn lower_assign<'a>(
                     value: Rvalue::Use(rhs_val),
                 });
             }
+        }
+        // Phase 3 increment B.1: `*r = rhs` — store through a
+        // `&mut T` reference. typeck has already verified the LHS
+        // is a `Star` unary over a `&mut T` operand; here we just
+        // lower the reference operand to a pointer-typed Operand
+        // and emit `StoreThroughRef`. The store width is the
+        // bin-expression's overall lhs type, which typeck recorded
+        // as the reference's inner.
+        Some(Expr::Unary(u)) if matches!(u.op_kind(), Some(SyntaxKind::Star)) => {
+            let ptr = u
+                .operand()
+                .map(|e| lower_expr(b, e, lcx))
+                .unwrap_or(Operand::Const(Const::Error));
+            let store_ty = lcx
+                .typed
+                .expr_types
+                .get(&NodePtr(u.syntax()))
+                .copied()
+                .unwrap_or(Ty::Error);
+            b.push_stmt(MirStmt::StoreThroughRef {
+                ptr,
+                value: rhs_val,
+                ty: store_ty,
+            });
         }
         _ => {}
     }

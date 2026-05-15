@@ -1,0 +1,7 @@
+fn main() -> i32 {
+    let x: i32 = 0;
+    let r: &mut i32 = &mut x;
+    *r = 7;
+    *r = *r + 35;
+    return *r;
+}
