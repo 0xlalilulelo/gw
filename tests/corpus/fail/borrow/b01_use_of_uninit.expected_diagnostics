@@ -1,0 +1,4 @@
+// `let x: i32;` declares but never initialises x. The dataflow's
+// must-be-init lattice at `return x;` is empty (no Assign / Call /
+// AssignField writes x on any path), so E0400 fires.
+E0400:2:9

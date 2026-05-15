@@ -1,0 +1,9 @@
+fn main() -> i32 {
+    let x: i32;
+    let i: i32 = 0;
+    while i < 0 {
+        x = 5;
+        i = i + 1;
+    }
+    return x;
+}

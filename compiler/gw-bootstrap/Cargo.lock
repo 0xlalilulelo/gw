@@ -307,6 +307,11 @@ dependencies = [
 [[package]]
 name = "gw_borrow"
 version = "0.0.1"
+dependencies = [
+ "gw_lex",
+ "gw_mir",
+ "rustc-hash",
+]
 
 [[package]]
 name = "gw_codegen_fast"
@@ -355,6 +360,7 @@ version = "0.0.1"
 dependencies = [
  "bumpalo",
  "gw_ast",
+ "gw_borrow",
  "gw_codegen_fast",
  "gw_codegen_llvm",
  "gw_lex",
@@ -362,6 +368,7 @@ dependencies = [
  "gw_parse",
  "gw_resolve",
  "gw_typeck",
+ "insta",
  "target-lexicon",
 ]
 

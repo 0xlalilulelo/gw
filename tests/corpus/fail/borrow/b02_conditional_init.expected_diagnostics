@@ -1,0 +1,4 @@
+// Only the then-arm writes x. The if's join block has must-init
+// set = then-arm.out ∩ else-arm.out = {x} ∩ {} = {} for x, so the
+// trailing `return x;` reads an uninitialised local.
+E0400:2:9

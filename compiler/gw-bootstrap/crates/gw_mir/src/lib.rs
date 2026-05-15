@@ -2155,10 +2155,17 @@ fn lower_match<'a>(
 
     // After processing all arms, b.cur is either the trailing
     // unreachable block from a wildcard or the dangling next_bb of
-    // the last literal-arm test. Either way, terminate it with a
-    // Goto to join so the CFG is well-formed; typeck's exhaustiveness
-    // check should mean this block is unreachable in practice.
-    b.set_terminator(b.cur, Terminator::Goto(join_bb));
+    // the last literal-arm test. Either way, terminate it with
+    // `Unreachable` rather than a `Goto(join_bb)`: typeck's
+    // exhaustiveness check should mean this block is unreachable
+    // in practice, and for non-exhaustive matches `Unreachable`
+    // traps cleanly rather than reading garbage from the
+    // dangling-path's never-written `result_local`. Phase 3 B.3:
+    // the dataflow checker reads block-CFG predecessor sets to
+    // compute must-init joins; an `Unreachable` block doesn't
+    // contribute to any successor's predecessor set, so the
+    // dangling path no longer poisons `join_bb`'s in-state.
+    b.set_terminator(b.cur, Terminator::Unreachable);
 
     b.cur = join_bb;
     match result_local {

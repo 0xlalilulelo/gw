@@ -1,0 +1,8 @@
+fn main() -> i32 {
+    let x: i32;
+    let c: bool = true;
+    if c {
+        x = 5;
+    }
+    return x;
+}

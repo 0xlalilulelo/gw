@@ -1,0 +1,10 @@
+fn main() -> i32 {
+    let x: i32;
+    let c: bool = true;
+    if c {
+        x = 42;
+    } else {
+        x = 99;
+    }
+    return x;
+}

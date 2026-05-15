@@ -44,6 +44,7 @@ gw_parse        = { path = "crates/gw_parse" }
 gw_resolve      = { path = "crates/gw_resolve" }
 gw_typeck       = { path = "crates/gw_typeck" }
 gw_mir          = { path = "crates/gw_mir" }
+gw_borrow       = { path = "crates/gw_borrow" }
 gw_codegen_fast = { path = "crates/gw_codegen_fast" }
 gw_codegen_llvm = { path = "crates/gw_codegen_llvm" }
 gw_comptime     = { path = "crates/gw_comptime" }

@@ -1,0 +1,6 @@
+// `while i < 0` may execute zero times, so the path from header →
+// exit doesn't pass through the body-arm that assigns x. The
+// dataflow's must-init at `return x;` excludes x. E0400 fires
+// regardless of whether the runtime trip count would happen to be
+// non-zero — this is a static check.
+E0400:2:9

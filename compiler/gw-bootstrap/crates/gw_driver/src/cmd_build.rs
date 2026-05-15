@@ -167,6 +167,23 @@ fn build_one(src_path: &Path, backend: Backend) -> Result<PathBuf, String> {
 
     let mir = lower(&typed, &resolved, &sm);
 
+    // Phase 3 increment B.3: borrow / init-state checker. Runs on
+    // the converged MIR; emits `E0400` diagnostics for reads of
+    // locals that aren't definitely-initialized on every incoming
+    // control-flow path. If any borrow-check diag fires we abort
+    // before codegen so we never lower an unsafe program.
+    let borrow_diags = gw_borrow::check_program(&mir);
+    if !borrow_diags.is_empty() {
+        for d in &borrow_diags {
+            eprintln!("  {}", render_simple(d, &sm));
+        }
+        return Err(format!(
+            "{n} error(s) in `{}`",
+            primary_display,
+            n = borrow_diags.len(),
+        ));
+    }
+
     let stem = src_path
         .file_stem()
         .and_then(|s| s.to_str())
