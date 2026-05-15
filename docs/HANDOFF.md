@@ -15,26 +15,33 @@ This document is the entry point for the next development session. Read it first
 > are mechanically derivable. See the original rename plan in the
 > session transcript and commits 1–6 on `main`.
 
-> **Last updated:** 2026-05-15, after Phase 3 B.2 — borrows
-> across fn-call boundaries (commit `cc9a6ca`). `&T` /
-> `&mut T` in fn parameter and return types, plus `&param`
-> on the caller side, lower correctly across both backends.
-> Two pre-existing bugs surfaced and fixed: LLVM
-> `make_fn_type` allow-list (rejected `Ty::Ref` returns) and
-> Cranelift entry-time param storage for address-taken
-> params (`&param` read uninitialised stack memory). **Still
-> no borrow checking** — that's B.3 (move tracking), B.4
-> (region inference), and B.5 (the borrow checker proper).
-> Closed sub-bundles preceding: B.1 `&mut` borrows + writes
-> (`080bd1a`), B.0 borrow-surface tracer (`f85a94e`),
-> CT.3b string literals (`f8bd7df`), CT.3a float (`0b3ccba`),
-> block-like-tail (`9ac51a1`), implicit-tail-return (`579c4f0`),
-> CT.2 entirely.
+> **Last updated:** 2026-05-15, after Phase 3 B.3 — first
+> actual checker pass: a `MaybeInitialized` dataflow framework
+> on MIR (commit `ba39a73`). `gw_borrow` becomes real: per-fn
+> forward dataflow with lattice = `FxHashSet<Local>` of
+> must-be-init locals, join = set intersection, transfer adds
+> `Assign / AssignField / Call.dst`. Reads of a local not in
+> the must-init set emit `USE_OF_UNINIT_LOCAL` (E0400).
+> Phase-1 surface is Copy-by-default (per fixture 218's
+> pass-by-value semantics), so the framework catches no
+> move-out transitions today — move tracking proper rides
+> B.4+. What it *does* catch is uninit reads from
+> `let x: T;` plus conditional-init shapes where only some
+> arms write the local. Driver wires the checker between
+> MIR build and codegen. Bootstraps `tests/corpus/fail/borrow/`
+> with three fixtures (uninit, conditional init, loop-no-init).
+> Closed sub-bundles preceding: B.2 borrows across fn calls
+> (`cc9a6ca`), B.1 `&mut` borrows + writes (`080bd1a`), B.0
+> borrow-surface tracer (`f85a94e`), CT.3b string literals
+> (`f8bd7df`), CT.3a float (`0b3ccba`), block-like-tail
+> (`9ac51a1`), implicit-tail-return (`579c4f0`), CT.2 entirely.
 > **Repo root:** `/Users/silmaril/Documents/GitHub/gw`
-> **Workspace tests:** 292 unit + integration, all green.
-> **Corpus:** 62 Phase-0 lex+parse snapshots + 257 Phase-1 + 31
+> **Workspace tests:** 293 unit + integration, all green
+> (+1: the new `borrow_fail_corpus` walker).
+> **Corpus:** 62 Phase-0 lex+parse snapshots + 258 Phase-1 + 31
 > Phase-2 comptime single-file run-tests + 4 Phase-2 multi-file
-> projects.
+> projects + 3 Phase-3 borrow-reject (the first fail-corpus
+> outside lex+parse).
 
 ---
 
@@ -46,7 +53,7 @@ resolve → typeck → MIR → codegen → link to a native executable.
 Two backends ship in the same workspace: `gw build --backend=fast`
 (Cranelift, default) and `gw build --backend=llvm` (LLVM 18 via
 `inkwell`). Both consume the same MIR and agree bit-exactly across
-the 257-program Phase-1 corpus + 4 multi-file projects + the 31
+the 258-program Phase-1 corpus + 4 multi-file projects + the 31
 Phase-2 comptime tracers. Phase 0, Phase 1, Phase 13 (LLVM), and
 the Phase-2 entry (c-strings, `match`, `?T`/`!T`, modules) are
 closed. **Phase 2 / CT.2 is now entirely closed** across five
@@ -133,8 +140,9 @@ gw/
 │   └── HANDOFF.md               (this file)
 ├── tests/corpus/
 │   ├── pass/lexparse/           (61 .gw + insta snapshots — Phase 0)
-│   ├── pass/phase1/             (257 .gw + .expected_exit / .expected_stdout)
-│   └── fail/lexparse/           (5 .gw + .expected_diagnostics)
+│   ├── pass/phase1/             (258 .gw + .expected_exit / .expected_stdout)
+│   ├── fail/lexparse/           (5 .gw + .expected_diagnostics)
+│   └── fail/borrow/             (3 .gw + .expected_diagnostics — B.3 reject corpus)
 ├── compiler/gw-bootstrap/       (Cargo workspace — host = Rust 1.95+)
 │   └── crates/
 │       ├── gw_lex/         ★ active
@@ -147,7 +155,7 @@ gw/
 │       ├── gw_codegen_fast/★ active (Cranelift-backed)
 │       ├── gw_codegen_llvm/★ active (LLVM-18-backed via inkwell, Phase 13)
 │       ├── gw_driver/      ★ active (the `gw` binary)
-│       ├── gw_borrow/             stub  (Phase 3 — B.0+B.1+B.2 closed, ladder in flight)
+│       ├── gw_borrow/      ★ active (Phase 3 — B.3 dataflow framework; B.4–B.8 queued)
 │       ├── gw_lir/                stub  (Phase 7)
 │       ├── gw_jit/                stub  (Phase 7)
 │       ├── gw_lsp/                stub  (Phase 9)
@@ -221,6 +229,7 @@ Each increment shipped one or more corpus programs and a single commit.
 | F.1 | multi-file tracer (cross-file resolve, flat namespace) | `57b275d` | +2 multi-file projects (01, 02) | new `DiagBag::merge` drains another bag's diagnostics into self; new `resolve_modules(primary, extras, ...)` accepts a primary module plus zero or more secondary modules, all defs in one flat namespace; driver auto-discovers sibling `.gw` files in the build target's directory, sorts by path, reads each into the shared SourceMap, parses each into a `SyntaxNode<'bump>` (one `FileArena` per file, all sharing one `Bump`); top-level statements in sibling files diagnose with new TOP_LEVEL_STMTS_IN_LIBRARY (E0203); +3 resolver unit tests + 2 corpus projects (`01_add_two_files`, `02_cross_file_class`) | 0 |
 | F.2 | `mod` + `use` declarations (opt-in modules) | `6969f64` | +1 multi-file project (03) | parser `parse_mod_decl` and `parse_use_decl`; AST `Item::Mod(ModDecl)` and `Item::Use(UseDecl)` promoted from `Stub` with `name()` accessors; resolver `process_module` puts items from `mod foo;` files in `module_tables[foo]` instead of the global flat `by_name`; F.2 globally flattens use'd module items into `by_name` (later refined in F.3); two new error codes E0204 UNKNOWN_MODULE and E0205 DUPLICATE_MOD; renamed fail fixture `f02_unsupported_mod.gw` → `f02_malformed_mod.gw` with refreshed expected diagnostics; +5 resolver unit tests + 1 corpus project (`03_mod_use`) | 0 |
 | F.3 | per-file `use` scoping | `aab3f0b` | +1 multi-file project (04) | `ResolvedModule` gains `file_scopes: FxHashMap<FileId, FxHashMap<String, DefId>>`; new `lookup_in_file(file, name)` consults the per-file scope, falling back to flat `by_name` for AST-test callers without a file context; resolver post-pass builds each file's effective scope = flat pool + own items + items from modules the file `use`s; conflicts within a single file's scope diagnose as DUPLICATE_DEFINITION; F.2's global-import code path is gone — `by_name` is no longer enriched by `use` decls; `register_fn` / `register_class` return `(name, DefId)` so `process_module` can record file-local items; typeck `Cx` gains `current_file: FileId` field set by `check_fn_body` and `check_synthetic_main_body`; four name-lookup sites switch from `cx.tm.resolved.lookup` to `lookup_in_file(cx.current_file, name)`; +1 resolver unit test (`use_only_visible_in_declaring_file`) + 1 corpus project (`04_use_per_file`) | 0 |
+| B.3 | move-tracking dataflow framework (first actual checker pass; `MaybeInitialized` lattice on MIR; emits E0400 `USE_OF_UNINIT_LOCAL`; bootstraps `tests/corpus/fail/borrow/`; **Phase-1 surface is Copy-by-default so no move-out transitions caught today** — the framework catches genuine uninit reads from `let x: T;` and conditional-init shapes) | `ba39a73` | +1 phase1 fixture (`248_uninit_both_arms_init.gw` → 42) + 3 phase3 reject fixtures (`b01_use_of_uninit.gw` → E0400, `b02_conditional_init.gw` → E0400, `b03_loop_no_init.gw` → E0400) + 1 walker (`gw_driver/tests/borrow_fail.rs`) | `gw_borrow` stub becomes a real crate. Public surface: `check_program(prog: &MirProgram) -> Vec<Diagnostic>` and the `ec::USE_OF_UNINIT_LOCAL` constant (E0400 — new 400-series namespace for the borrow checker). Algorithm per `MirFn`: build predecessor / successor adjacency from each block's terminator; entry-block in-set = `f.params`; worklist iteration with `Option<FxHashSet<Local>>` per block (`None` = "predecessor not yet processed", distinct from "empty intersection"); join = set intersection over predecessors with `Some` out-set; transfer adds `MirStmt::Assign.dst`, `MirStmt::AssignField.dst` (see AssignField semantics below), `Terminator::Call.dst`. After fixpoint, walk each reachable block with its converged in-state and emit one diag per local with a possibly-uninit read; dedupe by `Local` so multiple reads of the same uninit local produce a single E0400. Diagnostic span is the local's `LocalDecl.span` (the let-binding) — perfectly adequate for B.3-grade messaging; finer-grained per-use spans ride a future sub-bundle alongside MirStmt span instrumentation. **AssignField semantics**: treated as a *write* of the dst (init transfer) rather than a read-requiring-init, because `lower_struct_lit` emits one `AssignField` per field on a freshly-allocated dst with no prior `Assign` (the canonical `let p = Pair { .a = 7, .b = 19 };` lowering). Partial-init tracking (writing only some fields before a whole-aggregate read) rides a future sub-bundle alongside field-level move tracking. **MIR side-fix in `lower_match`**: trailing dangling block after the last arm's pattern test switched from `Terminator::Goto(join_bb)` to `Terminator::Unreachable`. The dangling path was always dynamically unreachable for exhaustive matches but its `None`-out poisoned `join_bb`'s must-init intersection (the match-result local is only written on arm-body blocks, never on the dangling path). For non-exhaustive matches this is also a strict improvement — traps cleanly via the codegen hardware-trap path instead of reading garbage from the never-written `result_local`. Driver wires the checker between `lower(...)` and `compile_program(...)` in `cmd_build.rs`; any non-empty diag list aborts before codegen so we never lower a program that may read garbage. Walker (`gw_driver/tests/borrow_fail.rs`) mirrors `gw_parse/tests/corpus.rs::fail_corpus`: in-process parse → resolve → typeck → MIR → `gw_borrow::check_program`, asserts prior stages succeed cleanly (the diagnostic must come from the borrow checker), then compares the list of `EXXXX:line:col` triples against the sibling `.expected_diagnostics` file. Three reject fixtures cover the three shapes the framework currently catches end-to-end: bare uninit-then-read (b01), conditional init where only the then-arm writes (b02), and loop-no-init where the while body may execute zero times (b03). Pass-corpus fixture 248 pins the both-arms-init positive case so the dataflow's join logic is exercised on the green path too. | **1** — `lower_match`'s `Goto(join_bb)` dangling-block terminator was a pre-existing latent codegen-correctness issue (non-exhaustive matches would have read garbage from `result_local`; existing corpus didn't exercise the shape so the bug stayed dormant). B.3's must-init intersection over `join_bb`'s predecessors surfaced it as an E0400 firing on the corpus-passing fixture `234_match_bool.gw` — the dangling-path's `None`-out contributed an empty must-init set to the join, so the trailing `return Operand::Local(result_local)` read an "uninit" local. Fixed by switching the terminator to `Unreachable`, which both removes the dangling predecessor from `join_bb`'s set in the dataflow *and* makes the runtime semantics safe-by-construction. The recombination rule predicted "1-2 bug yield" for B.3 because it introduces the first checker pass; observed 1 matches the lower end and was a MIR-level fix rather than a checker-level one. |
 | B.2 | borrows across fn-call boundaries (`&T` / `&mut T` in fn parameter and return types, plus `&param` on the caller side; **still no borrow checking** — no lifetime annotations in signatures, function-local regions only) | `cc9a6ca` | +4 phase1 fixtures (`244_borrow_param_read.gw` → 42, `245_mut_borrow_param_write.gw` → 42, `246_borrow_return.gw` → 10, `247_borrow_of_param.gw` → 42) | **Zero new typeck / MIR / lex / parse machinery** — B.0's `resolve_type` arm for `Type::Ref` already accepted `&T` in fn signatures, B.1's struct-variant `Ty::Ref { mutable, inner }` already flowed through the existing fn-signature plumbing, and MIR's call lowering already passed pointer-typed operands by value. The work was entirely in the two backends. **`gw_codegen_llvm`** `make_fn_type` previously had an explicit `U0 \| Int \| Bool \| Float` match on `f.return_ty`; non-`u0` returns now route through `llvm_basic_type` and then `lty.fn_type(&params, false)` (requires `BasicType` trait in scope). The error message gains "and references" so future failures name the right surface. The aggregate-return branch is unchanged — `is_aggregate_ty` still triggers the hidden out-pointer ABI before this scalar path runs. **`gw_codegen_fast`** `define_fn`'s entry-time block-param binding loop previously did `if let Some(var) = local_var.get(&param_local) { builder.def_var(*var, v); }` and silently dropped the value when the param had no `Variable`. Adds an `else if let Some(&slot) = local_slot.get(&param_local) { builder.ins().stack_store(v, slot, 0); }` arm — the slot was already sized by B.0's storage-decision pass; this is the missing entry-store. Four fixtures: 244 / 245 / 246 cover the surface (read through `&i32` param, write through `&mut i32` param, returning `&i32` from a two-arg picker) and 247 (`&param` flowing into a helper fn) is the specific shape that pinned the Cranelift bug — without the entry-store, `sum_via_ref(40, 2)` returned 242 on fast (`0xF0`-bit garbage XOR'd over 0x28) while LLVM correctly returned 42. | **2** — both pre-existing, both surfaced by B.2's call-shape probes rather than by B.2's own deltas: (a) LLVM `make_fn_type` rejected `Ty::Ref` returns (and would have rejected `Ty::Ptr` / `Ty::SentinelPtr` if a fn ever returned one, though no Phase-2 program did). The allow-list was a B.1-era artefact: B.0 added `Ty::Ref` to `llvm_basic_type` but didn't trace through `make_fn_type`'s explicit return match. (b) Cranelift's entry-time param-to-slot store was a B.0-era oversight: B.0 added the storage-decision branch that sizes slots for address-taken primitives but forgot the matching entry-time bind. The bug stayed dormant because B.0's three corpus fixtures `&`-borrow locals (which the body's first `Assign` writes), not params (which are bound only at entry). The lesson: every storage class needs both a sizer at fn entry *and* a binder for incoming params — adding one without the other gives a silent-miscompile shape that exhaustive-match can't catch. |
 | B.1 | `&mut` borrows + writes through references (`&mut x` expression, `&mut T` type, `*r = v` store; `Ty::Ref` becomes a struct variant `{ mutable, inner }`; MIR grows `StoreThroughRef`; **still no borrow checking**) | `080bd1a` | +2 phase1 fixtures (`242_mut_borrow_write.gw` → 10, `243_mut_borrow_then_read.gw` → 42) | `gw_lex` reserves `mut` as `TokenKind::KwMut`; `gw_ast` adds the matching `SyntaxKind::KwMut` plus two helpers `UnaryExpr::is_mut_borrow` and `RefType::is_mut`. `gw_parse` `parse_type`'s `Amp` arm and `parse_atom`'s prefix-unary path each eat an optional `KwMut` after the `&` — the leading `&` already triggers the right CST shape, the `KwMut` rides as a child token. `gw_typeck` migrates `Ty::Ref(RefInner)` to the struct variant `Ty::Ref { mutable: bool, inner: RefInner }`; `Ty` stays `Copy` because `RefInner` is a closed enum (`Int(IntTy) \| Bool`) and `bool: Copy`. The `Display` impl prints `&T` vs `&mut T` based on `mutable`. `resolve_type`'s `Type::Ref` arm reads `r.is_mut()`; the rejection message now mentions both `&T` and `&mut T`. `synth_unary`'s `Amp` arm reads `u.is_mut_borrow()` and emits `Ty::Ref { mutable, inner }`. `synth_unary`'s `Star` arm destructures `Ty::Ref { inner, .. }` (mutability irrelevant for reads — reads through `&T` and `&mut T` both yield `inner`). `synth_assign` gains a new LHS arm: `Some(Expr::Unary(u)) if u.op_kind() == Some(Star)` — type-checks the deref operand, accepts `Ty::Ref { mutable: true, inner }` (returning `inner.to_ty()` as the LHS type), rejects `mutable: false` with `cannot assign through a shared reference \`&T\`; use \`&mut T\` to permit mutation`, rejects anything else with `cannot assign through \`*\`: operand has type X, expected \`&mut T\``. **The arm also records the deref-LHS type in `expr_types[NodePtr(u.syntax())]`** so MIR's `StoreThroughRef` lowering can read the store width — see bug-yield note. The fallback `_` LHS arm's diagnostic updated to mention `*ref through a \`&mut T\``. `gw_mir` adds `MirStmt::StoreThroughRef { ptr: Operand, value: Operand, ty: Ty }`; `lower_assign`'s `Some(Expr::Unary(u))` arm (matching `op_kind == Star`) lowers the inner ref-expression to a pointer Operand, reads `lcx.typed.expr_types[NodePtr(u.syntax())]` for the store width, and emits `StoreThroughRef`. `gw_codegen_fast` `lower_block`'s `MirStmt` match adds a `StoreThroughRef` arm: `clif_ty(*ty)` picks the store width (fallback `I32`), `read_operand` reads the pointer at `cx.ptr_ty()`, then `fb.ins().store(MemFlags::new(), val, ptr_val, 0)`. `gw_codegen_llvm`'s `lower_stmt` match adds the matching arm: `read_operand(builder, cx, value, *ty)` then `read_operand(builder, cx, ptr, Ty::Ptr(IntTy::U8))` (pointers lower as opaque `ptr` regardless of pointee), then `builder.build_store(ptr_val.into_pointer_value(), val)`. `llvm_basic_type`'s `Ty::Ref(_)` pattern updated to the struct-variant `Ty::Ref { .. }`. **Scope restriction**: B.1 still doesn't have a `let mut x` binding modifier — locals are mutable by default in Phase 1, so `let r: &mut i32 = &mut x;` and `*r = …` both type-check without requiring the binding to be re-declared. `KwMut` *is* reserved now, so if a future sub-bundle introduces `let mut x` the parser will need to consume `KwMut` between `let` and the pattern; out of scope for B.1. Two fixtures pin the canonical shapes — write through `&mut x` (242, exit 10 from the original name, proving the alias) and write-then-read through the same reference (243, exit 42 from `*r = *r + 35` reading and re-storing). | **1** — `synth_assign`'s deref-LHS arm computed `lhs_ty` locally without recording it into `cx.tm.expr_types`. MIR's `StoreThroughRef` lowering reads `expr_types.get(NodePtr(u.syntax())).copied().unwrap_or(Ty::Error)` for the store width, so it received `Ty::Error`. The constant-RHS smoke test (`*r = 10`) masked it — the LLVM `read_operand` const path ignores the `ty` argument and reads the int type from the `Const::Int` itself, so the fixture executed. The Local-RHS fixture `*r = *r + 35` surfaced it as `unsupported construct: fn \`main\` reads local Local(4) with type Error; B.3 supports integers, bool, and floats`. Fixed by inserting `lhs_ty` into `expr_types[NodePtr(u.syntax())]` after the match in `synth_assign`. **The recombination rule said B.1 rides cleanly on B.0** — the `Ty::Ref` tuple→struct variant migration got caught at compile time everywhere it mattered (every consumer pattern updated), which is the rule's success case. The unrecorded-type-on-the-LHS bug is a genuinely new bug-class introduced because `synth_assign` (unlike `synth_expr`) doesn't auto-insert into `expr_types`. |
 | B.0 | borrow-surface tracer (`&local` and `*r` parse + type + lower end-to-end; **no borrow checking** — just the language surface) | `f85a94e` | +3 phase1 fixtures (`220_borrow_int.gw` → 5, `221_borrow_then_let.gw` → 42, `222_borrow_arith.gw` → 30) | `gw_parse` adds `Amp` / `Star` to `prefix_bp` at binding power 23; both prefix shapes flow through the existing `UnaryExpr` CST (op_kind disambiguates). `gw_typeck` `Ty::Ref(RefInner)` variant with `RefInner = Int(IntTy) \| Bool` (closed inner mirrors `OptInner` so `Ty` stays `Copy`). `resolve_type` arm for `Type::Ref` accepts primitive inners only (wider inners reject with `UNSUPPORTED_CONSTRUCT`). `synth_unary` gains `Amp` and `Star` arms: `Amp` requires the operand to be a path-to-local (consults `path_bindings`) and rejects anything else with `BAD_OPERAND`; `Star` requires `Ty::Ref(_)` operand and returns the inner. Raw pointers (`Ty::Ptr(_)`) deliberately do NOT participate in the deref arm — that's unsafe-tier surface for B.8. `gw_mir` gains `Rvalue::Ref { target: Local, pointee_ty: Ty }` and `Rvalue::Deref { ptr: Operand, ty: Ty }`. `MirFn` grows `address_taken_locals: FxHashSet<Local>` (consumed by the Cranelift backend to force address-taken primitives into `StackSlot` storage; LLVM ignores it because every local already has an `alloca`). `Builder` accumulates the set as `&local` lowers. `lower_unary` reorganised to match on `op_kind` first; the `Amp` arm looks up the target via `path_bindings → binding_to_local`, marks it address-taken, emits `Rvalue::Ref`; the `Star` arm lowers the operand to a pointer-typed Operand and emits `Rvalue::Deref`. `gw_codegen_fast` storage-decision pass extended: a primitive local in `address_taken_locals` allocates a `StackSlot` via `primitive_size_align` instead of an SSA `Variable`. `lower_assign_stmt`'s primitive-dst branch now writes via `stack_store` when the dst is slot-backed; `read_operand` for `Operand::Local` falls back to `stack_load(want, slot, 0)` when the local lives in a slot. `Rvalue::Ref` → `fb.ins().stack_addr(want_ty, slot, 0)`; `Rvalue::Deref` → `fb.ins().load(load_clif, MemFlags::new(), ptr_val, 0)`. `gw_codegen_llvm` `llvm_basic_type` arm for `Ty::Ref(_)` returns opaque `ptr` (same shape as `Ty::Ptr(_)`); `Rvalue::Ref` returns `cx.allocas[target]` directly; `Rvalue::Deref` reads the pointer operand and emits `build_load(lty, ptr_val, "deref")` at the result type's LLVM type. **Scope restriction**: B.0 only realises `&local` (path-to-let-binding). `&x.field`, `&literal`, `&call()`, `&mut`, and `&` in fn signatures ride B.1–B.2. Three corpus fixtures pin the canonical tracer (`&x; *r → x`), deref-into-let-init (`let y = *r`), and multi-borrow arithmetic (`*ra + *rb`) — exercise the new MIR rvalues end-to-end across both backends. | 0 |
@@ -571,7 +580,7 @@ shape works end-to-end. **The Phase 2 CT.1 prediction
 "latent-shape risk from parser side-effects" is now
 fully discharged.**
 
-### What 288 corpus programs cover
+### What 289 corpus programs cover
 
 - Phase-0 syntax: every TokenKind variant, every operator precedence
   level, every supported statement form.
@@ -894,8 +903,8 @@ Exit code: 1. The match desugars to a chain of compare+branch
 sequences — two range tests (each two compares) for the first arm,
 three equality tests for the second, one equality test for `-1`,
 and a final `Goto` for the wildcard. Both backends produce
-bit-exactly the same value across all 288 single-file corpus
-programs (257 phase1 + 31 phase2_comptime) + 4 multi-file
+bit-exactly the same value across all 289 single-file corpus
+programs (258 phase1 + 31 phase2_comptime) + 4 multi-file
 projects.
 
 The Phase-2 `?T` surface (O.1) brings the canonical optional shape:
@@ -1825,18 +1834,20 @@ The big jump. Phase 2 brings:
 
 Estimated cost remaining: dozens of hours, distributed between
 the remaining CT.3 widenings (classes, optionals, error unions)
-the remaining B.x sub-bundles (B.3 move tracking through B.8
+the remaining B.x sub-bundles (B.4 region inference through B.8
 safety tiers; see Phase 3 ladder below), and whatever path the
 `comptime fn` decl-level question takes.
-Bug yield so far is **6 caught + 1 deferred-and-now-resolved**
-across all twenty-four closed sub-bundles (twenty-one Phase-2 +
-B.0 + B.1 + B.2 from Phase 3):
+Bug yield so far is **7 caught + 1 deferred-and-now-resolved**
+across all twenty-five closed sub-bundles (twenty-one Phase-2 +
+B.0 + B.1 + B.2 + B.3 from Phase 3):
 (C.1+C.2+M.1+M.2+M.3+O.2+F.1+F.2+F.3+CT.1+CT.2a+CT.2b+CT.2c+CT.2d+CT.2e+impl-tail-ret+block-like-tail+CT.3a+CT.3b+B.0
 = 0 caught, O.1 = 1 caught, O.3 = 2 caught, B.1 = 1 caught
 (deref-LHS type not recorded in `expr_types`), B.2 = 2 caught
 (LLVM `make_fn_type` return allow-list missing `Ty::Ref`,
 Cranelift entry-time param store for slot-backed params),
-CT.1's E0315
+B.3 = 1 caught (`lower_match` dangling-block terminator was
+`Goto(join_bb)` rather than `Unreachable`, poisoning the
+must-init join), CT.1's E0315
 "deferred" entry resolved by implicit-tail-return, against
 a 12/A.x prediction of ~16-21 — the recombination
 + organisational sub-bundles under-shot prediction because
@@ -1898,6 +1909,32 @@ synthesises an LHS / pattern type without going through
 `synth_expr` needs an explicit `expr_types.insert` if MIR
 will later read that node's type — `synth_expr` does it for
 free, hand-rolled synthesis sites don't.
+
+B.3 observed yield was 1, the lower end of the predicted
+"1-2" — and notably the bug was a **MIR-level fix**
+(`lower_match` dangling-block terminator), not a
+checker-implementation bug. The dataflow / worklist / lattice
+machinery landed clean on first try, which is what we hoped
+for from "incremental closure" — the framework itself is
+small and self-contained, the riskier part is wiring it into
+the existing MIR semantics where load-bearing assumptions
+(like "all blocks reach `join_bb` via a value-writing path")
+turn out to be implicit. The dataflow's must-init
+intersection surfaced the latent `Goto(join_bb)` issue
+precisely because it asked the question "is the match-result
+local definitely written on *every* incoming edge to the
+join?" — a question the existing codegen never asked because
+both backends happened to read garbage from the same
+underlying alloca on the never-taken path. **The pattern
+across B.1 / B.2 / B.3: the *checker* increment is also a
+*validator* increment for the foundational increments it
+sits on top of.** This is exactly the design rationale for
+the Phase-3 ladder ordering — by the time the borrow checker
+proper (B.5) lands, B.3's framework will have flushed the
+"latent MIR-level garbage-read" shapes, and B.4's region
+inference will have flushed the "latent reference-shape"
+shapes. Whatever bugs B.5 reveals will be checker-design
+bugs, not foundational ones.
 
 B.2 observed yield was 2 against a prediction of ~1. **Both
 bugs were pre-existing B.0 / B.1 artefacts surfaced by B.2's
@@ -1995,7 +2032,7 @@ evaluator (see resolved open question #4 below; shared
 compile-time constants in Phase 2 use module-level
 `let CONSTANT: T = comptime { ... };` instead).
 
-#### Phase 3 ladder: B.0 + B.1 + B.2 closed, B.3–B.8 queued
+#### Phase 3 ladder: B.0 + B.1 + B.2 + B.3 closed, B.4–B.8 queued
 
 Phase 2 isn't strictly complete (CT.3c+ remain corpus-motivated)
 but Phase 3 is now in flight in parallel. The architecture's
@@ -2062,11 +2099,49 @@ mirroring CT.x's incremental closure:
   → 42, `246_borrow_return.gw` → 10, `247_borrow_of_param.gw`
   → 42 (the `&param` shape that pinned the Cranelift bug).
 
-- **B.3 — move tracking + use-after-move diagnostic**
-  (pending). First reject-corpus and first actual checker
-  pass. `MaybeInitialized` / `EverInitialized` dataflow on
-  MIR; reads of moved locals diagnose. Bootstraps
-  `tests/corpus/fail/borrow/`. Predicted yield 1-2.
+- **B.3 — move-tracking dataflow framework is closed**
+  (commit `ba39a73`): `gw_borrow` becomes real. Per-fn
+  forward dataflow on MIR with lattice = `FxHashSet<Local>`
+  of must-be-init locals, join = set intersection, transfer
+  adds `Assign / AssignField / Call.dst`. Reads of a local
+  not in the must-init set at the read site emit E0400
+  `USE_OF_UNINIT_LOCAL` (deduped per local). Phase-1 surface
+  is **Copy-by-default** (per fixture 218's pass-by-value
+  semantics — classes and slices flow as copies, not Rust
+  moves), so the framework catches no actual move-out
+  transitions today. What it *does* catch is genuine uninit
+  reads from `let x: T;` (no initialiser) and conditional-
+  init shapes where only some arms of an `if` write the
+  local. Move tracking proper (Move-typed surface + move-out
+  invalidations) rides B.4+ — this increment installs the
+  dataflow skeleton, worklist iteration, and diagnostic
+  plumbing that those increments extend.
+  Driver wires the checker between MIR build and codegen;
+  any non-empty diag list aborts before codegen so we never
+  lower a program that may read garbage.
+  MIR side-fix: `lower_match`'s trailing dangling-block
+  terminator switched from `Goto(join_bb)` to
+  `Terminator::Unreachable` (the path was always dynamically
+  unreachable for exhaustive matches but poisoned the
+  must-init intersection at `join_bb`). Strict improvement
+  for non-exhaustive matches: traps cleanly instead of
+  reading garbage from the never-written `result_local`.
+  AssignField treated as an init *write* of the dst (not a
+  read-requiring-init) because `lower_struct_lit` builds
+  aggregates field-by-field on freshly-allocated dsts with
+  no prior `Assign`. Partial-init tracking (writing only
+  some fields before a whole-aggregate read) rides a future
+  sub-bundle alongside field-level move tracking.
+  Bootstraps `tests/corpus/fail/borrow/` with three
+  fixtures: b01 (use of `let x: i32; return x;`), b02
+  (conditional init — only then-arm writes), b03
+  (loop-no-init — `while i < 0` body may execute zero
+  times). Pass-corpus adds fixture 248 pinning the positive
+  both-arms-init case.
+  Yield: 1 — `lower_match`'s `Goto(join_bb)` dangling-block
+  terminator was a pre-existing latent codegen-correctness
+  issue (non-exhaustive matches would have read garbage),
+  surfaced by B.3's dataflow flagging the intersection.
 
 - **B.4 — region inference** (pending). Each `&` gets a
   fresh region variable; `outlives` constraints from
@@ -2244,16 +2319,16 @@ state this doc describes:
 ```bash
 cd /Users/silmaril/Documents/GitHub/gw
 git log --oneline | head -10
-# expect tip: HANDOFF refresh after B.2 (this commit),
-#             cc9a6ca (B.2 borrows across fn-call boundaries),
+# expect tip: HANDOFF refresh after B.3 (this commit),
+#             ba39a73 (B.3 move-tracking dataflow framework),
+#             6421920 (HANDOFF refresh after B.2), cc9a6ca
+#             (B.2 borrows across fn-call boundaries),
 #             b919d5c (HANDOFF refresh after B.1), 080bd1a
 #             (B.1 `&mut` borrows + writes through references),
 #             e494494 (HANDOFF refresh after B.0), f85a94e
 #             (B.0 borrow-surface tracer), 94f64cf (fmt +
 #             clippy fix-up), 79de636 (HANDOFF refresh after
-#             CT.3b), f8bd7df (CT.3b comptime string literals),
-#             1df3f3b (HANDOFF refresh after CT.3a) at the
-#             bottom of head -10.
+#             CT.3b) at the bottom of head -10.
 
 git status
 # expect: clean working tree.
@@ -2269,17 +2344,24 @@ export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
 
 . "$HOME/.cargo/env"
 cargo test --manifest-path compiler/gw-bootstrap/Cargo.toml --workspace --no-fail-fast 2>&1 | grep "test result" | awk '{p+=$4;f+=$6}END{print p,f}'
-# expect: "292 0" (B.2's 4 new corpus fixtures are absorbed by
-# the existing phase1_run + llvm_backend walkers — no net new
-# unit tests landed in B.2; same shape as B.0 / B.1).
+# expect: "293 0" (B.3 adds one new integration test:
+# `gw_driver::borrow_fail_corpus`, the walker for the new
+# fail-corpus dir. B.3's one pass-corpus fixture 248 is
+# absorbed by the existing phase1_run + llvm_backend walkers
+# as usual).
 
 ls tests/corpus/pass/phase1/*.gw | wc -l
-# expect: 257 (was 253; +4 B.2 call-boundary borrow fixtures
-#         numbered 244_borrow_param_read,
-#         245_mut_borrow_param_write, 246_borrow_return, and
-#         247_borrow_of_param, on top of B.1's two
-#         242_..243_ mut-borrow fixtures and B.0's three
-#         220_..222_ borrow-tracer fixtures)
+# expect: 258 (was 257; +1 B.3 positive fixture
+#         248_uninit_both_arms_init that pins the both-arms-
+#         init shape the dataflow's intersection accepts, on
+#         top of B.2's four 244_..247_ call-boundary fixtures
+#         and B.1's two 242_..243_ mut-borrow fixtures and
+#         B.0's three 220_..222_ borrow-tracer fixtures)
+
+ls tests/corpus/fail/borrow/*.gw | wc -l
+# expect: 3 (B.3 reject corpus — `b01_use_of_uninit`,
+#         `b02_conditional_init`, `b03_loop_no_init`; the
+#         first fail-corpus outside lex+parse)
 
 ls tests/corpus/pass/phase2_comptime/*.gw | wc -l
 # expect: 31 (ct1_tracer + 4 ct2a_* + 4 ct2b_* + 4 ct2c_* + 5
