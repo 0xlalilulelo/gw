@@ -1,0 +1,8 @@
+fn read(r: &i32) -> i32 {
+    return *r;
+}
+
+fn main() -> i32 {
+    let x: i32 = 42;
+    return read(&x);
+}

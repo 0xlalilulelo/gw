@@ -55,7 +55,9 @@ use inkwell::module::{Linkage, Module};
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetTriple,
 };
-use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FloatType, FunctionType, IntType};
+use inkwell::types::{
+    BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, FunctionType, IntType,
+};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FloatValue, FunctionValue, GlobalValue, IntValue,
     PointerValue,
@@ -1368,18 +1370,21 @@ fn make_fn_type<'ctx>(
     if is_aggregate_ty(f.return_ty) {
         return Ok(context.void_type().fn_type(&params, false));
     }
-    Ok(match f.return_ty {
-        Ty::U0 => context.void_type().fn_type(&params, false),
-        Ty::Int(int_ty) => llvm_int_type(context, int_ty).fn_type(&params, false),
-        Ty::Bool => context.bool_type().fn_type(&params, false),
-        Ty::Float(float_ty) => llvm_float_type(context, float_ty).fn_type(&params, false),
-        ref other => {
-            return Err(CodegenError::Unsupported(format!(
-                "fn `{}` return type {:?}; B.4 supports `u0`, integers, bool, floats, classes, and slices",
-                f.name, other
-            )));
-        }
-    })
+    if f.return_ty == Ty::U0 {
+        return Ok(context.void_type().fn_type(&params, false));
+    }
+    // Non-u0 scalar returns route through `llvm_basic_type`, which
+    // covers integers / bool / floats / `*T` / `[*:S]T` / `&T`
+    // uniformly (Phase 3 B.2 adds `&T` returns; raw pointers were
+    // already supported by the type mapper but missing from the
+    // explicit return-arm allow-list).
+    let lty = llvm_basic_type(context, f.return_ty).ok_or_else(|| {
+        CodegenError::Unsupported(format!(
+            "fn `{}` return type {:?}; B.4 supports `u0`, integers, bool, floats, classes, slices, and references",
+            f.name, f.return_ty
+        ))
+    })?;
+    Ok(lty.fn_type(&params, false))
 }
 
 /// Map a [`Ty`] to its LLVM `BasicTypeEnum` for primitive scalar use

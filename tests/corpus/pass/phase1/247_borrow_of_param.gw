@@ -1,0 +1,11 @@
+fn deref_add(r: &i32, n: i32) -> i32 {
+    return *r + n;
+}
+
+fn sum_via_ref(a: i32, b: i32) -> i32 {
+    return deref_add(&a, b);
+}
+
+fn main() -> i32 {
+    return sum_via_ref(40, 2);
+}

@@ -528,6 +528,14 @@ fn define_fn(
                     let Some(v) = bp_iter.next() else { continue };
                     if let Some(var) = local_var.get(&param_local) {
                         builder.def_var(*var, v);
+                    } else if let Some(&slot) = local_slot.get(&param_local) {
+                        // Phase 3 B.2: parameter is address-taken
+                        // (`&param` somewhere in the body), so it
+                        // lives in a stack slot instead of an SSA
+                        // Variable. Without this store the slot
+                        // holds uninitialised stack memory at every
+                        // subsequent read.
+                        builder.ins().stack_store(v, slot, 0);
                     }
                 }
             }
