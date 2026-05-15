@@ -15,18 +15,21 @@ This document is the entry point for the next development session. Read it first
 > are mechanically derivable. See the original rename plan in the
 > session transcript and commits 1–6 on `main`.
 
-> **Last updated:** 2026-05-14, after opening Phase 3 with B.0 —
-> the borrow-surface tracer (commit `f85a94e`). `&local` and `*r`
-> parse, type-check, and lower end-to-end as the canonical
-> pointer-to-storage shape; **no borrow checking yet** — that's
-> B.3 (move tracking), B.4 (region inference), and B.5 (the
-> borrow checker proper). Closed sub-bundles preceding: CT.3b
-> string literals (`f8bd7df`), CT.3a float (`0b3ccba`),
+> **Last updated:** 2026-05-14, after Phase 3 B.1 — `&mut`
+> borrows + writes through references (commit `080bd1a`).
+> `&mut x` and `*r = v` now parse, type-check, and lower
+> end-to-end across both backends; `Ty::Ref` became a struct
+> variant `{ mutable, inner }` and MIR grew
+> `StoreThroughRef { ptr, value, ty }`. **Still no borrow
+> checking** — that's B.3 (move tracking), B.4 (region
+> inference), and B.5 (the borrow checker proper). Closed
+> sub-bundles preceding: B.0 borrow-surface tracer (`f85a94e`),
+> CT.3b string literals (`f8bd7df`), CT.3a float (`0b3ccba`),
 > block-like-tail (`9ac51a1`), implicit-tail-return (`579c4f0`),
 > CT.2 entirely.
 > **Repo root:** `/Users/silmaril/Documents/GitHub/gw`
 > **Workspace tests:** 292 unit + integration, all green.
-> **Corpus:** 62 Phase-0 lex+parse snapshots + 251 Phase-1 + 31
+> **Corpus:** 62 Phase-0 lex+parse snapshots + 253 Phase-1 + 31
 > Phase-2 comptime single-file run-tests + 4 Phase-2 multi-file
 > projects.
 
@@ -40,7 +43,7 @@ resolve → typeck → MIR → codegen → link to a native executable.
 Two backends ship in the same workspace: `gw build --backend=fast`
 (Cranelift, default) and `gw build --backend=llvm` (LLVM 18 via
 `inkwell`). Both consume the same MIR and agree bit-exactly across
-the 251-program Phase-1 corpus + 4 multi-file projects + the 31
+the 253-program Phase-1 corpus + 4 multi-file projects + the 31
 Phase-2 comptime tracers. Phase 0, Phase 1, Phase 13 (LLVM), and
 the Phase-2 entry (c-strings, `match`, `?T`/`!T`, modules) are
 closed. **Phase 2 / CT.2 is now entirely closed** across five
@@ -127,7 +130,7 @@ gw/
 │   └── HANDOFF.md               (this file)
 ├── tests/corpus/
 │   ├── pass/lexparse/           (61 .gw + insta snapshots — Phase 0)
-│   ├── pass/phase1/             (251 .gw + .expected_exit / .expected_stdout)
+│   ├── pass/phase1/             (253 .gw + .expected_exit / .expected_stdout)
 │   └── fail/lexparse/           (5 .gw + .expected_diagnostics)
 ├── compiler/gw-bootstrap/       (Cargo workspace — host = Rust 1.95+)
 │   └── crates/
@@ -141,7 +144,7 @@ gw/
 │       ├── gw_codegen_fast/★ active (Cranelift-backed)
 │       ├── gw_codegen_llvm/★ active (LLVM-18-backed via inkwell, Phase 13)
 │       ├── gw_driver/      ★ active (the `gw` binary)
-│       ├── gw_borrow/             stub  (Phase 3 — B.0 opened, ladder in flight)
+│       ├── gw_borrow/             stub  (Phase 3 — B.0+B.1 closed, ladder in flight)
 │       ├── gw_lir/                stub  (Phase 7)
 │       ├── gw_jit/                stub  (Phase 7)
 │       ├── gw_lsp/                stub  (Phase 9)
@@ -215,6 +218,7 @@ Each increment shipped one or more corpus programs and a single commit.
 | F.1 | multi-file tracer (cross-file resolve, flat namespace) | `57b275d` | +2 multi-file projects (01, 02) | new `DiagBag::merge` drains another bag's diagnostics into self; new `resolve_modules(primary, extras, ...)` accepts a primary module plus zero or more secondary modules, all defs in one flat namespace; driver auto-discovers sibling `.gw` files in the build target's directory, sorts by path, reads each into the shared SourceMap, parses each into a `SyntaxNode<'bump>` (one `FileArena` per file, all sharing one `Bump`); top-level statements in sibling files diagnose with new TOP_LEVEL_STMTS_IN_LIBRARY (E0203); +3 resolver unit tests + 2 corpus projects (`01_add_two_files`, `02_cross_file_class`) | 0 |
 | F.2 | `mod` + `use` declarations (opt-in modules) | `6969f64` | +1 multi-file project (03) | parser `parse_mod_decl` and `parse_use_decl`; AST `Item::Mod(ModDecl)` and `Item::Use(UseDecl)` promoted from `Stub` with `name()` accessors; resolver `process_module` puts items from `mod foo;` files in `module_tables[foo]` instead of the global flat `by_name`; F.2 globally flattens use'd module items into `by_name` (later refined in F.3); two new error codes E0204 UNKNOWN_MODULE and E0205 DUPLICATE_MOD; renamed fail fixture `f02_unsupported_mod.gw` → `f02_malformed_mod.gw` with refreshed expected diagnostics; +5 resolver unit tests + 1 corpus project (`03_mod_use`) | 0 |
 | F.3 | per-file `use` scoping | `aab3f0b` | +1 multi-file project (04) | `ResolvedModule` gains `file_scopes: FxHashMap<FileId, FxHashMap<String, DefId>>`; new `lookup_in_file(file, name)` consults the per-file scope, falling back to flat `by_name` for AST-test callers without a file context; resolver post-pass builds each file's effective scope = flat pool + own items + items from modules the file `use`s; conflicts within a single file's scope diagnose as DUPLICATE_DEFINITION; F.2's global-import code path is gone — `by_name` is no longer enriched by `use` decls; `register_fn` / `register_class` return `(name, DefId)` so `process_module` can record file-local items; typeck `Cx` gains `current_file: FileId` field set by `check_fn_body` and `check_synthetic_main_body`; four name-lookup sites switch from `cx.tm.resolved.lookup` to `lookup_in_file(cx.current_file, name)`; +1 resolver unit test (`use_only_visible_in_declaring_file`) + 1 corpus project (`04_use_per_file`) | 0 |
+| B.1 | `&mut` borrows + writes through references (`&mut x` expression, `&mut T` type, `*r = v` store; `Ty::Ref` becomes a struct variant `{ mutable, inner }`; MIR grows `StoreThroughRef`; **still no borrow checking**) | `080bd1a` | +2 phase1 fixtures (`242_mut_borrow_write.gw` → 10, `243_mut_borrow_then_read.gw` → 42) | `gw_lex` reserves `mut` as `TokenKind::KwMut`; `gw_ast` adds the matching `SyntaxKind::KwMut` plus two helpers `UnaryExpr::is_mut_borrow` and `RefType::is_mut`. `gw_parse` `parse_type`'s `Amp` arm and `parse_atom`'s prefix-unary path each eat an optional `KwMut` after the `&` — the leading `&` already triggers the right CST shape, the `KwMut` rides as a child token. `gw_typeck` migrates `Ty::Ref(RefInner)` to the struct variant `Ty::Ref { mutable: bool, inner: RefInner }`; `Ty` stays `Copy` because `RefInner` is a closed enum (`Int(IntTy) \| Bool`) and `bool: Copy`. The `Display` impl prints `&T` vs `&mut T` based on `mutable`. `resolve_type`'s `Type::Ref` arm reads `r.is_mut()`; the rejection message now mentions both `&T` and `&mut T`. `synth_unary`'s `Amp` arm reads `u.is_mut_borrow()` and emits `Ty::Ref { mutable, inner }`. `synth_unary`'s `Star` arm destructures `Ty::Ref { inner, .. }` (mutability irrelevant for reads — reads through `&T` and `&mut T` both yield `inner`). `synth_assign` gains a new LHS arm: `Some(Expr::Unary(u)) if u.op_kind() == Some(Star)` — type-checks the deref operand, accepts `Ty::Ref { mutable: true, inner }` (returning `inner.to_ty()` as the LHS type), rejects `mutable: false` with `cannot assign through a shared reference \`&T\`; use \`&mut T\` to permit mutation`, rejects anything else with `cannot assign through \`*\`: operand has type X, expected \`&mut T\``. **The arm also records the deref-LHS type in `expr_types[NodePtr(u.syntax())]`** so MIR's `StoreThroughRef` lowering can read the store width — see bug-yield note. The fallback `_` LHS arm's diagnostic updated to mention `*ref through a \`&mut T\``. `gw_mir` adds `MirStmt::StoreThroughRef { ptr: Operand, value: Operand, ty: Ty }`; `lower_assign`'s `Some(Expr::Unary(u))` arm (matching `op_kind == Star`) lowers the inner ref-expression to a pointer Operand, reads `lcx.typed.expr_types[NodePtr(u.syntax())]` for the store width, and emits `StoreThroughRef`. `gw_codegen_fast` `lower_block`'s `MirStmt` match adds a `StoreThroughRef` arm: `clif_ty(*ty)` picks the store width (fallback `I32`), `read_operand` reads the pointer at `cx.ptr_ty()`, then `fb.ins().store(MemFlags::new(), val, ptr_val, 0)`. `gw_codegen_llvm`'s `lower_stmt` match adds the matching arm: `read_operand(builder, cx, value, *ty)` then `read_operand(builder, cx, ptr, Ty::Ptr(IntTy::U8))` (pointers lower as opaque `ptr` regardless of pointee), then `builder.build_store(ptr_val.into_pointer_value(), val)`. `llvm_basic_type`'s `Ty::Ref(_)` pattern updated to the struct-variant `Ty::Ref { .. }`. **Scope restriction**: B.1 still doesn't have a `let mut x` binding modifier — locals are mutable by default in Phase 1, so `let r: &mut i32 = &mut x;` and `*r = …` both type-check without requiring the binding to be re-declared. `KwMut` *is* reserved now, so if a future sub-bundle introduces `let mut x` the parser will need to consume `KwMut` between `let` and the pattern; out of scope for B.1. Two fixtures pin the canonical shapes — write through `&mut x` (242, exit 10 from the original name, proving the alias) and write-then-read through the same reference (243, exit 42 from `*r = *r + 35` reading and re-storing). | **1** — `synth_assign`'s deref-LHS arm computed `lhs_ty` locally without recording it into `cx.tm.expr_types`. MIR's `StoreThroughRef` lowering reads `expr_types.get(NodePtr(u.syntax())).copied().unwrap_or(Ty::Error)` for the store width, so it received `Ty::Error`. The constant-RHS smoke test (`*r = 10`) masked it — the LLVM `read_operand` const path ignores the `ty` argument and reads the int type from the `Const::Int` itself, so the fixture executed. The Local-RHS fixture `*r = *r + 35` surfaced it as `unsupported construct: fn \`main\` reads local Local(4) with type Error; B.3 supports integers, bool, and floats`. Fixed by inserting `lhs_ty` into `expr_types[NodePtr(u.syntax())]` after the match in `synth_assign`. **The recombination rule said B.1 rides cleanly on B.0** — the `Ty::Ref` tuple→struct variant migration got caught at compile time everywhere it mattered (every consumer pattern updated), which is the rule's success case. The unrecorded-type-on-the-LHS bug is a genuinely new bug-class introduced because `synth_assign` (unlike `synth_expr`) doesn't auto-insert into `expr_types`. |
 | B.0 | borrow-surface tracer (`&local` and `*r` parse + type + lower end-to-end; **no borrow checking** — just the language surface) | `f85a94e` | +3 phase1 fixtures (`220_borrow_int.gw` → 5, `221_borrow_then_let.gw` → 42, `222_borrow_arith.gw` → 30) | `gw_parse` adds `Amp` / `Star` to `prefix_bp` at binding power 23; both prefix shapes flow through the existing `UnaryExpr` CST (op_kind disambiguates). `gw_typeck` `Ty::Ref(RefInner)` variant with `RefInner = Int(IntTy) \| Bool` (closed inner mirrors `OptInner` so `Ty` stays `Copy`). `resolve_type` arm for `Type::Ref` accepts primitive inners only (wider inners reject with `UNSUPPORTED_CONSTRUCT`). `synth_unary` gains `Amp` and `Star` arms: `Amp` requires the operand to be a path-to-local (consults `path_bindings`) and rejects anything else with `BAD_OPERAND`; `Star` requires `Ty::Ref(_)` operand and returns the inner. Raw pointers (`Ty::Ptr(_)`) deliberately do NOT participate in the deref arm — that's unsafe-tier surface for B.8. `gw_mir` gains `Rvalue::Ref { target: Local, pointee_ty: Ty }` and `Rvalue::Deref { ptr: Operand, ty: Ty }`. `MirFn` grows `address_taken_locals: FxHashSet<Local>` (consumed by the Cranelift backend to force address-taken primitives into `StackSlot` storage; LLVM ignores it because every local already has an `alloca`). `Builder` accumulates the set as `&local` lowers. `lower_unary` reorganised to match on `op_kind` first; the `Amp` arm looks up the target via `path_bindings → binding_to_local`, marks it address-taken, emits `Rvalue::Ref`; the `Star` arm lowers the operand to a pointer-typed Operand and emits `Rvalue::Deref`. `gw_codegen_fast` storage-decision pass extended: a primitive local in `address_taken_locals` allocates a `StackSlot` via `primitive_size_align` instead of an SSA `Variable`. `lower_assign_stmt`'s primitive-dst branch now writes via `stack_store` when the dst is slot-backed; `read_operand` for `Operand::Local` falls back to `stack_load(want, slot, 0)` when the local lives in a slot. `Rvalue::Ref` → `fb.ins().stack_addr(want_ty, slot, 0)`; `Rvalue::Deref` → `fb.ins().load(load_clif, MemFlags::new(), ptr_val, 0)`. `gw_codegen_llvm` `llvm_basic_type` arm for `Ty::Ref(_)` returns opaque `ptr` (same shape as `Ty::Ptr(_)`); `Rvalue::Ref` returns `cx.allocas[target]` directly; `Rvalue::Deref` reads the pointer operand and emits `build_load(lty, ptr_val, "deref")` at the result type's LLVM type. **Scope restriction**: B.0 only realises `&local` (path-to-let-binding). `&x.field`, `&literal`, `&call()`, `&mut`, and `&` in fn signatures ride B.1–B.2. Three corpus fixtures pin the canonical tracer (`&x; *r → x`), deref-into-let-init (`let y = *r`), and multi-borrow arithmetic (`*ra + *rb`) — exercise the new MIR rvalues end-to-end across both backends. | 0 |
 | impl-tail-ret | implicit-tail-return for bare-expression tails (drops E0315; typeck checks tail against declared return type; MIR wires tail operand into `Terminator::Return`) | `579c4f0` | +4 phase1 fixtures (`200_tail_return_arith.gw` → 7, `201_tail_return_literal.gw` → 42, `202_tail_return_let_then_path.gw` → 22, `203_tail_return_widening.gw` → 100) | `gw_typeck` `check_fn_body` replaces the E0315 emission with `check_expr(tail, sig.ret, &mut cx)` — the bidirectional narrowing already running for `let` initialisers and `return` operands (decision #16) handles literal-width adoption (`fn f() -> i64 { 42 }`) without new typeck machinery. A non-matching tail type (e.g. `fn f() -> u0 { 42 }`) diagnoses as the ordinary `TYPE_MISMATCH` (E0300). The CT.1-era `ec::TAIL_EXPR_IN_FN_BODY` (E0315) constant is retired (replaced by a comment-only marker in `ec`). `gw_mir` `lower_fn` captures `lower_block`'s returned operand; if `body.tail_expr().is_some()` and the trailing block has no terminator, sets `Terminator::Return(tail_operand)`. The existing fall-through cases (u0/Error → `Return(Unit)`; non-u0 with no tail → `Unreachable`) stay unchanged for blocks without a tail expression. Literal width flows automatically: `lower_literal` reads `typed.expr_types[NodePtr(lit)]` for the `IntTy`, and typeck's `check_expr(tail, sig.ret, …)` populates that entry with sig.ret. **Scope deliberately limited to bare-Expr tails** (CT.1's `parse_expr_stmt` widening); `parse_stmt`'s block-like-statement arm (`KwIf` / `KwWhile` / `KwFor` / `LBrace`) stays unchanged, so `fn classify(x: i32) -> i32 { if x < 0 { -1 } else { 1 } }` still requires explicit `return`, and CT.2d's comptime paren-wrap workaround stays in place. The parser widening + divergent-tail handling rides a separate future sub-bundle so the corpus-regression handling (the `25_if_else.gw` / `27_else_if.gw` / `163_print_padding.gw` shapes where the if's u0 tail-type would mismatch a non-u0 fn return) can be designed separately — the natural answer is "discard u0 tails when fn returns non-u0" but it's deferred for clean staging. The two old E0315 reject tests in `gw_typeck` are replaced with three new tests: two positive (`fn_body_with_int_tail_accepts`, `fn_body_with_arith_tail_accepts`) and one negative (`fn_body_with_tail_type_mismatch_rejects` asserting TYPE_MISMATCH for `fn f() -> u0 { 42 }`). The pre-existing `_clean` tests stay unchanged. | 0 |
 | CT.3b | comptime string literals (`CtValue::Str(Vec<u8>)`; `StringLit` decoded via `decode_string_literal` kept in lockstep with `gw_mir`; MIR materialisation as `[]u8` slice aggregate sharing the rodata interning path; `CtValue` loses `Copy`) | `f8bd7df` | +2 phase2_comptime tracers (`ct3b_string_literal.gw` → exit 0 stdout "hi\n", `ct3b_string_escape.gw` → exit 0 stdout "a\tb\n") | `gw_comptime` `CtValue` gains the `Str(Vec<u8>)` variant carrying decoded bytes inline; `#[derive(Copy, Clone, Debug)]` becomes `#[derive(Clone, Debug)]` because `Vec<u8>` isn't `Copy`. The ripple is small and mechanical: `EvalCx::load_local` shifts from `.copied().flatten()` to `.and_then(\|s\| s.as_ref()).cloned()`; `gw_mir::lower_comptime`'s `comptime_values.get(...).copied()` becomes `.cloned()`; the unary-minus operand match and `expect_bool` each gain a `CtValue::Str(_)` rejection arm. `eval_literal` adds an arm for `SyntaxKind::StringLit` decoding via the new `decode_string_literal(raw: &str) -> Vec<u8>` helper, which mirrors `gw_mir::decode_string_literal` byte-for-byte. Supported escapes: `\n \t \r \0 \\ \" \'`; unknown escapes pass through literally (the `\\` + following byte). **`RawStringLit` (`\\…\\` GW syntax) deliberately not handled** — the runtime decoder would mis-decode the `\\` delimiter as the `\\` escape sequence (a latent bug no corpus program exercises); CT.3b stays in lockstep with the validated runtime path. No comptime operations on strings (concat, `==`, `.len`); the tuple-dispatch's existing catch-all `_` rejects them via the `arithmetic_on_string_rejects` test invariant. `gw_typeck` `synth_comptime`'s inner-type gate widens to `Ty::Int(_) \| Ty::Bool \| Ty::Float(_) \| Ty::Slice(IntTy::U8)`; rejection message refreshed to name the new supported set ("`int`, `bool`, `float`, and `[]u8` string blocks only"). `gw_mir` `lower_comptime` signature gains `b: &mut Builder` (the call site in `lower_expr` already has it in scope) so the new arm can build an aggregate. The `(CtValue::Str(bytes), Ty::Slice(IntTy::U8))` arm interns bytes into `lcx.string_literals`, allocates a fresh `Ty::Slice(IntTy::U8)` local, pushes `AssignField data = Const::DataAddr(id)` and `AssignField len = Const::Int(n, USize)`, returns `Operand::Local(dst)`. The materialisation shape is identical to runtime `lower_string_literal`'s; codegen handles both through the same data-pointer + slice-aggregate path. +7 `gw_comptime` unit tests covering: bare literal decoded; empty string; `\n` escape decoded as byte 0x0A; multi-escape payload; unknown escape passes through; string + string rejects via the arithmetic catch-all; **`decode_string_literal_matches_runtime`** — the canonical lockstep assertion against the decoder contract. Storage-decision rationale: owned-inline `Vec<u8>` is simpler than threading a `&mut Vec<Vec<u8>>` storage borrow through every `EvalCx` consumer; the `CtValue: !Copy` change is load-bearing for CT.3c's anticipated `CtValue::Class(Vec<CtValue>)` aggregate shape. | 0 |
@@ -563,7 +567,7 @@ shape works end-to-end. **The Phase 2 CT.1 prediction
 "latent-shape risk from parser side-effects" is now
 fully discharged.**
 
-### What 282 corpus programs cover
+### What 284 corpus programs cover
 
 - Phase-0 syntax: every TokenKind variant, every operator precedence
   level, every supported statement form.
@@ -886,8 +890,8 @@ Exit code: 1. The match desugars to a chain of compare+branch
 sequences — two range tests (each two compares) for the first arm,
 three equality tests for the second, one equality test for `-1`,
 and a final `Goto` for the wildcard. Both backends produce
-bit-exactly the same value across all 282 single-file corpus
-programs (251 phase1 + 31 phase2_comptime) + 4 multi-file
+bit-exactly the same value across all 284 single-file corpus
+programs (253 phase1 + 31 phase2_comptime) + 4 multi-file
 projects.
 
 The Phase-2 `?T` surface (O.1) brings the canonical optional shape:
@@ -1817,14 +1821,15 @@ The big jump. Phase 2 brings:
 
 Estimated cost remaining: dozens of hours, distributed between
 the remaining CT.3 widenings (classes, optionals, error unions)
-the remaining B.x sub-bundles (B.1 mut-borrows through B.8
-safety tiers; see Phase 3 ladder below), and whatever path the
-`comptime fn` decl-level question takes.
-Bug yield so far is **3 caught + 1 deferred-and-now-resolved**
-across all twenty-two closed sub-bundles (twenty-one Phase-2 +
-B.0 from Phase 3):
+the remaining B.x sub-bundles (B.2 borrows across fn calls
+through B.8 safety tiers; see Phase 3 ladder below), and
+whatever path the `comptime fn` decl-level question takes.
+Bug yield so far is **4 caught + 1 deferred-and-now-resolved**
+across all twenty-three closed sub-bundles (twenty-one Phase-2 +
+B.0 + B.1 from Phase 3):
 (C.1+C.2+M.1+M.2+M.3+O.2+F.1+F.2+F.3+CT.1+CT.2a+CT.2b+CT.2c+CT.2d+CT.2e+impl-tail-ret+block-like-tail+CT.3a+CT.3b+B.0
-= 0 caught, O.1 = 1 caught, O.3 = 2 caught, CT.1's E0315
+= 0 caught, O.1 = 1 caught, O.3 = 2 caught, B.1 = 1 caught
+(deref-LHS type not recorded in `expr_types`), CT.1's E0315
 "deferred" entry resolved by implicit-tail-return, against
 a 12/A.x prediction of ~16-21 — the recombination
 + organisational sub-bundles under-shot prediction because
@@ -1869,9 +1874,23 @@ exhaustive-match checking surfaced every missing arm at compile
 time, the LLVM codegen's "every local gets an alloca" shape
 made `Rvalue::Ref` literally `cx.allocas[target]`, and the
 Cranelift `address_taken_locals` metadata is small enough to
-inspect by hand. The recombination rule predicts B.1 (`&mut`)
+inspect by hand. The recombination rule predicted B.1 (`&mut`)
 rides on B.0 cleanly because the only addition is a mutability
 bit at the type level; storage / codegen shape stays identical.
+B.1's observed yield was 1, half the prediction of "rides
+cleanly with zero new bugs": the variant migration *did* land
+zero-bug end-to-end (every consumer pattern auto-updated under
+exhaustive-match), but `synth_assign`'s deref-LHS arm — added
+to type-check the new `*r = v` shape — computed the LHS type
+locally without recording it into `expr_types`, so MIR's
+`StoreThroughRef` saw `Ty::Error` for the store width whenever
+the RHS was a Local. The const-RHS smoke test masked the bug
+because LLVM's `read_operand` const path ignores the `ty`
+argument. The lesson for B.2+ is that any new typeck arm that
+synthesises an LHS / pattern type without going through
+`synth_expr` needs an explicit `expr_types.insert` if MIR
+will later read that node's type — `synth_expr` does it for
+free, hand-rolled synthesis sites don't.
 
 The dual-backend test now in place means any Phase 2 codegen change
 is automatically validated against both Cranelift and LLVM; this
@@ -1939,7 +1958,7 @@ evaluator (see resolved open question #4 below; shared
 compile-time constants in Phase 2 use module-level
 `let CONSTANT: T = comptime { ... };` instead).
 
-#### Phase 3 ladder: B.0 opened, B.1–B.8 queued
+#### Phase 3 ladder: B.0 + B.1 closed, B.2–B.8 queued
 
 Phase 2 isn't strictly complete (CT.3c+ remain corpus-motivated)
 but Phase 3 is now in flight in parallel. The architecture's
@@ -1963,9 +1982,25 @@ mirroring CT.x's incremental closure:
   Corpus: `220_borrow_int.gw` → 5, `221_borrow_then_let.gw`
   → 42, `222_borrow_arith.gw` → 30.
 
-- **B.1 — `&mut` + writes** (pending). Parser accepts `&mut`;
-  `Ty::Ref` gains a `mut: bool` flag; `*r = v` allowed when
-  `r: &mut T`. Still no borrow checking. Predicted yield ~1.
+- **B.1 — `&mut` + writes is closed** (commit `080bd1a`):
+  `KwMut` reserved (lexer + AST + syntax-kind plumbing);
+  `parse_type` and `parse_atom` eat an optional `KwMut` after
+  a leading `Amp`. `Ty::Ref(RefInner)` migrates to the struct
+  variant `Ty::Ref { mutable: bool, inner: RefInner }`
+  (`Ty: Copy` preserved — `RefInner` is closed and `bool` is
+  `Copy`). `synth_assign` gains a `*r = v` arm gated on
+  `mutable: true` (rejects `&T` writes with a dedicated
+  diagnostic, rejects non-ref operands with the existing
+  `expected &mut T` message). MIR grows `MirStmt::StoreThroughRef
+  { ptr, value, ty }`; both backends emit a single
+  pointer-typed store at the operand's width (Cranelift
+  `fb.ins().store(MemFlags::new(), val, ptr_val, 0)`; LLVM
+  `builder.build_store(ptr_val.into_pointer_value(), val)`).
+  Still no borrow checking. Corpus: `242_mut_borrow_write.gw`
+  → 10 (write through `&mut x`, read back via the original
+  name), `243_mut_borrow_then_read.gw` → 42 (write, then
+  read+rewrite through the same `&mut`). Yield: 1 — see ledger
+  row.
 
 - **B.2 — borrows across fn calls** (pending). `fn read(r:
   &i32) -> i32` etc. Function-local regions only — no
@@ -2154,17 +2189,16 @@ state this doc describes:
 ```bash
 cd /Users/silmaril/Documents/GitHub/gw
 git log --oneline | head -10
-# expect tip: HANDOFF refresh after B.0 (this commit),
-#             94f64cf (fmt + clippy fix-up), f85a94e (B.0
-#             borrow-surface tracer), 79de636 (HANDOFF refresh
-#             after CT.3b), f8bd7df (CT.3b comptime string
-#             literals), 1df3f3b (HANDOFF refresh after CT.3a),
-#             0b3ccba (CT.3a comptime float arithmetic +
-#             comparisons), 2d069a6 (HANDOFF refresh after
-#             block-like-tail), 9ac51a1 (block-like-tail parser
-#             widening + divergent-tail discard), c215ce4
-#             (HANDOFF refresh after impl-tail-ret) at the
-#             bottom of head -10.
+# expect tip: HANDOFF refresh after B.1 (this commit),
+#             080bd1a (B.1 `&mut` borrows + writes through
+#             references), e494494 (HANDOFF refresh after
+#             B.0), f85a94e (B.0 borrow-surface tracer),
+#             94f64cf (fmt + clippy fix-up), 79de636 (HANDOFF
+#             refresh after CT.3b), f8bd7df (CT.3b comptime
+#             string literals), 1df3f3b (HANDOFF refresh after
+#             CT.3a), 0b3ccba (CT.3a comptime float arithmetic
+#             + comparisons), 2d069a6 (HANDOFF refresh after
+#             block-like-tail) at the bottom of head -10.
 
 git status
 # expect: clean working tree.
@@ -2180,15 +2214,16 @@ export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
 
 . "$HOME/.cargo/env"
 cargo test --manifest-path compiler/gw-bootstrap/Cargo.toml --workspace --no-fail-fast 2>&1 | grep "test result" | awk '{p+=$4;f+=$6}END{print p,f}'
-# expect: "292 0" (B.0's 3 new corpus fixtures are absorbed by
+# expect: "292 0" (B.1's 2 new corpus fixtures are absorbed by
 # the existing phase1_run + llvm_backend walkers — no net new
-# unit tests landed in B.0).
+# unit tests landed in B.1; same as B.0).
 
 ls tests/corpus/pass/phase1/*.gw | wc -l
-# expect: 251 (was 248; +3 B.0 borrow-tracer fixtures numbered
-#         220_..222_ on top of the 4 implicit-tail-return
-#         fixtures 200_..203_ and the 3 block-like-tail
-#         fixtures 204_..206_)
+# expect: 253 (was 251; +2 B.1 mut-borrow fixtures numbered
+#         242_mut_borrow_write and 243_mut_borrow_then_read,
+#         picked from the next free slot since 223/224 were
+#         already slice fixtures, on top of B.0's three
+#         220_..222_ borrow-tracer fixtures)
 
 ls tests/corpus/pass/phase2_comptime/*.gw | wc -l
 # expect: 31 (ct1_tracer + 4 ct2a_* + 4 ct2b_* + 4 ct2c_* + 5
