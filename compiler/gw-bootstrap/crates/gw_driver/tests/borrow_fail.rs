@@ -98,4 +98,3 @@ fn run_through_borrow(path: &std::path::Path) -> Vec<String> {
         })
         .collect()
 }
-
