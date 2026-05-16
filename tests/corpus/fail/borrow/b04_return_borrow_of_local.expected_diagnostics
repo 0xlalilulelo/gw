@@ -1,0 +1,6 @@
+// `&x` inside `dangle` anchors the returned reference to `x`, a
+// let-binding local. B.4's origin analysis flags this as a
+// dangling borrow — the returned pointer would point at storage
+// that the fn return invalidates. Diag span points at `x`'s
+// let-binding.
+E0401:2:9

@@ -1,0 +1,10 @@
+fn confused() -> &i32 {
+    let x: i32 = 42;
+    let r: &i32 = &x;
+    return r;
+}
+
+fn main() -> i32 {
+    let p: &i32 = confused();
+    return *p;
+}

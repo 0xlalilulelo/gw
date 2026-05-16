@@ -9,13 +9,26 @@
 //! genuinely-uninit reads from `let x: T;` (no initialiser) and
 //! conditional inits that don't cover every path.
 //!
+//! Phase 3 increment B.4 adds a region-origin analysis: each
+//! ref-typed local gets a set of "anchor" origins (either a
+//! parameter, which outlives the fn return, or a let-binding,
+//! which dies at fn return). Returns whose ref traces back to a
+//! let-binding anchor emit `BORROW_OUTLIVES_FN` (E0401). This
+//! catches the canonical dangling-borrow shape `fn dangle() ->
+//! &i32 { let x: i32 = 5; return &x; }` without requiring the
+//! full loan-tracking machinery of B.5. The origin sets double
+//! as the seed data structure B.5's loan-tracking dataflow will
+//! consume to compute "which loans are still in scope at point
+//! P".
+//!
 //! See `docs/architecture.md` Part D.5 for the long-form design.
 
 use gw_lex::diag::{Diagnostic, Label};
 use gw_mir::{
     BlockId, Const, Local, MirBlock, MirFn, MirProgram, MirStmt, Operand, Rvalue, Terminator,
 };
-use rustc_hash::FxHashSet;
+use gw_typeck::Ty;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Error codes raised by the borrow checker (E0400-series).
 pub mod ec {
@@ -23,15 +36,21 @@ pub mod ec {
     /// A local is read on at least one control-flow path where it
     /// has not been initialized.
     pub const USE_OF_UNINIT_LOCAL: ErrorCode = ErrorCode(400);
+    /// A returned reference traces back to a local whose storage
+    /// ends at the function's return — the caller would receive a
+    /// dangling pointer.
+    pub const BORROW_OUTLIVES_FN: ErrorCode = ErrorCode(401);
 }
 
-/// Run B.3's move-tracking dataflow over `prog` and return the
+/// Run the borrow-checker pipeline over `prog` and return all
 /// accumulated diagnostics. An empty vec means the program is
-/// initialization-clean.
+/// borrow-clean. Currently includes B.3's init dataflow and B.4's
+/// region-origin analysis.
 pub fn check_program(prog: &MirProgram) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     for f in &prog.functions {
         check_fn(f, &mut diags);
+        check_region_origins(f, &mut diags);
     }
     diags
 }
@@ -268,7 +287,176 @@ fn make_uninit_diag(f: &MirFn, local: Local) -> Diagnostic {
     d
 }
 
+/// Anchor for the "where does this reference's storage live"
+/// origin analysis. A `Param` anchor is a parameter local — its
+/// storage lives in the caller's frame and outlives the fn
+/// return, so returning a ref anchored to it is safe. A
+/// `LocalScope` anchor is a let-binding local — its storage
+/// dies when the fn returns, so returning a ref anchored to it
+/// would hand the caller a dangling pointer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+enum Origin {
+    Param(Local),
+    LocalScope(Local),
+}
+
+/// Phase 3 increment B.4: region-origin analysis on MIR. For
+/// each ref-typed local, compute the set of `Origin` anchors
+/// its storage transitively points at. On `Return(Local(r))`
+/// where `r` is ref-typed, if any anchor in `origins[r]` is a
+/// `LocalScope`, the returned pointer would dangle — emit
+/// `BORROW_OUTLIVES_FN` (E0401).
+fn check_region_origins(f: &MirFn, diags: &mut Vec<Diagnostic>) {
+    if f.blocks.is_empty() {
+        return;
+    }
+
+    // Build the initial origin map by scanning every `Rvalue::Ref`
+    // in the function. Each ref expression seeds its dst local's
+    // origin set with one anchor that classifies the target as
+    // either a parameter or a let-scope local.
+    let params: FxHashSet<Local> = f.params.iter().copied().collect();
+    let mut origins: FxHashMap<Local, FxHashSet<Origin>> = FxHashMap::default();
+    for blk in &f.blocks {
+        for stmt in &blk.statements {
+            if let MirStmt::Assign {
+                dst,
+                value: Rvalue::Ref { target, .. },
+            } = stmt
+            {
+                let anchor = if params.contains(target) {
+                    Origin::Param(*target)
+                } else {
+                    Origin::LocalScope(*target)
+                };
+                origins.entry(*dst).or_default().insert(anchor);
+            }
+        }
+    }
+
+    // Fixpoint-propagate origins along ref-typed assignment chains
+    // and through call-result locals. The lattice is
+    // `(FxHashMap<Local, FxHashSet<Origin>>, ⊆)`; transfer is
+    // monotone (only ever inserts), so a single re-iteration loop
+    // converges in O(stmts × distinct-locals) time.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for blk in &f.blocks {
+            for stmt in &blk.statements {
+                // `dst = Use(src)` propagates src's origins if src
+                // is ref-typed. Ignore non-ref locals — their
+                // origin sets are uninteresting.
+                if let MirStmt::Assign {
+                    dst,
+                    value: Rvalue::Use(Operand::Local(src)),
+                } = stmt
+                {
+                    if is_ref(f, *src) && propagate(&mut origins, *src, *dst) {
+                        changed = true;
+                    }
+                }
+            }
+            // A call that returns a `&T` produces a ref-typed dst.
+            // Per Phase-1 elision (no explicit lifetime
+            // annotations) the conservative rule is: dst's origin
+            // set is the union of every ref-typed argument's
+            // origin set. This matches Rust's elision when the
+            // return lifetime equals any one of the input
+            // lifetimes — for "function-local" regions it's
+            // sufficient because the only thing we ask of `dst`
+            // is whether it traces back to a caller-side anchor.
+            if let Terminator::Call { args, dst, .. } = &blk.terminator {
+                if is_ref(f, *dst) {
+                    let mut union: FxHashSet<Origin> = FxHashSet::default();
+                    for a in args {
+                        if let Operand::Local(a_local) = a {
+                            if is_ref(f, *a_local) {
+                                if let Some(s) = origins.get(a_local) {
+                                    union.extend(s.iter().copied());
+                                }
+                            }
+                        }
+                    }
+                    if !union.is_empty() {
+                        let entry = origins.entry(*dst).or_default();
+                        for o in union {
+                            if entry.insert(o) {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Diagnostic pass: every `Return(Local(r))` where `r` is
+    // ref-typed and `origins[r]` contains at least one
+    // `LocalScope` anchor is a dangling-borrow return. Emit one
+    // diagnostic per offending fn-return — dedupe via a flag so
+    // multiple-return-block shapes don't double-fire on the same
+    // origin chain.
+    let mut reported = false;
+    for blk in &f.blocks {
+        if reported {
+            break;
+        }
+        let Terminator::Return(Operand::Local(r)) = &blk.terminator else {
+            continue;
+        };
+        if !is_ref(f, *r) {
+            continue;
+        }
+        let Some(anchors) = origins.get(r) else {
+            continue;
+        };
+        let dangling_anchor = anchors.iter().find(|o| matches!(o, Origin::LocalScope(_)));
+        if let Some(Origin::LocalScope(local)) = dangling_anchor {
+            diags.push(make_dangling_diag(f, *local));
+            reported = true;
+        }
+    }
+}
+
+fn propagate(origins: &mut FxHashMap<Local, FxHashSet<Origin>>, src: Local, dst: Local) -> bool {
+    let src_set = match origins.get(&src) {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => return false,
+    };
+    let entry = origins.entry(dst).or_default();
+    let mut changed = false;
+    for o in src_set {
+        if entry.insert(o) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn is_ref(f: &MirFn, l: Local) -> bool {
+    matches!(f.locals[l.0 as usize].ty, Ty::Ref { .. })
+}
+
+fn make_dangling_diag(f: &MirFn, local: Local) -> Diagnostic {
+    let span = f.locals[local.0 as usize].span;
+    let mut d = Diagnostic::error(
+        ec::BORROW_OUTLIVES_FN,
+        Label::new(span, "borrowed local declared here"),
+        "returned reference outlives the function — borrow points at a local whose storage ends at this fn's return",
+    );
+    d.notes.push(
+        "Phase 3 B.4 enforces region-validity on function returns: \
+         a returned `&T` must trace back to a parameter (caller-owned) \
+         rather than a let-binding (callee-scope). Either return by \
+         value, or rewrite the API so the caller supplies the storage \
+         (`fn out(out: &mut T) { ... }`)."
+            .into(),
+    );
+    d
+}
+
 /// Re-export the borrow-checker error-code namespace so callers
 /// (the driver, tests) can name codes without depending directly
 /// on `gw_lex::ErrorCode` numerics.
-pub use ec::USE_OF_UNINIT_LOCAL;
+pub use ec::{BORROW_OUTLIVES_FN, USE_OF_UNINIT_LOCAL};

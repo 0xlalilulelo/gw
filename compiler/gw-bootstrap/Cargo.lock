@@ -310,6 +310,7 @@ version = "0.0.1"
 dependencies = [
  "gw_lex",
  "gw_mir",
+ "gw_typeck",
  "rustc-hash",
 ]
 

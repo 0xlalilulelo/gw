@@ -1,0 +1,6 @@
+// `&x` is held in a let-binding `r`, which is then returned. The
+// origin of `r` propagates through the `Assign { dst: r, value:
+// Use(Local(tmp)) }` chain back to the original `Ref { target: x
+// }`. B.4's fixpoint propagation catches the indirection;
+// returning `r` still resolves to a LocalScope anchor on `x`.
+E0401:2:9

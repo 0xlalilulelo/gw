@@ -8,6 +8,7 @@ description            = "GW region-based borrow checker (Phase 3+). See docs/ar
 
 [dependencies]
 gw_lex     = { workspace = true }
+gw_typeck  = { workspace = true }
 gw_mir     = { workspace = true }
 rustc-hash = { workspace = true }
 
