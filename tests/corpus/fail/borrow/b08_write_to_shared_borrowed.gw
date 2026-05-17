@@ -1,0 +1,11 @@
+fn main() -> i32 {
+    let x: i32 = 5;
+    let r: &i32 = &x;
+    x = 10;
+    return *r;
+}
+// Direct write to a local while a shared borrow is still
+// live. B.5's direct-write arm flags the assignment as a
+// conflict with the active shared loan on `x`. This is the
+// `Assign { dst: x, ... }`-vs-existing-loan-on-x rule (no
+// reference is involved on the LHS — just the original name).

@@ -1,0 +1,12 @@
+fn main() -> i32 {
+    let x: i32 = 5;
+    let r: &i32 = &x;
+    let q: &mut i32 = &mut x;
+    *q = 10;
+    return *r;
+}
+// A shared `&x` and a mutable `&mut x` cannot coexist on the
+// same local — the shared loan would observe the mutable
+// borrow's writes. B.5 flags this at the gen site of the
+// second (mutable) borrow; diagnostic span points at the
+// borrowed local's declaration.

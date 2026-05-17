@@ -1,0 +1,14 @@
+fn main() -> i32 {
+    let x: i32 = 5;
+    let r: &mut i32 = &mut x;
+    let q: &mut i32 = &mut x;
+    *r = 10;
+    *q = 20;
+    return *q;
+}
+// Two `&mut x` of the same local cannot coexist — at the
+// moment `q` is created, `r`'s mutable loan is still in scope
+// (loans live to end-of-fn under Phase 3 B.5's function-scoped
+// region rules). B.5 flags the conflict at `x`'s declaration
+// site (the borrowed-local span; same convention as B.4's
+// E0401). The diag fires once per place.
