@@ -15,37 +15,41 @@ This document is the entry point for the next development session. Read it first
 > are mechanically derivable. See the original rename plan in the
 > session transcript and commits 1–6 on `main`.
 
-> **Last updated:** 2026-05-16, after Phase 3 B.4 — region-origin
-> analysis + dangling-borrow reject (commit `fe733b5`). `gw_borrow`
-> grows its second pass alongside B.3's init dataflow: per-fn
-> origin map seeded by scanning every `Rvalue::Ref` (parameters
-> anchor as `Origin::Param(local)`, outlive the fn return;
-> let-binding locals anchor as `Origin::LocalScope(local)`, die
-> at the fn return); fixpoint-propagated through ref-typed
-> `Assign { dst, Use(Local(src)) }` chains and through
-> `Terminator::Call { args, dst, .. }` where `dst` is ref-typed
-> (union of every ref-typed argument's origins — Phase-1 elision
-> rule). On `Return(Local(r))` where `r` is ref-typed, any
-> `LocalScope` anchor in `origins[r]` emits `BORROW_OUTLIVES_FN`
-> (E0401) at the borrowed local's `LocalDecl.span`. Zero new lex
-> / parse / typeck / MIR machinery — pure analysis on existing
-> MIR shapes. Origin sets are also the seed data structure B.5's
-> loan-tracking dataflow will consume. Two new fail fixtures
-> (b04 direct `return &x;`, b05 indirect `let r = &x; return r;`
-> that exercises the fixpoint propagation). Closed sub-bundles
-> preceding: B.3 move-tracking dataflow framework (`ba39a73`),
-> B.2 borrows across fn calls (`cc9a6ca`), B.1 `&mut` borrows +
-> writes (`080bd1a`), B.0 borrow-surface tracer (`f85a94e`),
-> CT.3b string literals (`f8bd7df`), CT.3a float (`0b3ccba`),
-> block-like-tail (`9ac51a1`), implicit-tail-return (`579c4f0`),
-> CT.2 entirely.
+> **Last updated:** 2026-05-16, after Phase 3 B.5 — loan tracking
+> + aliasing rule on mutating accesses (commit `76ac9c2`). The
+> borrow checker proper: `gw_borrow` gains its third pass riding
+> on B.3's worklist machinery and B.4's origin map. Each
+> `Rvalue::Ref` site becomes a loan `(place, mutable)`; the
+> dataflow lattice is `(2^Loans, ⊆)` with union join and
+> gen-only-no-kill transfer — matching the architecture's
+> "function-local, scope-bounded regions" simplification
+> (loans live to end-of-fn because Phase 1 has no sub-fn
+> binding scopes). Three mutating-access shapes emit
+> `CONFLICTING_BORROW` (E0402): Ref gen-site (mut+any or
+> shared+mut on the same place); direct write of a borrowed
+> local (`x = …` while `&x` is live); `StoreThroughRef`
+> writing through `*r` to a place that has another live loan
+> not held by `r` (consumes B.4's origins for the underlying-
+> place resolution). Shared-read aliasing checks (read-while-
+> mut) are **deferred to B.5b** — they require a backward
+> liveness pass on ref locals to avoid rejecting existing
+> positive fixture 242 (`let r = &mut x; *r = 10; return x;`),
+> which Rust's NLL accepts under last-use loan death. Three
+> new fail fixtures (b06 two `&mut`, b07 shared+`&mut`, b08
+> direct write to borrowed). Closed sub-bundles preceding:
+> B.4 region-origin analysis (`fe733b5`), B.3 move-tracking
+> dataflow framework (`ba39a73`), B.2 borrows across fn calls
+> (`cc9a6ca`), B.1 `&mut` borrows + writes (`080bd1a`), B.0
+> borrow-surface tracer (`f85a94e`), CT.3b string literals
+> (`f8bd7df`), CT.3a float (`0b3ccba`), block-like-tail
+> (`9ac51a1`), implicit-tail-return (`579c4f0`), CT.2 entirely.
 > **Repo root:** `/Users/silmaril/Documents/GitHub/gw`
 > **Workspace tests:** 293 unit + integration, all green
-> (B.4 adds no new walker — its two fixtures ride B.3's
+> (B.5 adds no new walker — its three fixtures ride B.3's
 > `borrow_fail_corpus` glob).
 > **Corpus:** 62 Phase-0 lex+parse snapshots + 258 Phase-1 + 31
 > Phase-2 comptime single-file run-tests + 4 Phase-2 multi-file
-> projects + 5 Phase-3 borrow-reject (the first fail-corpus
+> projects + 8 Phase-3 borrow-reject (the first fail-corpus
 > outside lex+parse).
 
 ---
@@ -147,7 +151,7 @@ gw/
 │   ├── pass/lexparse/           (61 .gw + insta snapshots — Phase 0)
 │   ├── pass/phase1/             (258 .gw + .expected_exit / .expected_stdout)
 │   ├── fail/lexparse/           (5 .gw + .expected_diagnostics)
-│   └── fail/borrow/             (5 .gw + .expected_diagnostics — B.3 + B.4 reject corpus)
+│   └── fail/borrow/             (8 .gw + .expected_diagnostics — B.3 + B.4 + B.5 reject corpus)
 ├── compiler/gw-bootstrap/       (Cargo workspace — host = Rust 1.95+)
 │   └── crates/
 │       ├── gw_lex/         ★ active
@@ -160,7 +164,7 @@ gw/
 │       ├── gw_codegen_fast/★ active (Cranelift-backed)
 │       ├── gw_codegen_llvm/★ active (LLVM-18-backed via inkwell, Phase 13)
 │       ├── gw_driver/      ★ active (the `gw` binary)
-│       ├── gw_borrow/      ★ active (Phase 3 — B.3 dataflow + B.4 region-origin; B.5–B.8 queued)
+│       ├── gw_borrow/      ★ active (Phase 3 — B.3 dataflow + B.4 origins + B.5 loans; B.5b/B.6–B.8 queued)
 │       ├── gw_lir/                stub  (Phase 7)
 │       ├── gw_jit/                stub  (Phase 7)
 │       ├── gw_lsp/                stub  (Phase 9)
@@ -234,6 +238,7 @@ Each increment shipped one or more corpus programs and a single commit.
 | F.1 | multi-file tracer (cross-file resolve, flat namespace) | `57b275d` | +2 multi-file projects (01, 02) | new `DiagBag::merge` drains another bag's diagnostics into self; new `resolve_modules(primary, extras, ...)` accepts a primary module plus zero or more secondary modules, all defs in one flat namespace; driver auto-discovers sibling `.gw` files in the build target's directory, sorts by path, reads each into the shared SourceMap, parses each into a `SyntaxNode<'bump>` (one `FileArena` per file, all sharing one `Bump`); top-level statements in sibling files diagnose with new TOP_LEVEL_STMTS_IN_LIBRARY (E0203); +3 resolver unit tests + 2 corpus projects (`01_add_two_files`, `02_cross_file_class`) | 0 |
 | F.2 | `mod` + `use` declarations (opt-in modules) | `6969f64` | +1 multi-file project (03) | parser `parse_mod_decl` and `parse_use_decl`; AST `Item::Mod(ModDecl)` and `Item::Use(UseDecl)` promoted from `Stub` with `name()` accessors; resolver `process_module` puts items from `mod foo;` files in `module_tables[foo]` instead of the global flat `by_name`; F.2 globally flattens use'd module items into `by_name` (later refined in F.3); two new error codes E0204 UNKNOWN_MODULE and E0205 DUPLICATE_MOD; renamed fail fixture `f02_unsupported_mod.gw` → `f02_malformed_mod.gw` with refreshed expected diagnostics; +5 resolver unit tests + 1 corpus project (`03_mod_use`) | 0 |
 | F.3 | per-file `use` scoping | `aab3f0b` | +1 multi-file project (04) | `ResolvedModule` gains `file_scopes: FxHashMap<FileId, FxHashMap<String, DefId>>`; new `lookup_in_file(file, name)` consults the per-file scope, falling back to flat `by_name` for AST-test callers without a file context; resolver post-pass builds each file's effective scope = flat pool + own items + items from modules the file `use`s; conflicts within a single file's scope diagnose as DUPLICATE_DEFINITION; F.2's global-import code path is gone — `by_name` is no longer enriched by `use` decls; `register_fn` / `register_class` return `(name, DefId)` so `process_module` can record file-local items; typeck `Cx` gains `current_file: FileId` field set by `check_fn_body` and `check_synthetic_main_body`; four name-lookup sites switch from `cx.tm.resolved.lookup` to `lookup_in_file(cx.current_file, name)`; +1 resolver unit test (`use_only_visible_in_declaring_file`) + 1 corpus project (`04_use_per_file`) | 0 |
+| B.5 | loan tracking + aliasing rule on mutating accesses (borrow checker proper; per-fn loan table seeded by `Rvalue::Ref` sites; forward dataflow on `(2^Loans, ⊆)` with union join + gen-only-no-kill — function-local region simplification means loans live to end-of-fn; three mutating-access conflict shapes: (1) `Rvalue::Ref` gen-site mut+any/shared+mut on same place, (2) direct write of a borrowed local, (3) `StoreThroughRef` through-pointer write checking origins[ptr]-anchored loans not held by ptr; emits `CONFLICTING_BORROW` (E0402); per-place dedupe; **shared-read aliasing deferred to B.5b**) | `76ac9c2` | +3 phase3 reject fixtures (`b06_two_mut_borrows_of_local.gw` → E0402, `b07_shared_and_mut_borrow.gw` → E0402, `b08_write_to_shared_borrowed.gw` → E0402) | `gw_borrow` gains a third per-fn pass `check_loans` running alongside B.3's init dataflow and B.4's region-origin pass; all three invoked from the same `check_program` entrypoint. **Refactor**: `check_region_origins` split into pure `compute_origins(f) -> FxHashMap<Local, FxHashSet<Origin>>` (B.4 seed + fixpoint, no diag emission) and a thinned `check_region_origins(f, &origins, diags)` for the E0401 walk; `check_program` computes origins once and threads them through both B.4 and B.5 so the through-pointer access resolution doesn't redo the work. Public surface gains `ec::CONFLICTING_BORROW = ErrorCode(402)`. **Loan table**: scan every `MirStmt::Assign { dst, value: Rvalue::Ref { target, .. } }`; each site gets a `LoanId`; `Loan { place: target, mutable: ref_mutability(f, dst) }` where `ref_mutability` reads `Ty::Ref { mutable, .. }` from the dst-local's type. `loan_at_stmt: FxHashMap<(BlockId-as-usize, stmt_idx), LoanId>` lets later passes re-locate the loan from its position without rescanning the rvalue. **Holds fixpoint** (per-local set of loans the local can carry): seed at each ref gen-site with `holds[dst] |= {LoanId}`; propagate along ref-typed `Assign { dst, Use(Local(src)) }` chains and through `Terminator::Call { args, dst, .. }` (Phase-1 elision union over ref-typed args) — same monotone-grow-only shape as B.4's origins. Used at through-pointer access sites to exclude the loans the pointer itself holds (the legitimate use). **Live-loan dataflow**: forward, union join, gen-only. `block_in[entry] = ∅`; `block_in[B] = ⋃ block_out[pred]`; `block_out[B] = block_in[B] ∪ block_gen[B]`. Iterate to fixpoint; monotone-grow-only ⇒ convergence in O(blocks × loans). **Diagnostic pass**: walk each block with `block_in` as a running `live: FxHashSet<LoanId>`; at each stmt + terminator dispatch the three mutating-access checks above; emit one `make_conflicting_borrow_diag(f, place)` per (place, fn) thanks to a `reported: FxHashSet<Local>` dedupe. Diagnostic primary span is `f.locals[place.0 as usize].span` (the borrowed local's declaration site) — same convention as B.3's E0400 / B.4's E0401, easy to compute, stable for fixture diagnostic strings (`E0402:line:col` of the borrowed local's let-binding). Three fail-corpus fixtures pin the canonical shapes: b06 (`let r = &mut x; let q = &mut x;` — mut+mut at gen, fires on q's site), b07 (`let r = &x; let q = &mut x;` — shared+mut at gen, fires on q's site), b08 (`let r = &x; x = 10;` — direct write to borrowed local). All three expected to fire E0402 at line 2 col 9 (where `x` is declared). **Scope deliberately reduced**: shared-read aliasing (read-while-mut by name + deref-through-shared-ref-while-mut-loan-exists) is **deferred to B.5b** alongside backward liveness of ref locals. The naive end-of-fn loan-death rule combined with a shared-read check would reject existing positive fixture `242_mut_borrow_write.gw` (`let r = &mut x; *r = 10; return x;`) which Rust's NLL accepts under last-use loan death. Catching that shape requires a backward liveness pass on ref locals to compute loan-death = last-use-of-any-holder, which is the natural B.5b sub-bundle. The mutating-access checks alone catch the three canonical conflict shapes without false-positives on the existing 248-fixture phase1 corpus. Architecture spec: D.5 steps 2-3 ("aliasing rule check": mut access conflicts with any loan; shared access conflicts with mut loan; path-prefix analysis on places). Phase 1's path-prefix collapses to local-equality because `synth_unary::Amp` rejects anything that isn't a path-to-local — no `&x.field`, no `&literal`, no `&call()`. | 0 |
 | B.4 | region-origin analysis + dangling-borrow reject (per-fn origin sets seeded from every `Rvalue::Ref`; `Origin::{Param(local), LocalScope(local)}` anchor classification by `f.params` membership; fixpoint propagation through ref-typed `Assign { dst, Use(Local(src)) }` chains and `Terminator::Call { args, dst, .. }` results — Phase-1 elision rule unions over ref-typed args; `Return(Local(r))` with any `LocalScope` anchor in `origins[r]` emits `BORROW_OUTLIVES_FN` (E0401); deduped to one diag per fn) | `fe733b5` | +2 phase3 reject fixtures (`b04_return_borrow_of_local.gw` → E0401, `b05_return_borrow_via_let.gw` → E0401) | `gw_borrow` grows a second per-fn pass `check_region_origins` running alongside B.3's init dataflow; both invoked from the same `check_program` entrypoint. Public surface gains `ec::BORROW_OUTLIVES_FN = ErrorCode(401)`. Algorithm: build the initial origin map by scanning every `MirStmt::Assign { dst, value: Rvalue::Ref { target, .. } }` — seed `origins[dst]` with `Origin::Param(target)` if `target ∈ f.params`, else `Origin::LocalScope(target)`. Lattice = `(FxHashMap<Local, FxHashSet<Origin>>, ⊆)`; transfer is monotone (only ever inserts), so a single `while changed` loop converges in O(stmts × distinct-locals). Two propagation rules per iteration: (a) `Assign { dst, Use(Operand::Local(src)) }` where `src` is ref-typed → union `origins[src]` into `origins[dst]`. (b) `Terminator::Call { args, dst, .. }` where `dst` is ref-typed → union every ref-typed arg's `origins[a_local]` into `origins[dst]`. The call-result union is the Phase-1 elision conservative rule — without lifetime annotations in signatures, "the result's region equals the union of input regions" is sufficient because the only thing we ask of `dst` later is whether it traces back to a caller-side anchor. After fixpoint, walk each block's `Terminator::Return(Operand::Local(r))`; if `r` is ref-typed and `origins[r]` contains any `Origin::LocalScope(local)`, emit `make_dangling_diag(f, local)` and set `reported = true`. The single-fire dedupe handles multi-return-block shapes (e.g. `fn pick(c: bool) -> &i32 { if c { return &a; } else { return &b; } }`) without filing two diagnostics on the same dangling chain. Diagnostic span is the borrowed local's `LocalDecl.span` (the `let x: i32 = …` site); the user-facing note suggests "return by value, or rewrite the API so the caller supplies the storage". `is_ref(f, l) = matches!(f.locals[l.0 as usize].ty, Ty::Ref { .. })` is the discriminator gate consulted across every arm — `Ty::Ref` already carried the struct-variant shape since B.1, so the gate is structural. `gw_borrow/Cargo.toml` picks up `gw_typeck` as a workspace dep (was lex + mir + rustc-hash only). Two fail-corpus fixtures pin both shapes: b04 (`fn dangle() -> &i32 { let x: i32 = 5; return &x; }` — direct return-of-ref; tests the seed → return path with no propagation) and b05 (`fn confused() -> &i32 { let x: i32 = 42; let r: &i32 = &x; return r; }` — indirect return through a let-binding ref; tests the `Assign { dst: r, Use(Local(tmp)) }` chain that the fixpoint must traverse). Both fixtures absorbed by B.3's existing `borrow_fail_corpus` walker via `insta::glob!` — no new test infrastructure. Origin sets double as the seed data structure B.5's loan-tracking dataflow will consume to compute "which loans are still in scope at point P"; the `Origin` enum is intentionally minimal (two variants, both carrying the source `Local`) so B.5's lattice extension can re-use the anchors directly. | 0 |
 | B.3 | move-tracking dataflow framework (first actual checker pass; `MaybeInitialized` lattice on MIR; emits E0400 `USE_OF_UNINIT_LOCAL`; bootstraps `tests/corpus/fail/borrow/`; **Phase-1 surface is Copy-by-default so no move-out transitions caught today** — the framework catches genuine uninit reads from `let x: T;` and conditional-init shapes) | `ba39a73` | +1 phase1 fixture (`248_uninit_both_arms_init.gw` → 42) + 3 phase3 reject fixtures (`b01_use_of_uninit.gw` → E0400, `b02_conditional_init.gw` → E0400, `b03_loop_no_init.gw` → E0400) + 1 walker (`gw_driver/tests/borrow_fail.rs`) | `gw_borrow` stub becomes a real crate. Public surface: `check_program(prog: &MirProgram) -> Vec<Diagnostic>` and the `ec::USE_OF_UNINIT_LOCAL` constant (E0400 — new 400-series namespace for the borrow checker). Algorithm per `MirFn`: build predecessor / successor adjacency from each block's terminator; entry-block in-set = `f.params`; worklist iteration with `Option<FxHashSet<Local>>` per block (`None` = "predecessor not yet processed", distinct from "empty intersection"); join = set intersection over predecessors with `Some` out-set; transfer adds `MirStmt::Assign.dst`, `MirStmt::AssignField.dst` (see AssignField semantics below), `Terminator::Call.dst`. After fixpoint, walk each reachable block with its converged in-state and emit one diag per local with a possibly-uninit read; dedupe by `Local` so multiple reads of the same uninit local produce a single E0400. Diagnostic span is the local's `LocalDecl.span` (the let-binding) — perfectly adequate for B.3-grade messaging; finer-grained per-use spans ride a future sub-bundle alongside MirStmt span instrumentation. **AssignField semantics**: treated as a *write* of the dst (init transfer) rather than a read-requiring-init, because `lower_struct_lit` emits one `AssignField` per field on a freshly-allocated dst with no prior `Assign` (the canonical `let p = Pair { .a = 7, .b = 19 };` lowering). Partial-init tracking (writing only some fields before a whole-aggregate read) rides a future sub-bundle alongside field-level move tracking. **MIR side-fix in `lower_match`**: trailing dangling block after the last arm's pattern test switched from `Terminator::Goto(join_bb)` to `Terminator::Unreachable`. The dangling path was always dynamically unreachable for exhaustive matches but its `None`-out poisoned `join_bb`'s must-init intersection (the match-result local is only written on arm-body blocks, never on the dangling path). For non-exhaustive matches this is also a strict improvement — traps cleanly via the codegen hardware-trap path instead of reading garbage from the never-written `result_local`. Driver wires the checker between `lower(...)` and `compile_program(...)` in `cmd_build.rs`; any non-empty diag list aborts before codegen so we never lower a program that may read garbage. Walker (`gw_driver/tests/borrow_fail.rs`) mirrors `gw_parse/tests/corpus.rs::fail_corpus`: in-process parse → resolve → typeck → MIR → `gw_borrow::check_program`, asserts prior stages succeed cleanly (the diagnostic must come from the borrow checker), then compares the list of `EXXXX:line:col` triples against the sibling `.expected_diagnostics` file. Three reject fixtures cover the three shapes the framework currently catches end-to-end: bare uninit-then-read (b01), conditional init where only the then-arm writes (b02), and loop-no-init where the while body may execute zero times (b03). Pass-corpus fixture 248 pins the both-arms-init positive case so the dataflow's join logic is exercised on the green path too. | **1** — `lower_match`'s `Goto(join_bb)` dangling-block terminator was a pre-existing latent codegen-correctness issue (non-exhaustive matches would have read garbage from `result_local`; existing corpus didn't exercise the shape so the bug stayed dormant). B.3's must-init intersection over `join_bb`'s predecessors surfaced it as an E0400 firing on the corpus-passing fixture `234_match_bool.gw` — the dangling-path's `None`-out contributed an empty must-init set to the join, so the trailing `return Operand::Local(result_local)` read an "uninit" local. Fixed by switching the terminator to `Unreachable`, which both removes the dangling predecessor from `join_bb`'s set in the dataflow *and* makes the runtime semantics safe-by-construction. The recombination rule predicted "1-2 bug yield" for B.3 because it introduces the first checker pass; observed 1 matches the lower end and was a MIR-level fix rather than a checker-level one. |
 | B.2 | borrows across fn-call boundaries (`&T` / `&mut T` in fn parameter and return types, plus `&param` on the caller side; **still no borrow checking** — no lifetime annotations in signatures, function-local regions only) | `cc9a6ca` | +4 phase1 fixtures (`244_borrow_param_read.gw` → 42, `245_mut_borrow_param_write.gw` → 42, `246_borrow_return.gw` → 10, `247_borrow_of_param.gw` → 42) | **Zero new typeck / MIR / lex / parse machinery** — B.0's `resolve_type` arm for `Type::Ref` already accepted `&T` in fn signatures, B.1's struct-variant `Ty::Ref { mutable, inner }` already flowed through the existing fn-signature plumbing, and MIR's call lowering already passed pointer-typed operands by value. The work was entirely in the two backends. **`gw_codegen_llvm`** `make_fn_type` previously had an explicit `U0 \| Int \| Bool \| Float` match on `f.return_ty`; non-`u0` returns now route through `llvm_basic_type` and then `lty.fn_type(&params, false)` (requires `BasicType` trait in scope). The error message gains "and references" so future failures name the right surface. The aggregate-return branch is unchanged — `is_aggregate_ty` still triggers the hidden out-pointer ABI before this scalar path runs. **`gw_codegen_fast`** `define_fn`'s entry-time block-param binding loop previously did `if let Some(var) = local_var.get(&param_local) { builder.def_var(*var, v); }` and silently dropped the value when the param had no `Variable`. Adds an `else if let Some(&slot) = local_slot.get(&param_local) { builder.ins().stack_store(v, slot, 0); }` arm — the slot was already sized by B.0's storage-decision pass; this is the missing entry-store. Four fixtures: 244 / 245 / 246 cover the surface (read through `&i32` param, write through `&mut i32` param, returning `&i32` from a two-arg picker) and 247 (`&param` flowing into a helper fn) is the specific shape that pinned the Cranelift bug — without the entry-store, `sum_via_ref(40, 2)` returned 242 on fast (`0xF0`-bit garbage XOR'd over 0x28) while LLVM correctly returned 42. | **2** — both pre-existing, both surfaced by B.2's call-shape probes rather than by B.2's own deltas: (a) LLVM `make_fn_type` rejected `Ty::Ref` returns (and would have rejected `Ty::Ptr` / `Ty::SentinelPtr` if a fn ever returned one, though no Phase-2 program did). The allow-list was a B.1-era artefact: B.0 added `Ty::Ref` to `llvm_basic_type` but didn't trace through `make_fn_type`'s explicit return match. (b) Cranelift's entry-time param-to-slot store was a B.0-era oversight: B.0 added the storage-decision branch that sizes slots for address-taken primitives but forgot the matching entry-time bind. The bug stayed dormant because B.0's three corpus fixtures `&`-borrow locals (which the body's first `Assign` writes), not params (which are bound only at entry). The lesson: every storage class needs both a sizer at fn entry *and* a binder for incoming params — adding one without the other gives a silent-miscompile shape that exhaustive-match can't catch. |
@@ -1840,13 +1845,14 @@ The big jump. Phase 2 brings:
 
 Estimated cost remaining: dozens of hours, distributed between
 the remaining CT.3 widenings (classes, optionals, error unions)
-the remaining B.x sub-bundles (B.5 loan tracking + aliasing rule
-through B.8 safety tiers; see Phase 3 ladder below), and whatever
-path the `comptime fn` decl-level question takes.
+the remaining B.x sub-bundles (B.5b shared-read aliasing + ref-
+local backward liveness through B.8 safety tiers; see Phase 3
+ladder below), and whatever path the `comptime fn` decl-level
+question takes.
 Bug yield so far is **7 caught + 1 deferred-and-now-resolved**
-across all twenty-six closed sub-bundles (twenty-one Phase-2 +
-B.0 + B.1 + B.2 + B.3 + B.4 from Phase 3):
-(C.1+C.2+M.1+M.2+M.3+O.2+F.1+F.2+F.3+CT.1+CT.2a+CT.2b+CT.2c+CT.2d+CT.2e+impl-tail-ret+block-like-tail+CT.3a+CT.3b+B.0+B.4
+across all twenty-seven closed sub-bundles (twenty-one Phase-2 +
+B.0 + B.1 + B.2 + B.3 + B.4 + B.5 from Phase 3):
+(C.1+C.2+M.1+M.2+M.3+O.2+F.1+F.2+F.3+CT.1+CT.2a+CT.2b+CT.2c+CT.2d+CT.2e+impl-tail-ret+block-like-tail+CT.3a+CT.3b+B.0+B.4+B.5
 = 0 caught, O.1 = 1 caught, O.3 = 2 caught, B.1 = 1 caught
 (deref-LHS type not recorded in `expr_types`), B.2 = 2 caught
 (LLVM `make_fn_type` return allow-list missing `Ty::Ref`,
@@ -1971,6 +1977,39 @@ checker-design bugs (false positives on aliasing, missed
 mutable-vs-shared conflicts) rather than foundational gaps in
 the ref / origin plumbing.
 
+B.5 observed yield was 0 against a prediction of 2-3. **Not
+because B.5 itself was trivial — but because the scope was
+reduced mid-design to defer shared-read aliasing to B.5b,
+and the trickier shapes (which were where the foundational
+complexity lived) went with the deferred scope.** The
+discovery was a corpus collision: under the spec's
+"function-local region = end-of-fn loan death"
+simplification, a naive shared-read check would have
+rejected existing positive fixture
+`242_mut_borrow_write.gw` (`let r = &mut x; *r = 10; return
+x;`), which Rust's NLL accepts because `r` is dead after
+`*r = 10`. The architecture explicitly accepts some
+over-rejection ("we accept that some programs Rust accepts
+GW will reject"), but rejecting an existing pinned positive
+fixture is a corpus regression rather than a deliberate
+loosening. **Choosing what to defer** was the substantive
+work of B.5: a backward liveness pass on ref locals, needed
+to derive loan death = last-use-of-any-holder, was the
+natural unit to peel off into B.5b. The remaining mutating-
+access checks (Ref gen-site, direct-write, through-pointer
+mut access) all rode directly on B.4's origins + the same
+monotone-grow-only fixpoint shape proven correct by B.4 —
+which is why the 0 yield held on the implemented scope.
+**The recombination rule's success-case lesson sharpens
+here**: zero-yield checker increments don't necessarily
+mean "the foundational work was exhaustive"; they can also
+mean "the increment's scope is small enough that what
+remains is structural recombination". B.5b will exercise
+the actually-novel machinery (backward liveness on ref
+locals, last-use loan death, the shared-read aliasing arm)
+and the prediction stays armed for that increment — yield
+2-3 is now B.5b's prediction, not B.5's.
+
 B.2 observed yield was 2 against a prediction of ~1. **Both
 bugs were pre-existing B.0 / B.1 artefacts surfaced by B.2's
 call-shape probes, not B.2's own deltas** — B.2 added zero
@@ -2067,7 +2106,7 @@ evaluator (see resolved open question #4 below; shared
 compile-time constants in Phase 2 use module-level
 `let CONSTANT: T = comptime { ... };` instead).
 
-#### Phase 3 ladder: B.0 + B.1 + B.2 + B.3 + B.4 closed, B.5–B.8 queued
+#### Phase 3 ladder: B.0 + B.1 + B.2 + B.3 + B.4 + B.5 closed, B.5b + B.6–B.8 queued
 
 Phase 2 isn't strictly complete (CT.3c+ remain corpus-motivated)
 but Phase 3 is now in flight in parallel. The architecture's
@@ -2219,13 +2258,78 @@ mirroring CT.x's incremental closure:
   `f.params` set the rest of the borrow checker already
   consults; the pre-flight gate caught nothing new.
 
-- **B.5 — loan tracking + aliasing rule (the borrow
-  checker proper)** (pending). Forward dataflow on the
-  loan-set lattice; mutable access invalidates loans;
-  shared access only conflicts with mutable loans.
-  Path-prefix analysis on places (`x.f` covers `x.f.g`).
-  Architecture spec: D.5 steps 2-3. Centerpiece of the
-  ladder; predicted yield 2-3.
+- **B.5 — loan tracking + aliasing rule (the borrow checker
+  proper) is closed** (commit `76ac9c2`): `gw_borrow` gains
+  its third pass riding on B.3's worklist machinery and
+  B.4's origin map. Each `Rvalue::Ref` site becomes a loan
+  `(place, mutable)`; mutability is read from the dst-local's
+  `Ty::Ref { mutable, .. }` (the language doesn't carry
+  mutability on the rvalue itself). The dataflow lattice is
+  `(2^Loans, ⊆)` with union join and gen-only-no-kill
+  transfer — matching the architecture's "function-local,
+  scope-bounded regions" simplification: loans live to
+  end-of-fn because Phase 1 has no sub-fn binding scopes that
+  drop refs early.
+  Three mutating-access shapes emit `CONFLICTING_BORROW`
+  (E0402): **(1) Ref gen-site** — at `Assign { dst, Rvalue::
+  Ref { target, .. } }`, the new loan conflicts with any
+  live loan on `target` iff `new.mutable || existing.mutable`
+  (mut+any or shared+mut on the same place). **(2) Direct
+  write of a borrowed local** — `Assign { dst, value }` with
+  non-Ref value, `AssignField { dst, .. }`, and
+  `Terminator::Call { dst, .. }` all conflict with any live
+  loan on `dst`. **(3) Through-pointer mut access** —
+  `StoreThroughRef { ptr, .. }` writing through `*r` checks
+  loans on `origins[r]`'s anchors (consumes B.4's data
+  structure) *excluding* the loans `r` itself holds (those
+  are the legitimate use). The `holds` map (per-local set of
+  loans the local can carry) uses the same fixpoint shape as
+  `compute_origins` but tracks `LoanId` instead of `Origin`.
+  Refactored `check_region_origins` into pure `compute_origins`
+  (no diag emission) + `check_region_origins` (the E0401 walk
+  over the origin map); `check_program` computes origins once
+  and threads them through both B.4 and B.5.
+  Diagnostic primary span is the conflicted-over place's
+  `LocalDecl.span` (B.4 / B.3 convention); deduped by `place:
+  Local` — one E0402 per borrowed local per fn.
+  Three fail-corpus fixtures pin the canonical shapes: b06
+  (two `&mut x`), b07 (shared + `&mut x`), b08 (direct write
+  `x = …` while shared `&x` is live).
+  **Scope deliberately reduced**: the shared-read aliasing
+  arm (read-while-mut by name; deref-through-shared-ref
+  while a mutable loan exists) is **deferred to B.5b**.
+  Under the end-of-fn loan-death rule, a naive shared-read
+  check would reject existing positive fixture
+  `242_mut_borrow_write.gw` (`let r = &mut x; *r = 10;
+  return x;`) which Rust's NLL accepts. Catching that shape
+  needs a backward-liveness pass on ref locals to compute
+  loan-death = last-use-of-any-holder. The mutating-access
+  checks alone catch the three canonical conflict shapes
+  without false-positives on the existing 248-fixture
+  phase1 corpus.
+  Architecture spec: D.5 steps 2-3. Yield: 0 — the scope
+  reduction carried the trickier shapes with it; the
+  remaining mutating-access checks ride directly on B.4's
+  origins and the monotone-grow-only fixpoint shape proven
+  correct by B.4. The recombination rule's success case
+  again: by the time the centerpiece increment lands, the
+  cumulative foundational work has covered the surface.
+
+- **B.5b — backward liveness of ref locals + shared-read
+  aliasing arm** (pending). Compute backward liveness of
+  ref-typed locals to derive loan death = last-use-of-any-
+  holder; add the shared-read check (direct reads of a
+  borrowed local + reads through a shared ref while a
+  mutable loan on the underlying place exists). Also
+  reintroduces a `span: Span` field on `Loan` so the
+  diagnostic can carry a secondary "earlier borrow here"
+  label, and migrates dedupe from per-place to per-conflict-
+  pair. Also: handle loan death on ref-local overwrite
+  (`let r = &x; r = &y;`) which the B.5 `holds` fixpoint
+  currently over-approximates. Once B.5b lands the
+  end-of-fn region simplification is fully replaced by
+  last-use semantics, which is the closest Phase 1 can get
+  to Rust NLL without going to Polonius.
 
 - **B.6 — drop elaboration** (pending). Insert `Drop`
   terminators where definitely-initialized →
@@ -2390,17 +2494,17 @@ state this doc describes:
 ```bash
 cd /Users/silmaril/Documents/GitHub/gw
 git log --oneline | head -10
-# expect tip: HANDOFF refresh after B.4 (this commit),
-#             fe733b5 (B.4 region-origin analysis + dangling-borrow
-#             reject), 929b60f (fmt: drop trailing blank line in
-#             borrow_fail.rs), fd20255 (HANDOFF refresh after B.3),
-#             ba39a73 (B.3 move-tracking dataflow framework),
-#             6421920 (HANDOFF refresh after B.2), cc9a6ca
-#             (B.2 borrows across fn-call boundaries),
-#             b919d5c (HANDOFF refresh after B.1), 080bd1a
-#             (B.1 `&mut` borrows + writes through references),
-#             e494494 (HANDOFF refresh after B.0) at the bottom
-#             of head -10.
+# expect tip: HANDOFF refresh after B.5 (this commit),
+#             76ac9c2 (B.5 loan tracking + aliasing rule on
+#             mutating accesses), 0875b67 (HANDOFF refresh
+#             after B.4), fe733b5 (B.4 region-origin analysis +
+#             dangling-borrow reject), 929b60f (fmt: drop
+#             trailing blank line in borrow_fail.rs), fd20255
+#             (HANDOFF refresh after B.3), ba39a73 (B.3
+#             move-tracking dataflow framework), 6421920
+#             (HANDOFF refresh after B.2), cc9a6ca (B.2 borrows
+#             across fn-call boundaries), b919d5c (HANDOFF
+#             refresh after B.1) at the bottom of head -10.
 
 git status
 # expect: clean working tree.
@@ -2418,10 +2522,10 @@ export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
 cargo test --manifest-path compiler/gw-bootstrap/Cargo.toml --workspace --no-fail-fast 2>&1 | grep "test result" | awk '{p+=$4;f+=$6}END{print p,f}'
 # expect: "293 0" (B.3 added one new integration test:
 # `gw_driver::borrow_fail_corpus`, the walker for the new
-# fail-corpus dir. B.4's two new fixtures ride that walker
-# via `insta::glob!` — no new test count. B.3's one
-# pass-corpus fixture 248 is absorbed by the existing
-# phase1_run + llvm_backend walkers as usual).
+# fail-corpus dir. B.4's two and B.5's three new fixtures
+# both ride that walker via `insta::glob!` — no new test
+# count. B.3's one pass-corpus fixture 248 is absorbed by the
+# existing phase1_run + llvm_backend walkers as usual).
 
 ls tests/corpus/pass/phase1/*.gw | wc -l
 # expect: 258 (was 257; +1 B.3 positive fixture
@@ -2432,11 +2536,14 @@ ls tests/corpus/pass/phase1/*.gw | wc -l
 #         B.0's three 220_..222_ borrow-tracer fixtures)
 
 ls tests/corpus/fail/borrow/*.gw | wc -l
-# expect: 5 (B.3 reject corpus — `b01_use_of_uninit`,
+# expect: 8 (B.3 reject corpus — `b01_use_of_uninit`,
 #         `b02_conditional_init`, `b03_loop_no_init` —
 #         plus B.4's two dangling-borrow rejects
 #         `b04_return_borrow_of_local` and
-#         `b05_return_borrow_via_let`; the first fail-corpus
+#         `b05_return_borrow_via_let` — plus B.5's three
+#         loan-conflict rejects `b06_two_mut_borrows_of_local`,
+#         `b07_shared_and_mut_borrow`, and
+#         `b08_write_to_shared_borrowed`; the first fail-corpus
 #         outside lex+parse)
 
 ls tests/corpus/pass/phase2_comptime/*.gw | wc -l
